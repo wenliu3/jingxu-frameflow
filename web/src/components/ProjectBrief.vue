@@ -37,6 +37,7 @@ function fmtSec(sec) {
 const editing = ref(-1)
 const draftName = ref('')
 const draftAnchor = ref('')
+const draftVoice = ref('')
 // v-for 里的模板 ref 会被收进数组，直接用函数 ref 拿单个元素
 let editNameEl = null
 let editAnchorEl = null
@@ -45,6 +46,7 @@ function startEdit(i, c) {
   editing.value = i
   draftName.value = c.name || ''
   draftAnchor.value = c.anchor || ''
+  draftVoice.value = c.voice || ''
   nextTick(() => {
     const el = editAnchorEl || editNameEl
     if (!el) return
@@ -64,9 +66,10 @@ function saveEdit() {
   const name = draftName.value.trim()
   if (!name) return
   const anchor = draftAnchor.value.trim()
+  const voice = draftVoice.value.trim()
   editing.value = -1
-  if (name === c.name && anchor === (c.anchor || '').trim()) return
-  emit('update-character', { index: i, name, anchor })
+  if (name === c.name && anchor === (c.anchor || '').trim() && voice === (c.voice || '').trim()) return
+  emit('update-character', { index: i, name, anchor, voice })
 }
 </script>
 
@@ -151,6 +154,15 @@ function saveEdit() {
             @keydown.enter.meta.prevent="saveEdit"
             @keydown.esc.prevent="cancelEdit"
           ></textarea>
+          <input
+            v-model="draftVoice"
+            class="ename"
+            maxlength="200"
+            :aria-label="`${c.name} 的音色`"
+            placeholder="音色：清亮的少女音、低沉沙哑…会作为该角色所有镜头的配音基调"
+            @keydown.enter.prevent="saveEdit"
+            @keydown.esc.prevent="cancelEdit"
+          />
           <div class="eops">
             <span class="ehint">锚点改了记得重新生成定妆照</span>
             <button type="button" class="ecancel" @click="cancelEdit">取消</button>
@@ -163,6 +175,7 @@ function saveEdit() {
             <i v-if="c.stale" class="cwarn" title="角色提示词已修改，重新生成定妆照后将与新形象一致">图待更新</i>
           </span>
           <span class="canchor">{{ c.anchor }}</span>
+          <span v-if="c.voice" class="cvoice">音色：{{ c.voice }}</span>
         </template>
       </div>
     </div>
@@ -306,6 +319,7 @@ h2 { margin: 0 0 8px; font-size: 21px; font-weight: 600; letter-spacing: -0.4px;
   white-space: nowrap;
 }
 .canchor { grid-column: 1 / -1; font-size: 12px; color: var(--fg-2); line-height: 1.7; white-space: pre-line; overflow-wrap: anywhere; }
+.cvoice { grid-column: 1 / -1; font-size: 11px; color: var(--fg-3); line-height: 1.6; overflow-wrap: anywhere; }
 
 .stats { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 16px; padding-top: 18px; border-top: 1px solid var(--line); }
 .stat { font-size: 12px; color: var(--fg-2); display: flex; align-items: baseline; gap: 6px; }

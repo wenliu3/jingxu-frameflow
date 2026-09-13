@@ -186,6 +186,8 @@ class GenerateRequest(BaseModel):
 
 class ShotPatch(BaseModel):
     scene_desc: str | None = None
+    audio: str | None = None
+    transition: str | None = Field(None, pattern="^(cut|continue)$")
     visual_prompt: str | None = None
     negative_prompt: str | None = None
     video_prompt: str | None = None
@@ -217,9 +219,10 @@ class TaskPatch(BaseModel):
 
 
 class CharacterPatch(BaseModel):
-    """角色编辑：名字与锚点提示词。锚点是分镜提示词和定妆照共用的角色一致性描述。"""
+    """角色编辑：名字、锚点提示词与音色。锚点是分镜提示词和定妆照共用的角色一致性描述。"""
     name: str | None = Field(None, min_length=1, max_length=40)
     anchor: str | None = Field(None, max_length=2000)
+    voice: str | None = Field(None, max_length=500)
 
 
 def _task(task_id: str) -> dict[str, Any]:
@@ -352,29 +355,15 @@ def _scan_tasks() -> None:
 
 
 def _reload(task_id: str) -> tuple[Project | None, list[Shot]]:
-    """从磁盘把任务的分镜数据读回来，供单镜编辑/重生成使用。"""
+    """把内存里的任务分镜读回成 Shot 对象。统一走 Shot.from_dict，
+    新增字段（audio/transition/voice…）不需要记得同步这里。"""
     project = None
     shot_list: list[Shot] = []
     task = TASKS.get(task_id) or {}
     if task.get("project"):
         project = Project.from_dict(task["project"])
     for raw in task.get("shots", []):
-        shot_list.append(
-            Shot(
-                shot_id=int(raw["shot_id"]),
-                scene_desc=raw.get("scene_desc", ""),
-                visual_prompt=raw.get("visual_prompt", ""),
-                negative_prompt=raw.get("negative_prompt", ""),
-                video_prompt=raw.get("video_prompt", ""),
-                camera=raw.get("camera", ""),
-                motion=raw.get("motion", ""),
-                duration=float(raw.get("duration") or 3.0),
-                dialogue=raw.get("dialogue", ""),
-                character_refs=list(raw.get("character_refs") or []),
-                image_path=raw.get("image_path", ""),
-                video_path=raw.get("video_path", ""),
-            )
-        )
+        shot_list.append(Shot.from_dict(raw, int(raw["shot_id"])))
     return project, shot_list
 
 
@@ -383,20 +372,7 @@ def _persist(task_id: str) -> None:
     task = _task(task_id)
     project = Project.from_dict(task["project"]) if task.get("project") else None
     shots = [
-        Shot(
-            shot_id=int(r["shot_id"]),
-            scene_desc=r.get("scene_desc", ""),
-            visual_prompt=r.get("visual_prompt", ""),
-            negative_prompt=r.get("negative_prompt", ""),
-            video_prompt=r.get("video_prompt", ""),
-            camera=r.get("camera", ""),
-            motion=r.get("motion", ""),
-            duration=float(r.get("duration") or 3.0),
-            dialogue=r.get("dialogue", ""),
-            character_refs=list(r.get("character_refs") or []),
-            image_path=r.get("image_path", ""),
-            video_path=r.get("video_path", ""),
-        )
+        Shot.from_dict(r, int(r["shot_id"]))
         for r in task.get("shots", [])
     ]
     if project:
@@ -705,6 +681,9 @@ def patch_character(task_id: str, index: int, patch: CharacterPatch) -> dict:
             char["anchor"] = patch.anchor.strip()
             char["stale"] = True
             changed = True
+        if patch.voice is not None and patch.voice.strip() != char.get("voice", ""):
+            char["voice"] = patch.voice.strip()
+            changed = True
         if changed:
             _persist(task_id)
         return dict(char)
@@ -797,19 +776,7 @@ def regenerate_shot(
     if project is None:
         raise HTTPException(status_code=409, detail="任务尚未生成分镜，无法重生成")
 
-    shot = Shot(
-        shot_id=int(target["shot_id"]),
-        scene_desc=target.get("scene_desc", ""),
-        visual_prompt=target.get("visual_prompt", ""),
-        negative_prompt=target.get("negative_prompt", ""),
-        video_prompt=target.get("video_prompt", ""),
-        camera=target.get("camera", ""),
-        motion=target.get("motion", ""),
-        duration=float(target.get("duration") or 3.0),
-        dialogue=target.get("dialogue", ""),
-        character_refs=list(target.get("character_refs") or []),
-        video_path=target.get("video_path", ""),
-    )
+    shot = Shot.from_dict(target, int(target["shot_id"]))
 
     try:
         pipeline.regenerate_shot(
@@ -853,6 +820,34 @@ def _resolve_image(task_id: str, shot: dict) -> str | None:
     return cand if os.path.isfile(cand) else None
 
 
+def _chain_last_frame(task_id: str, shot: dict) -> str:
+    """首尾帧接力：本镜标记 continue 且上一镜视频已存在时，
+    抽取上一镜最后一帧作为本镜首帧（H3 fl2va 模式），实现真实动作衔接。
+    任何一环不满足都返回空串，回落到本镜自己的首帧图。"""
+    try:
+        if str(shot.get("transition") or "cut") != "continue":
+            return ""
+        sid = int(shot.get("shot_id") or 0)
+        if sid <= 1:
+            return ""
+        prev = os.path.join(_out_dir(task_id), "videos", f"shot_{sid - 1:02d}.mp4")
+        if not os.path.isfile(prev):
+            return ""
+        frames_dir = os.path.join(_out_dir(task_id), "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        out = os.path.join(frames_dir, f"chain_{sid:02d}.png")
+        if os.path.isfile(out) and os.path.getmtime(out) >= os.path.getmtime(prev):
+            return out  # 上一镜视频重生成过（mtime 更新）时缓存自动失效重抽
+        subprocess.run(
+            [_ffmpeg_exe(), "-y", "-sseof", "-0.1", "-i", prev,
+             "-frames:v", "1", "-update", "1", out],
+            capture_output=True, timeout=120,
+        )
+        return out if os.path.isfile(out) else ""
+    except Exception:
+        return ""
+
+
 def _run_video_job(job: dict[str, Any]) -> None:
     task = TASKS.get(job["task_id"])
     try:
@@ -872,10 +867,15 @@ def _run_video_job(job: dict[str, Any]) -> None:
         prompt = (target or {}).get("video_prompt") or (target or {}).get("scene_desc", "")
         if not prompt:
             raise RuntimeError("视频提示词为空")
-        duration = float((target or {}).get("duration") or 3.0)
+        duration = float((target or {}).get("duration") or 5.0)
+        audio = str((target or {}).get("audio") or "")
+        last_frame = _chain_last_frame(job["task_id"], target or {})
 
         provider = _make_video_provider()
-        provider.generate(image, prompt, duration, _video_out_path(job["task_id"], job["shot_id"]))
+        provider.generate(
+            image, prompt, duration, _video_out_path(job["task_id"], job["shot_id"]),
+            audio=audio, last_frame_path=last_frame,
+        )
 
         with LOCK:
             job["status"] = "succeeded"
@@ -1030,9 +1030,12 @@ def _run_batch(job: dict[str, Any]) -> None:
             {},
         )
         prompt = shot_data.get("video_prompt") or shot_data.get("scene_desc", "")
-        duration = float(shot_data.get("duration") or 3.0)
+        duration = float(shot_data.get("duration") or 5.0)
+        audio = str(shot_data.get("audio") or "")
+        # 批量是串行的：轮到本镜时上一镜视频必然已落盘，接力才能取到尾帧
+        last_frame = _chain_last_frame(job["task_id"], shot_data or {})
         try:
-            provider.generate(t["image"], prompt, duration, t["out"])
+            provider.generate(t["image"], prompt, duration, t["out"], audio=audio, last_frame_path=last_frame)
             with LOCK:
                 rel = f"videos/shot_{t['shot_id']:02d}.mp4"
                 job["done"] += 1

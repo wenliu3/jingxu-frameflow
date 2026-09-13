@@ -112,6 +112,20 @@ function commit(field) {
       </div>
 
       <div class="line">
+        <span class="k">衔接</span>
+        <select
+          class="cell-input"
+          :aria-label="`第 ${shot.shot_id} 镜与上一镜的衔接`"
+          :value="val('transition')"
+          @change="onInput('transition', $event)"
+          @blur="commit('transition')"
+        >
+          <option value="cut">cut · 独立镜头</option>
+          <option value="continue">continue · 承接上镜尾帧</option>
+        </select>
+      </div>
+
+      <div class="line">
         <span class="k">台词</span>
         <input
           class="cell-input"
@@ -145,6 +159,17 @@ function commit(field) {
             :value="val('video_prompt')"
             @input="onInput('video_prompt', $event)"
             @blur="commit('video_prompt')"
+          ></textarea>
+        </div>
+        <div class="line col">
+          <span class="k promptk">声音设计 · 随视频生成</span>
+          <textarea
+            class="cell-area"
+            rows="2"
+            :aria-label="`第 ${shot.shot_id} 镜声音设计`"
+            :value="val('audio')"
+            @input="onInput('audio', $event)"
+            @blur="commit('audio')"
           ></textarea>
         </div>
       </template>

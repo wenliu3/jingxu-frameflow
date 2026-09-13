@@ -18,6 +18,7 @@ class Character:
 
     name: str
     anchor: str
+    voice: str = ""              # 音色/声音设计（少女音清亮、低沉沙哑…），随镜头写进声音设计
     image_path: str = ""
 
     @classmethod
@@ -25,6 +26,7 @@ class Character:
         return cls(
             name=str(d.get("name", "")),
             anchor=str(d.get("anchor", "")),
+            voice=str(d.get("voice", "")),
             image_path=str(d.get("image_path", "")),
         )
 
@@ -64,10 +66,12 @@ class Shot:
     scene_desc: str = ""          # 中文画面描述，给人审阅
     visual_prompt: str = ""       # 英文画面提示词，给图像模型，产出这一镜的首帧图
     negative_prompt: str = ""
-    video_prompt: str = ""        # 英文动态提示词，配首帧图送图生视频模型
+    video_prompt: str = ""        # 中文动态提示词，配首帧图送图生视频模型
+    audio: str = ""               # 声音设计（环境音/说话人音色），拼进 H3 提示词随视频生成
     camera: str = ""              # 景别：远景/全景/中景/近景/特写   —— 视频预留
     motion: str = ""              # 运镜：固定/缓慢推镜/横移/跟随      —— 视频预留
-    duration: float = 3.0         # 秒                                —— 视频预留
+    duration: float = 5.0         # 秒（H3 训练区间下限 124 帧 = 5s）—— 视频预留
+    transition: str = "cut"       # cut=切场景独立镜头；continue=承接上一镜尾帧
     dialogue: str = ""
     character_refs: list[str] = field(default_factory=list)
     image_path: str = ""
@@ -78,11 +82,18 @@ class Shot:
         return cls(
             shot_id=shot_id,
             scene_desc=str(d.get("scene_desc", "")),
+            visual_prompt=str(d.get("visual_prompt", "")),
+            negative_prompt=str(d.get("negative_prompt", "")),
+            video_prompt=str(d.get("video_prompt", "")),
+            audio=str(d.get("audio", "")),
             camera=str(d.get("camera", "")),
             motion=str(d.get("motion", "")),
-            duration=float(d.get("duration", 3.0) or 3.0),
+            duration=float(d.get("duration", 5.0) or 5.0),
+            transition=str(d.get("transition") or "cut"),
             dialogue=str(d.get("dialogue", "")),
             character_refs=[str(x) for x in (d.get("character_refs") or [])],
+            image_path=str(d.get("image_path", "")),
+            video_path=str(d.get("video_path", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:

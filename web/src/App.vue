@@ -485,12 +485,12 @@ async function onRerollCharacter({ index, name }) {
 
 // 编辑角色的名字与锚点提示词。锚点是后续分镜提示词与定妆照的角色一致性来源，
 // 改完服务端会标记 stale，前端提示重新生成定妆照。
-async function onUpdateCharacter({ index, name, anchor }) {
+async function onUpdateCharacter({ index, name, anchor, voice }) {
   const ownerId = taskId.value
   if (charSaving.value >= 0) return
   charSaving.value = index
   try {
-    const updated = await api.patchCharacter(ownerId, index, { name, anchor })
+    const updated = await api.patchCharacter(ownerId, index, { name, anchor, voice })
     if (taskId.value === ownerId) {
       const chars = task.value?.project?.characters || []
       if (chars[index]) chars[index] = { ...chars[index], ...updated }
@@ -825,11 +825,12 @@ const backendHint = computed(() => {
           <label class="mfield">
             <span>加速 LoRA</span>
             <select v-model="cfg.video_lora" class="url-input mono">
-              <option value="minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors">4 步 LoRA · 最快</option>
-              <option value="minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors">8 步 LoRA · 均衡</option>
+              <option value="">不加载 LoRA · 标准画质（配 20 步，无蒸馏伪影，较慢）</option>
+              <option value="minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors">4 步 LoRA · 最快（配 4 步）</option>
+              <option value="minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors">8 步 LoRA · 均衡（配 8 步）</option>
             </select>
           </label>
-          <p class="chint">视频画幅自动跟随首帧图，最终尺寸以生成服务的支持范围为准。</p>
+          <p class="chint">视频画幅自动跟随首帧图；H3 原生分辨率 1344×768，画质选 0.98MP 才能吃满。每镜 2-5 秒由分镜师按节奏决定（成片会就近吸附到约 2.3/3/3.75/4.5/5.2 秒的帧网格档位）。</p>
         </div>
 
         <footer class="mfoot">

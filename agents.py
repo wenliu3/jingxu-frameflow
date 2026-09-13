@@ -24,6 +24,8 @@ DIRECTOR_SYSTEM = """你是一位短片导演。用户会给你一句创意或�
 2. style 要包含三部分：视觉风格 + 色调 + 参考质感（例如"赛博朋克霓虹，冷蓝与品红对撞，电影胶片颗粒"）。
 3. aspect_ratio 从 16:9 / 9:16 / 1:1 中选一个，除非用户在输入里明确指定。
 4. 角色数量控制在 1-3 个，多了会出现画面混乱。
+5. 每个角色要给 voice（声音设计）：年龄感 + 音色 + 语速语气（例如"清亮的少女音，语速偏快"）。
+   它会作为该角色在所有镜头里的配音基调，随声音设计送进视频模型。
 
 只输出 JSON，不要任何解释文字：
 {
@@ -32,7 +34,7 @@ DIRECTOR_SYSTEM = """你是一位短片导演。用户会给你一句创意或�
   "style": "视觉风格 + 色调 + 质感",
   "aspect_ratio": "16:9",
   "characters": [
-    {"name": "主角A", "anchor": "28岁亚洲男性，黑色短发，左眉有一道旧疤，深蓝色冲锋衣"}
+    {"name": "主角A", "anchor": "28岁亚洲男性，黑色短发，左眉有一道旧疤，深蓝色冲锋衣", "voice": "低沉沉稳的青年男声"}
   ]
 }"""
 
@@ -43,7 +45,15 @@ STORYBOARD_SYSTEM = """你是一位分镜师。根据给定的故事设定，拆
 - scene_desc：一句中文画面描述，写清楚「谁、在哪、做什么、什么光线」
 - camera：景别，只能从 远景 / 全景 / 中景 / 近景 / 特写 中选一个
 - motion：运镜，只能从 固定 / 缓慢推镜 / 缓慢拉镜 / 横移 / 跟随 中选一个
-- duration：该镜时长（秒），单镜 2-5 秒
+- duration：该镜时长（秒），2 到 5 之间由你按节奏自由决定，小数随意。
+  快速反应/动作切口/快节奏剪辑 2-3 秒；常规叙事 3-4 秒；定场、抒情、需要呼吸感 4-5 秒。
+  代码会就近吸附到模型帧网格（实际成片约 2.3 / 3 / 3.75 / 4.5 / 5.2 秒这些档位）。
+  H3 官方标注的最佳帧区间是 5-15 秒，短镜头稳定性略降——但快节奏本来就需要短镜，
+  稳定性优先的定场镜头给长一点即可，不要因此把节奏拉平
+- transition：与上一镜的衔接关系，只能填 cut 或 continue。
+  cut = 切换了场景或时间（独立镜头，用首帧图起播）；continue = 同一场景的连续动作
+  （生成时会自动承接上一镜的最后一帧作为本镜首帧，实现真正的动作衔接）。
+  第一个分镜必须填 cut；连续动作被切换打断时宁可用 cut 重新起构图，也不要硬连
 - dialogue：该镜的台词或旁白，没有就填空字符串
 - character_refs：出现在该镜中的角色 name 列表，没有人物就填空数组
 
@@ -56,7 +66,7 @@ STORYBOARD_SYSTEM = """你是一位分镜师。根据给定的故事设定，拆
    以把故事讲完整、节奏自然为准，不要注水凑数，也不要压缩成预告片。
 
 只输出 JSON，不要任何解释文字：
-{"shots": [{"scene_desc": "...", "camera": "中景", "motion": "缓慢推镜", "duration": 3, "dialogue": "", "character_refs": ["主角A"]}]}"""
+{"shots": [{"scene_desc": "...", "camera": "中景", "motion": "缓慢推镜", "duration": 2.5, "transition": "cut", "dialogue": "", "character_refs": ["主角A"]}]}"""
 
 
 PROMPT_SYSTEM = """你是提示词工程师。每个分镜要写两种提示词，用途完全不同，不要混用。
@@ -80,7 +90,8 @@ PROMPT_SYSTEM = """你是提示词工程师。每个分镜要写两种提示词�
 H3 是全模态模型，它要的是一份「迷你分镜简报」（shot brief），不是关键词堆，
 也不是 Runway 那类极简运动提示词。写成连贯的中文散文，按固定顺序组织：
 
-7. 顺序固定：主体 → 时间轴动作 → 环境反应 → 镜头运动 → 光影 → 落点 → 声音。
+7. 顺序固定：主体 → 时间轴动作 → 环境反应 → 镜头运动 → 光影 → 落点。
+   声音设计单独写进 audio 字段，不要混进 video_prompt。
    这个顺序不能乱，这类模型对开头的内容权重最高。
 8. 主体：一句话点名是谁、处于什么状态。只写名字和状态，不要复述外貌——
    发型、服装、疤痕、信物都已经在首帧图里，复述会让模型推翻首帧重新生成，
@@ -96,8 +107,12 @@ H3 是全模态模型，它要的是一份「迷你分镜简报」（shot brief�
     不要写「氛围感」「电影感」这类情绪词，H3 对具体的物理描述执行得更准。
     也不要写景别和时长——这两样分别由首帧图和生成参数决定，写进去只会干扰。
 13. 落点：说明这一镜结束在什么状态（「定格在他低头的侧脸」「镜头停在全景」）。
-14. 声音：写明环境音，并明确要不要配乐。H3 会连音频一起生成，你不写它就自己编，
-    经常编出你不想要的配乐。没有特殊要求就写「只要环境音，不要配乐」。
+14. audio（声音设计，单独字段）：H3 画面和音频是一起生成的，这段就是给它看的
+    声音简报。全部用正向描述——只说有什么声音，绝不写「不要配乐」「没有音乐」
+    这类否定句（模型对否定不敏感，写了照样编）。格式：环境音（具体到声源，
+    如「只有海浪拍岸和海风声」）+ 有台词/动作发声时写说话人和音色（结合角色锚点
+    与 voice 字段，如「小夏清亮的少女音念出台词」）。默认不想要配乐就一个字
+    都不要提音乐，只列环境音。
 15. 整段 80 到 200 字。H3 官方建议英文 50-120 词，中文按这个信息量折算；
     超过 200 字不再增加控制，只会引入矛盾。
 16. 用中文写——H3 的语言主干是 Qwen3-VL，中文原生支持好，而且你要在界面上读改它。
@@ -105,7 +120,7 @@ H3 是全模态模型，它要的是一份「迷你分镜简报」（shot brief�
     模型对这类词的识别更准。
 
 只输出 JSON，不要任何解释文字：
-{"shots": [{"shot_id": 1, "visual_prompt": "...", "negative_prompt": "...", "video_prompt": "..."}]}"""
+{"shots": [{"shot_id": 1, "visual_prompt": "...", "negative_prompt": "...", "video_prompt": "...", "audio": "..."}]}"""
 
 
 def director(
@@ -209,7 +224,10 @@ def prompt_engineer(project: Project, shots: list[Shot]) -> None:
             f" | 出场角色：{', '.join(s.character_refs) or '无'}"
         )
 
-    anchors = "\n".join(f"  - {c.name}：{c.anchor}" for c in project.characters)
+    anchors = "\n".join(
+        f"  - {c.name}：{c.anchor}" + (f"｜音色：{c.voice}" if c.voice else "")
+        for c in project.characters
+    )
     user = (
         f"全局风格：{project.style}\n"
         f"角色锚点：\n{anchors}\n\n"
@@ -225,6 +243,10 @@ def prompt_engineer(project: Project, shots: list[Shot]) -> None:
             s.visual_prompt = str(item.get("visual_prompt", ""))
             s.negative_prompt = str(item.get("negative_prompt", ""))
             s.video_prompt = str(item.get("video_prompt", ""))
+            # 声音设计只在模型真的返回了才覆盖：单镜改写时若模型没给 audio，
+            # 保留用户手填/上一轮的声音设计，而不是清空
+            if item.get("audio"):
+                s.audio = str(item.get("audio"))
         if not s.visual_prompt:
             raise RuntimeError(f"分镜 {s.shot_id} 未获得 visual_prompt")
         if not s.video_prompt:

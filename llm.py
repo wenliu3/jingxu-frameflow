@@ -3,12 +3,14 @@
 模型现状（2026-09-11 核实）：
 - 当前模型 ID 是 `deepseek-flash`，服务 DeepSeek-V4.1-Flash（2026-09-10 发布）。
 - `deepseek-chat` / `deepseek-reasoner` 是**已通知弃用的兼容别名**，不要再用于新代码。
-- 1M 上下文 / 384K 最大输出 / 支持 JSON Output。
+- 1M 上下文 / 384K 最大输出 / 支持 JSON Output / 原生多模态（图片输入走 OpenAI 兼容格式）。
 
 两个必须显式处理的坑：
-1. **思考模式默认开启**。V4 系列默认按 high effort 推理，推理 token 计入输出预算和费用；
-   预算不足时会返回 HTTP 200 但 content 为空。这里显式关闭（本任务无需复杂推理）。
-   另：思考模式下 temperature 参数**不生效**，关闭后才会按 0.7 起作用。
+1. **思考模式**。V4 系列思考模式按 high effort 推理，推理 token 计入输出预算和费用；
+   预算不足时会返回 HTTP 200 但 content 为空。故事与分镜需要情节构思，这里显式
+   开启思考并指定 reasoning_effort="high"（官方文档的标准姿势），max_tokens 直接
+   放开到模型上限兜住推理开销。
+   另：思考模式下 temperature 参数不生效，保留 0.7 只对非思考请求有意义。
 2. **JSON Output 偶发返回空内容**。官方文档明确提及此行为，要求配合明确的 JSON 指令。
    这里用重试兜住。
 
@@ -24,9 +26,10 @@ import time
 
 import requests
 
-# 8000 只够一次输出十几镜的 JSON；放开到 16000 兜住「AI 自定镜数」时
-# 一次拆 20-30 镜的情况（模型上限 384K，max_tokens 只是封顶，不按它计费）。
-MAX_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", "16000"))
+# 思考开启后推理 token 计入输出预算，直接放开到模型上限（384K 最大输出）：
+# max_tokens 只是封顶、按实际用量计费，设满不会有额外成本，也杜绝长分镜被
+# 推理吃光预算导致空返回的问题。
+MAX_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", "384000"))
 RETRIES = 2
 
 
@@ -63,7 +66,8 @@ def chat_json(system: str, user: str, temperature: float = 0.7) -> dict:
                 "temperature": temperature,
                 "max_tokens": MAX_TOKENS,
                 "response_format": {"type": "json_object"},
-                "thinking": {"type": "disabled"},
+                "reasoning_effort": "high",
+                "thinking": {"type": "enabled"},
             },
             timeout=300,
         )

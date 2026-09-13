@@ -136,10 +136,25 @@ class ComfyUIVideoProvider:
         self.poll_interval = poll_interval
         self.timeout = timeout_per_shot
 
-    def generate(self, image_path: str, video_prompt: str, duration: float, out_path: str) -> str:
-        """生成一条视频并落盘，返回 out_path。阻塞直到完成或超时。"""
+    def generate(
+        self,
+        image_path: str,
+        video_prompt: str,
+        duration: float,
+        out_path: str,
+        audio: str = "",
+        last_frame_path: str = "",
+    ) -> str:
+        """生成一条视频并落盘，返回 out_path。阻塞直到完成或超时。
+
+        audio 是声音设计（环境音/说话人音色），H3 的画面与音频共用一份提示词，
+        所以只能拼在 prompt 末尾做软引导，无法像负向提示词那样硬性排除。
+        last_frame_path 是上一镜视频的尾帧图：给了就按 fl2va 模式生成，
+        让本镜首帧承接上一镜结尾（首尾帧接力），实现镜头间的真实动作衔接。
+        """
         image_name = self._upload(image_path)
-        workflow = self._build_workflow(video_prompt, duration, image_name)
+        last_frame_name = self._upload(last_frame_path) if last_frame_path else ""
+        workflow = self._build_workflow(video_prompt, duration, image_name, audio, last_frame_name)
         prompt_id = self._submit(workflow)
         filename, subfolder = self._wait(prompt_id)
         self._download(filename, subfolder, out_path)
@@ -162,22 +177,46 @@ class ComfyUIVideoProvider:
         name = data.get("name", "")
         return f"{sub}/{name}" if sub else name
 
-    def _build_workflow(self, video_prompt: str, duration: float, image_name: str) -> dict:
+    def _build_workflow(
+        self,
+        video_prompt: str,
+        duration: float,
+        image_name: str,
+        audio: str = "",
+        last_frame_name: str = "",
+    ) -> dict:
         wf = json.loads(json.dumps(self.template))  # 深拷贝
         wf["100"]["inputs"]["image"] = image_name
-        wf["104"]["inputs"]["prompt"] = video_prompt
-        # 帧数：时长 ×24fps，再向上调整到 ≡5 (mod 17)（H3 的帧数约束）
+        prompt = video_prompt.strip()
+        if audio.strip():
+            prompt = f"{prompt}\n\n声音设计：{audio.strip()}"
+        wf["104"]["inputs"]["prompt"] = prompt
+        # 首尾帧接力：last_frame 节点按需动态注入（模板里不放，避免未接线节点
+        # 参与 ComfyUI 的输入校验）
+        if last_frame_name:
+            wf["101"] = {
+                "class_type": "LoadImage",
+                "inputs": {"image": last_frame_name},
+            }
+            wf["104"]["inputs"]["last_frame"] = ["101", 0]
+        # 帧数：时长 ×24fps，就近吸附到 ≡5 (mod 17) 的网格（H3 的帧数约束）。
+        # 就近而不是向上：向上吸附会把 4.5s 的请求吞成 5.17s，时长设定失真。
         frames = max(5, round(duration * 24))
-        frames += (5 - frames % 17) % 17
+        frames = max(5, 17 * round((frames - 5) / 17) + 5)
         wf["104"]["inputs"]["length"] = frames
         wf["15"]["inputs"]["noise_seed"] = random.randint(0, 2**31)
         # 画质/速度旋钮
         wf["119"]["inputs"]["megapixels"] = float(os.getenv("H3_MEGAPIXELS", "0.9"))
         steps = int(os.getenv("H3_STEPS", "8"))
         wf["9"]["inputs"]["steps"] = steps
-        wf["121"]["inputs"]["lora_name"] = os.getenv(
-            "H3_LORA", "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
-        )
+        lora_name = os.getenv("H3_LORA", "").strip()
+        if lora_name:
+            # turbo LoRA 蒸馏档：8 步左右出片
+            wf["121"]["inputs"]["lora_name"] = lora_name
+        else:
+            # 标准（无 LoRA）档：卸掉 LoRA 节点，模型直连采样器，20 步以上无蒸馏伪影
+            wf["9"]["inputs"]["model"] = ["6", 0]
+            wf.pop("121", None)
         return wf
 
     def _submit(self, workflow: dict) -> str:

@@ -68,6 +68,7 @@ function commit(field) {
       <span class="tag">{{ shot.camera || '—' }}</span>
       <span class="tag">{{ shot.motion || '—' }}</span>
       <span class="tag mono">{{ shot.duration }}s</span>
+      <span v-if="shot.transition === 'continue'" class="tag accent">承接上镜</span>
       <span v-if="shot.character_refs?.length" class="tag accent">
         {{ shot.character_refs.join(' / ') }}
       </span>
@@ -97,6 +98,17 @@ function commit(field) {
           :value="val('video_prompt')"
           @input="onInput('video_prompt', $event)"
           @blur="commit('video_prompt')"
+        ></textarea>
+      </label>
+
+      <label class="promptblock">
+        <span class="plabel">声音设计 · 随视频生成（环境音/音色，正向描述）</span>
+        <textarea
+          class="parea"
+          rows="2"
+          :value="val('audio')"
+          @input="onInput('audio', $event)"
+          @blur="commit('audio')"
         ></textarea>
       </label>
     </template>

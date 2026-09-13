@@ -90,7 +90,7 @@ def main() -> int:
             continue
         print(f"  #{s.shot_id:02d} 生成中：{img} -> {out_path}")
         try:
-            provider.generate(img, prompt, s.duration, out_path)
+            provider.generate(img, prompt, s.duration, out_path, audio=s.audio)
             s.video_path = out_path
             d = raw[s.shot_id - 1]
             d["video_path"] = out_path
