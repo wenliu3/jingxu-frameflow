@@ -1,0 +1,14 @@
+# 统一换行：文本文件入库一律 LF，checkout 时 Windows 也保持 LF，
+# 保证 deploy_comfyui*.sh 在 Linux 服务器上直接可跑（不会被 \r 坑）。
+* text=auto
+*.sh text eol=lf
+*.py text
+*.vue text
+*.js text
+*.json text
+*.md text
+
+# 二进制
+*.png binary
+*.webp binary
+*.svg text
