@@ -18,8 +18,9 @@ const props = defineProps({
 
 const emit = defineEmits(['patch', 'regen', 'video', 'open'])
 
-const CAMERAS = ['远景', '全景', '中景', '近景', '特写']
-const MOTIONS = ['固定', '缓慢推镜', '缓慢拉镜', '横移', '跟随']
+// 景别 / 运镜的可选值不在这里定义：datalist 统一在 ShotBoard.vue（唯一来源）。
+// 这里曾有一份重复的 CAMERAS / MOTIONS 常量，实际从未被使用，已删——
+// 两处各存一份，扩展词表时必然漏改一处。
 
 const local = ref({})
 
@@ -151,22 +152,28 @@ function commit(field) {
           ></textarea>
         </div>
         <div class="line col">
-          <span class="k promptk">视频提示词 · 驱动画面</span>
+          <span
+            class="k promptk"
+            title="H3 的画面字段（integrated_multimodal_description），用英文写；台词保留原语言"
+          >视频提示词 · 英文</span>
           <textarea
             class="cell-area mono"
             rows="3"
-            :aria-label="`第 ${shot.shot_id} 镜视频提示词 · 驱动画面`"
+            :aria-label="`第 ${shot.shot_id} 镜视频提示词 · 英文，对应 H3 的 integrated_multimodal_description 字段`"
             :value="val('video_prompt')"
             @input="onInput('video_prompt', $event)"
             @blur="commit('video_prompt')"
           ></textarea>
         </div>
         <div class="line col">
-          <span class="k promptk">声音设计 · 随视频生成</span>
+          <span
+            class="k promptk"
+            title="H3 的声音字段（overall_soundscape），只写画内环境音，用英文；配乐由代码统一写 N/A"
+          >环境音 · 英文</span>
           <textarea
             class="cell-area"
             rows="2"
-            :aria-label="`第 ${shot.shot_id} 镜声音设计`"
+            :aria-label="`第 ${shot.shot_id} 镜环境音 · 英文，对应 H3 的 overall_soundscape 字段`"
             :value="val('audio')"
             @input="onInput('audio', $event)"
             @blur="commit('audio')"

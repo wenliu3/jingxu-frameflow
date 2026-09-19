@@ -9,16 +9,17 @@ const props = defineProps({
   batchProgress: { type: Object, default: null },
   exportBusy: { type: Boolean, default: false },
   hasVideos: { type: Boolean, default: false },
+  // 视频输入模式。空串表示场景不适用（外接 API 后端没有这个概念），此时不渲染选择器。
+  videoMode: { type: String, default: '' },
 })
 
-const emit = defineEmits(['submit', 'batch-video', 'export'])
+const emit = defineEmits(['submit', 'batch-video', 'export', 'video-mode'])
 const idea = ref('')
 const ideaEl = ref(null)
 const mode = ref('idea')
 const shotCount = ref('auto')
 const ratio = ref('')
 const concurrency = ref(2)
-const advanced = ref(false)
 const composing = ref(false)
 const chars = ref([])
 const showChars = ref(false)
@@ -156,7 +157,6 @@ function reset() {
   shotCount.value = 'auto'
   ratio.value = ''
   concurrency.value = 2
-  advanced.value = false
   composing.value = false
 }
 
@@ -211,10 +211,6 @@ defineExpose({ focus, setIdea, reset })
         <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="7.5" cy="6" r="3" stroke="currentColor" stroke-width="1.4" /><path d="M2.5 16v-1.5a5 5 0 0 1 10 0V16M15.5 6.5v6M12.5 9.5h6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
         {{ showChars ? '收起角色' : chars.length ? `角色设定（${chars.length}）` : '添加角色' }}
       </button>
-      <button class="tool-button" type="button" @click="chooseFile">
-        <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m7 10 5-5a3 3 0 0 1 4.2 4.2l-6.5 6.5a4 4 0 0 1-5.6-5.6l6.2-6.2M7 10l-1 1a2 2 0 0 0 2.8 2.8l5.5-5.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
-        {{ sourceName ? '更换剧本' : '导入剧本' }}
-      </button>
       <input ref="fileInput" class="file-input" type="file" accept=".txt,.md,.markdown" aria-label="导入 TXT 或 Markdown 剧本，最大 10 MB" @change="onFile" />
       <span class="shortcut-hint">Ctrl / Cmd + Enter 开始创作</span>
     </div>
@@ -249,7 +245,7 @@ defineExpose({ focus, setIdea, reset })
       </button>
     </div>
 
-    <div v-if="advanced" class="advanced-settings">
+    <div class="advanced-settings">
       <label class="concurrency-field">
         <span>生成并发</span>
         <select v-model="concurrency" aria-label="生成并发数量">
@@ -282,9 +278,9 @@ defineExpose({ focus, setIdea, reset })
             <option value="1:1">1:1 方屏</option>
           </select>
         </label>
-        <button class="icon-button more-settings" :class="{ expanded: advanced }" type="button" :aria-expanded="advanced" :title="advanced ? '收起更多设置' : '更多设置：生成并发'" aria-label="更多设置：生成并发" @click="advanced = !advanced">
-          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M3 6h14M3 14h14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /><circle cx="7" cy="6" r="2" fill="var(--surface, #fff)" stroke="currentColor" stroke-width="1.4" /><circle cx="13" cy="14" r="2" fill="var(--surface, #fff)" stroke="currentColor" stroke-width="1.4" /></svg>
-        </button>
+        <!-- 2026-09-14：三种视频输入模式（i2v/flf/portrait）已合并 —— 不再让用户选，
+             改由素材工坊里的「选了什么素材 + 有没有勾首尾帧」决定走哪条。
+             这里的选择器移除，配置里的 video_mode 字段保留（分镜工作台的老流程还在消费它）。 -->
       </div>
       <button class="create-button" type="button" :disabled="!canSubmit" @click="submit">
         <span v-if="busy" class="composer-spinner" aria-hidden="true"></span>
@@ -354,10 +350,8 @@ defineExpose({ focus, setIdea, reset })
 .parameter svg { width: 15px; height: 15px; }
 .parameter > span { white-space: nowrap; }
 .composer select { color: var(--fg, #262925); font-size: 12px; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='m3 4.5 3 3 3-3' fill='none' stroke='%2372766e' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 7px center; }
-.parameter select { width: auto; max-width: 120px; min-height: 35px; padding: 7px 22px 7px 2px; border: 0; border-radius: 4px; background-color: transparent; }
+.parameter select { width: auto; max-width: 148px; min-height: 35px; padding: 7px 22px 7px 2px; border: 0; border-radius: 4px; background-color: transparent; }
 .parameter select:focus { box-shadow: none; background-color: transparent; }
-.composer .more-settings { width: 36px; height: 37px; }
-.composer .more-settings.expanded { background: var(--accent-dim, #fbede5); color: var(--accent, #dc603e); }
 .composer .create-button { display: inline-flex; align-items: center; justify-content: center; gap: 12px; min-height: 42px; margin-left: auto; padding: 10px 18px; border: 1px solid var(--accent, #dc603e); border-radius: 8px; background: var(--accent, #dc603e); color: var(--accent-ink, #fff); font-size: 13px; font-weight: 600; white-space: nowrap; }
 .composer .create-button:hover:not(:disabled) { background: #c95233; border-color: #c95233; }
 .composer .create-button:disabled { opacity: .5; cursor: not-allowed; }

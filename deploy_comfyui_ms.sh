@@ -50,6 +50,7 @@ echo "[deps] OK"
 step "3/6 模型（ModelScope 内网下载极快，已存在的自动跳过）"
 M=models
 FILES=(
+  # fl2va：文生视频 / 首帧 / 首尾帧（T2VA / I2VA / FL2VA / L2VA）
   "diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors"
   "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
   "vae/minimax_h3_video_vae_fp16.safetensors"
@@ -57,6 +58,15 @@ FILES=(
   "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
   "loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
 )
+# ref2va：全能参考模式（Ref2VA）——用角色参考图锁定身份、构图交给提示词，
+# 这才是「人物图 + 提示词、不出分镜图」那条路线需要的权重。
+# 与 fl2va 是两个独立 checkpoint，同一时刻只能挂一个。
+# ⚠️ 存储：这个文件约 20GB，先确认实例盘放得下（DSW 常驻盘通常很小，
+#    必要时把 M 指到临时盘再把 models/ 软链回去）。
+# 不需要就 WANT_REF2VA=0 bash deploy_comfyui_ms.sh 跳过。
+if [ "${WANT_REF2VA:-1}" = "1" ]; then
+  FILES+=("diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors")
+fi
 for f in "${FILES[@]}"; do
   if [ -f "$M/$f" ]; then
     echo "已有 $f，跳过"

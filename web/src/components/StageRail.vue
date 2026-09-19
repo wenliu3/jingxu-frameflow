@@ -1,26 +1,44 @@
 <script setup>
 import { computed } from 'vue'
 
-// 四阶段进度。运行中按 label 反查当前步骤；停下时按 stage_state
-// （directed / storyboarded / imaged）判定各步的完成情况——分段验收流程里
+// 阶段进度。运行中按 label 反查当前步骤；停下时按 stage_state
+// （directed / blocks / storyboarded / imaged）判定各步的完成情况——分段验收流程里
 // 停在中间阶段是常态，不能把 succeeded 一律当全部完成。
+// 两种流程各有一套轨道：分块（新，资产准备 → 分块编排 → 成片）与分镜（旧，兼容历史任务）。
 const props = defineProps({
   status: { type: String, default: 'idle' },
   stage: { type: String, default: '' },
   stageState: { type: String, default: '' },
+  flow: { type: String, default: 'shots' },
   done: { type: Number, default: 0 },
   total: { type: Number, default: 0 },
 })
 
-const STEPS = [
-  { label: '故事设定', role: '导演' },
-  { label: '拆解分镜', role: '分镜师' },
-  { label: '提示词', role: '翻译' },
-  { label: '出图', role: '图像模型' },
-]
+const STEPS_BY_FLOW = {
+  blocks: [
+    { label: '故事设定', role: '导演' },
+    { label: '资产准备', role: '定妆照 · 场景 · 道具' },
+    { label: '分块编排', role: '每块 10 秒' },
+    { label: '合并成片', role: '导出' },
+  ],
+  shots: [
+    { label: '故事设定', role: '导演' },
+    { label: '拆解分镜', role: '分镜师' },
+    { label: '提示词', role: '翻译' },
+    { label: '出图', role: '图像模型' },
+  ],
+}
+const STEPS = computed(() => STEPS_BY_FLOW[props.flow] || STEPS_BY_FLOW.shots)
 
-// 各阶段停下来的位置：directed=完成1步，storyboarded=完成3步（分镜+提示词），imaged=全部
-const DONE_STEPS = { directed: 1, storyboarded: 3, imaged: 4 }
+// 各阶段停下来的位置。
+// 分块：directed=完成2步（故事+资产），blocks=完成3步；分镜：storyboarded=3步，imaged=4步
+// flow 随任务异步到达，必须响应式，不能在 setup 里取一次定死
+const DONE_STEPS = computed(() => ({
+  directed: props.flow === 'blocks' ? 2 : 1,
+  blocks: 3,
+  storyboarded: 3,
+  imaged: 4,
+}))
 
 const finished = computed(
   () => props.stageState === 'imaged' && props.status === 'succeeded',
@@ -30,11 +48,13 @@ const failed = computed(() => props.status === 'failed')
 // -1 = 尚未开始（排队中）
 const current = computed(() => {
   const s = props.stage || ''
-  if (finished.value) return STEPS.length
+  if (finished.value) return STEPS.value.length
   if (s.includes('生成故事设定')) return 0
   if (s.includes('拆解分镜')) return 1
   if (s.includes('生成提示词')) return 2
   if (s.includes('出图')) return 3
+  if (s.includes('分块中')) return 2
+  if (s.includes('分块编排')) return 2
   return -1
 })
 
@@ -48,7 +68,7 @@ function stateOf(i) {
     return 'todo'
   }
   if (finished.value) return 'done'
-  const doneCount = DONE_STEPS[props.stageState] ?? 0
+  const doneCount = DONE_STEPS.value[props.stageState] ?? 0
   return i < doneCount ? 'done' : 'todo'
 }
 </script>

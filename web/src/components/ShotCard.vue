@@ -91,7 +91,7 @@ function commit(field) {
         ></textarea>
       </label>
       <label class="promptblock">
-        <span class="plabel">视频提示词 · 驱动画面</span>
+        <span class="plabel" title="H3 的画面字段（integrated_multimodal_description），英文写作，台词保留原语言">视频提示词 · 英文</span>
         <textarea
           class="parea mono"
           rows="3"
@@ -102,7 +102,7 @@ function commit(field) {
       </label>
 
       <label class="promptblock">
-        <span class="plabel">声音设计 · 随视频生成（环境音/音色，正向描述）</span>
+        <span class="plabel" title="H3 的声音字段（overall_soundscape）：只写画内环境音，英文写作；配乐由代码统一写 N/A">环境音 · 英文</span>
         <textarea
           class="parea"
           rows="2"

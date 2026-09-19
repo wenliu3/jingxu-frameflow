@@ -14,6 +14,31 @@ const props = defineProps({
 
 const emit = defineEmits(['patch', 'regen', 'video', 'open-image'])
 
+// 景别与运镜的可选值。datalist 只做输入建议、不做强校验，这里是唯一的来源——
+// ShotRow.vue 只引用 list 名，不要再存一份副本（两处各存一份，扩展时必然漏改一处）。
+// 运镜用 H3 官方英文术语：agents.STORYBOARD_SYSTEM 派给分镜 Agent 的是同一份词表，
+// 官方对英文术语的识别比中文译名准。幅度 / 速度不在这里选，由提示词 Agent 写进英文句子。
+const CAMERAS = ['远景', '全景', '中景', '近景', '特写']
+const MOTIONS = [
+  'Static Shot',
+  'Push In',
+  'Pull Out',
+  'Zoom In',
+  'Zoom Out',
+  'Pan Left',
+  'Pan Right',
+  'Tilt Up',
+  'Tilt Down',
+  'Truck Left',
+  'Truck Right',
+  'Pedestal Up',
+  'Pedestal Down',
+  'Arc Shot',
+  'Tracking Shot',
+  'POV',
+  'Shake Slightly',
+]
+
 const view = ref(loadView())     // table | gallery，偏好持久化
 watch(view, saveView)
 
@@ -126,10 +151,10 @@ function isVideoBusy(shot) {
 
     <!-- 景别 / 运镜的可选值，来源见 agents.py 的分镜 System Prompt。全页只能有一份。 -->
     <datalist id="camera-options">
-      <option v-for="c in ['远景', '全景', '中景', '近景', '特写']" :key="c" :value="c" />
+      <option v-for="c in CAMERAS" :key="c" :value="c" />
     </datalist>
     <datalist id="motion-options">
-      <option v-for="m in ['固定', '缓慢推镜', '缓慢拉镜', '横移', '跟随']" :key="m" :value="m" />
+      <option v-for="m in MOTIONS" :key="m" :value="m" />
     </datalist>
   </section>
 </template>

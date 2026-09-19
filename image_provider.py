@@ -8,12 +8,19 @@ ModelScope 只是第一个实现。抽成接口是为了将来换即梦 / 豆包
    不是一次请求直接拿图。
 2. 提交时必须带 X-ModelScope-Async-Mode: true。
 
-模型选型（2026-09 现状，LMArena 文生图榜）：
-- Tongyi-MAI/Z-Image-Turbo —— 速度优先。6B / S3-DiT 架构，<3 秒出图，Elo 1083。
-  第三方实测可走 API-Inference，默认用它保证能跑通。
-- Qwen/Qwen-Image-2512 —— 质量优先。7B / MMDiT 架构，原生 2K，文字渲染更强，
-  Elo 1139，是当前最佳开源文生图模型。速度明显更慢。
-两者都出自阿里通义实验室。分镜图追求质量时切到 Qwen-Image。
+模型选型（2026-09 现状，ModelScope API-Inference 实际可用列表）：
+- Tongyi-MAI/Z-Image-Turbo —— 默认。6B / S3-DiT，<3 秒出图，中文 prompt 直接可用。
+  分镜图、定妆照、素材（道具/场景）**统一用它**。
+- Qwen/Qwen-Image-2512 —— 更懂中文、文字渲染强，但出人物明显不如 Z-Image-Turbo
+  （2026-09-14 实测结论，改回来过）。别拿它出人像。
+- black-forest-labs/FLUX.2-dev —— 人像质感强，但**只吃英文 prompt**，中文进去出来的
+  是完全无关的画面。填它到面板也能跑：代码按模型名自动切英文 prompt（见 pipeline._is_flux）。
+- 注意：FLUX 系是 guidance-distilled 模型，接口不吃 negative_prompt
+  （发送可能报错），代码里按模型名跳过。
+
+**全链路纯文生图（2026-09-14 起）**：不再有图生图 / Edit 模型 / 参考图上传。
+人物四视角与道具两视角的一致性靠「逐字相同的 anchor + 同一角色共用 seed」约束，
+不靠参考图。原 Edit 路线（Qwen-Image-Edit-2511）已整体移除。
 """
 
 from __future__ import annotations
@@ -62,7 +69,11 @@ class ImageProvider(ABC):
         size: str = "1024x576",
         seed: int | None = None,
     ) -> str:
-        """生成一张图并落盘，返回落盘路径。"""
+        """生成一张图并落盘，返回落盘路径。
+
+        seed 不是可选项里的装饰：定妆照四视角 / 道具两视角靠**同一 seed**
+        把身份锚住，只让视角描述变化。同一角色换 seed 就等于换一个人。
+        """
 
     def close(self) -> None:
         """释放资源。默认无操作。"""
@@ -131,8 +142,14 @@ class ModelScopeProvider(ImageProvider):
         size: str,
         seed: int | None,
     ) -> str:
-        payload: dict = {"model": self.model, "prompt": prompt, "n": 1, "size": size}
-        if negative_prompt:
+        payload: dict = {
+            "model": self.model,
+            "prompt": prompt,
+            "n": 1,
+            "size": size,
+        }
+        # FLUX 系是 guidance-distilled，接口不吃 negative_prompt
+        if negative_prompt and "flux" not in self.model.lower():
             payload["negative_prompt"] = negative_prompt
         if seed is not None:
             payload["seed"] = seed
@@ -275,7 +292,12 @@ class AgnesProvider(ImageProvider):
 
 
 def create_provider(name: str | None = None) -> ImageProvider:
-    """按 IMAGE_PROVIDER 环境变量选择后端，默认 modelscope。"""
+    """按 IMAGE_PROVIDER 环境变量选择后端，默认 modelscope。
+
+    模型一律由 MODELSCOPE_IMAGE_MODEL（= 面板的 image_model）决定。
+    2026-09-14 起取消「质量模型」双轨：分镜图、定妆照、素材共用同一个模型，
+    双轨的代价是面板改了模型但定妆照不生效，用户看到的是"改了没用"。
+    """
     key = (name or os.getenv("IMAGE_PROVIDER", "modelscope")).strip().lower()
     if key == "modelscope":
         return ModelScopeProvider()

@@ -4,3 +4,5 @@ imageio-ffmpeg
 fastapi>=0.110
 uvicorn>=0.29
 pydantic>=2.6
+# 角色音色样本（tts.py）。走微软在线服务，零显存零成本
+edge-tts>=7.0
