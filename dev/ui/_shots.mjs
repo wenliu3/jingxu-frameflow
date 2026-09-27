@@ -30,14 +30,14 @@ try {
   await shot('view_create_empty')
 
   // 加一个角色（填描述，跳过 LLM 设计锚点，快且确定）
-  await page.click('.head-actions .btn-ghost')
+  await page.click('.head-actions .add-material')
   await page.type('.addform input[aria-label="新素材名字"]', '林晚')
   await page.type('.addform input[aria-label="新素材描述"]', '22 岁女性，齐肩黑发，米色针织外套')
   await page.click('.addform .btn-primary')
   await new Promise((r) => setTimeout(r, 2500))
 
   // 再加一个场景，并选中两个素材，看「本次视频素材」有内容时的样子
-  await page.click('.head-actions .btn-ghost')
+  await page.click('.head-actions .add-material')
   await new Promise((r) => setTimeout(r, 250))
   await page.$$eval('.addform .seg button', (els) => els.find((e) => e.textContent.trim() === '场景').click())
   await page.type('.addform input[aria-label="新素材名字"]', '便利店内部')

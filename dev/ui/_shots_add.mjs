@@ -47,7 +47,7 @@ async function pickKind(label) {
   const t0 = Date.now()
   // 已经开着就别再点一下（那个按钮是开关，会把它关掉）
   if (!(await page.$('.addform'))) {
-    await page.click('.head-actions .btn-ghost')
+    await page.click('.head-actions .add-material')
     await sleep(250)
   }
   await page.$$eval('.addform .af-kinds button',
@@ -85,7 +85,7 @@ try {
   await sleep(900)
 
   // 1) 点「添加素材」：只应该有 5 个选择，且没有名字/描述输入框
-  await page.click('.head-actions .btn-ghost')
+  await page.click('.head-actions .add-material')
   await sleep(300)
   const picker = await page.evaluate(() => ({
     选项: [...document.querySelectorAll('.addform .af-kinds button')].map((b) => b.textContent.trim()),

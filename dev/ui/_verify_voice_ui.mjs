@@ -45,7 +45,7 @@ async function shot(name) {
 
 async function pickKind(label) {
   if (!(await page.$('.addform'))) {
-    await page.click('.head-actions .btn-ghost')
+    await page.click('.head-actions .add-material')
     await sleep(250)
   }
   await page.$$eval('.addform .af-kinds button',

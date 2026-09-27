@@ -123,7 +123,7 @@ try {
   // ---------- 2) 没有作品时点「添加素材」→ 应该自动建一个空白作品 ----------
   //    添加流程：点按钮只弹 5 个类型 → 选「角色」→ 下面角色组里直接多一张编辑态的卡片。
   const before = await page.$$eval('.history-row', (els) => els.length)
-  await page.click('.head-actions .btn-ghost')
+  await page.click('.head-actions .add-material')
   await wait(300)
   const kindCount = await page.$$eval('.addform .af-kinds button', (els) => els.length)
   check('「添加素材」只给 5 个类型可选', kindCount === 5, `实际 ${kindCount} 个`)
@@ -166,21 +166,69 @@ try {
   // ---------- 4) 标题状态应该是「未开始」（draft 态） ----------
   check('状态显示「未开始」', (await textOf('.create-head .status-pill')).includes('未开始'))
 
-  // ---------- 5) 01 里的选中开关已经**撤掉了**（2026-09-19 斌哥定，改了两轮） ----------
-  //    原断言是「01 里点卡片能选中」（查 .mcard.picked）。09-19 先去掉"点整张卡片选中"
-  //    （点图片下面那块会莫名被选上），又去掉了那个小圆圈 —— 原话
-  //    "不用选这个，因为选了也不知道能有什么功能"。所以这里改成**反向断言**：
-  //    点一下，卡片也不该出现任何选中态。真正给 02 选素材靠「分镜工作台」里
-  //    02 自带的 .picklist（见第 7 步）。
-  //    ⚠️ 撤 UI 时必须同步扫 _*.mjs —— 留着旧断言的话，它测的是一个**已经不存在的行为**，
+  // ---------- 5) 01 的选中：**只有勾选框能选中**（2026-09-27 重新定过） ----------
+  //    历史：09-19 斌哥让撤掉 01 的选中，理由"选了也不知道能有什么功能"（撤了两轮 ——
+  //    先是"点整张卡片"，后是图片右上角的小圆圈）。2026-09-27 他**点名要了**
+  //    「自动生成」，选中重新长出来，但机制换了：**缩略图左上角的勾选框是唯一入口**，
+  //    点卡片主体仍然只用来放大看图。
+  //    所以这一条现在验两件事，两件都不能少：
+  //      ① 点卡片主体**不**产生选中态（把 09-19 那条否掉的行为钉住，别找回来）
+  //      ② 点勾选框**能**选中（新机制真的通）
+  //    ⚠️ 撤/改 UI 时必须同步扫 _*.mjs —— 留着旧断言的话，它测的是一个**已经不存在的行为**，
   //       报出来的 FAIL 会把人引去查一个早就改好的地方。
   await page.click('.mgroups .mgroup:nth-child(1) .mcard')
   await wait(300)
   const onCreate = await page.$$eval('.mgroups .mgroup:nth-child(1) .mcard',
     (els) => els.map((e) => e.classList.contains('picked')))
-  check('01 里点卡片不再有选中态（09-19 撤的，别再找回来）',
+  check('点卡片主体不产生选中态（09-19 否过的那条别找回来）',
     onCreate.length > 0 && onCreate.every((x) => x === false), JSON.stringify(onCreate))
   await page.click('.mgroups .mgroup:nth-child(1) .mcard')
+  await wait(250)
+
+  // ⚠️ 勾选框只出现在**有提示词**的卡片上（没提示词就没东西可出）。
+  //    「添加素材」只填名字，所以这里先用「提示词」弹窗补一段 ——
+  //    顺带把那条链路也在这套真后端的 e2e 里走一遍（弹窗 → PATCH → 刷新）。
+  await page.evaluate(() => {
+    const c = document.querySelector('.mgroups .mgroup:nth-child(1) .mcard')
+    const b = [...c.querySelectorAll('.mops button')].find((x) => x.textContent.trim() === '提示词')
+    if (b) b.click()
+  })
+  await page.waitForSelector('.td-dialog', { timeout: 8000 })
+  await page.$eval('.td-dialog textarea.td-prompt', (el) => {
+    el.value = ''
+    el.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  await page.type('.td-dialog textarea.td-prompt', '二十岁少女，黑色短发，米色针织外套')
+  await page.evaluate(() => {
+    const d = document.querySelector('.td-dialog')
+    ;[...d.querySelectorAll('.pd-foot button')].find((b) => b.textContent.includes('保存')).click()
+  })
+  await wait(1600)
+  check('「提示词」弹窗能改并保存（改完勾选框才出现）',
+    (await page.$('.mgroups .mgroup:nth-child(1) .mcard .gpick')) !== null)
+
+  // ⚠️ 点击和计数要分开：Vue 是异步更新 DOM，同一个 evaluate 里点完立刻数会数到 0
+  //    （第一版就是这么写的，按钮那边已经变成「自动生成1」了、这里却报 0）。
+  await page.click('.mgroups .mgroup:nth-child(1) .mcard .gpick')
+  await wait(300)
+  const pickedByBox = await page.$$eval('.mgroups .mgroup:nth-child(1) .mcard.picked', (els) => els.length)
+  check('点缩略图左上角的勾选框能选中（批量「自动生成」的入口）',
+    pickedByBox === 1, String(pickedByBox))
+  const genBtn = await page.evaluate(() => {
+    const heads = [...document.querySelectorAll('.step-head .head-actions')]
+    const head = heads.find((h) => h.getBoundingClientRect().height > 0)
+    const b = [...head.querySelectorAll('button')].find((x) => x.textContent.trim().startsWith('自动生成'))
+    return b ? { 文案: b.textContent.replace(/\s+/g, ''), 禁用: b.disabled } : null
+  })
+  check('标题行的「自动生成」跟着解禁并显示数量',
+    genBtn?.文案 === '自动生成1' && genBtn?.禁用 === false, JSON.stringify(genBtn))
+  // 收尾：把勾选去掉，别影响后面的步骤
+  await page.evaluate(() => {
+    const heads = [...document.querySelectorAll('.step-head .head-actions')]
+    const head = heads.find((h) => h.getBoundingClientRect().height > 0)
+    const b = [...head.querySelectorAll('button')].find((x) => x.textContent.trim() === '清空')
+    if (b) b.click()
+  })
   await wait(250)
 
   // ---------- 6) 进工作台 · 切「分镜工作台」tab ----------

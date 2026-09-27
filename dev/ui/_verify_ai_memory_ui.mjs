@@ -13,7 +13,7 @@
 // 要验的几件事：
 //   ① 五类弹窗各自读**自己那个槽**（角色条目上形象图与音色是两个槽，别串）
 //   ② 比例回填；道具弹窗没有比例行
-//   ③ 存了脏比例（手改过 json）→ 回落默认值，且**必须有一颗 chip 高亮**
+//   ③ 存了脏比例（手改过 json）→ 回落默认 16:9，且**必须有一颗 chip 高亮**
 //      （脏值直接塞进 v-model 的话，用户看到的是"一个都没选中"）
 //   ④ 没生成过的素材 → 描述为空、比例是默认值（不该凭空填东西）
 import { createRequire } from 'node:module'
@@ -102,7 +102,7 @@ async function shot(name) {
 // 「添加素材」→ 选类型 → 填名字 → 保存（保存只落条目，不出图）
 async function addCard(kindLabel, name) {
   if (!(await page.$('.addform'))) {
-    await page.click('.head-actions .btn-ghost')
+    await page.click('.head-actions .add-material')
     await sleep(250)
   }
   await page.$$eval('.addform .af-kinds button',
@@ -231,17 +231,19 @@ try {
   console.log('\n  —— 脏比例（手改过 project.json） ——')
   d = await probe('脏值角色')
   check('脏值角色：描述照常回填', d.描述 === '脏比例的角色', String(d.描述))
-  check('脏值角色：比例回落成默认 1:1（不是原样 7:3）', d.选中 === '1:1', d.选中)
+  check('脏值角色：比例回落成默认 16:9（不是原样 7:3）', d.选中 === '16:9', d.选中)
   check('脏值角色：仍然恰好一颗 chip 高亮', d.高亮数 === 1, String(d.高亮数))
   d = await probe('脏值场景')
-  check('脏值场景：比例回落成作品画幅 16:9', d.选中 === '16:9', d.选中)
+  check('脏值场景：比例同样回落成 16:9', d.选中 === '16:9', d.选中)
   check('脏值场景：仍然恰好一颗 chip 高亮', d.高亮数 === 1, String(d.高亮数))
 
   // ---------- 6) 没生成过 → 空的，不凭空填 ----------
   console.log('\n  —— 没生成过的素材 ——')
   d = await probe('空白角色')
   check('没生成过的角色：描述是空的', d.描述 === '', JSON.stringify(d.描述))
-  check('没生成过的角色：比例是默认 1:1', d.选中 === '1:1', d.选中)
+  // 2026-09-27 起默认比例统一成 16:9（斌哥："文档里没给明图片比例，就默认 16:9"），
+  // 不再按类型分叉（角色原来是 1:1、场景/图片跟作品画幅）。素材条目上存了 ratio 时优先用它。
+  check('没生成过的角色：比例是默认 16:9', d.选中 === '16:9', d.选中)
 
   // ---------- 7) 关掉再打开，值不该被上一次清掉 ----------
   console.log('\n  —— 关掉再打开 ——')

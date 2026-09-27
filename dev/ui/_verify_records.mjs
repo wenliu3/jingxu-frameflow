@@ -28,11 +28,30 @@ const CHROME = 'C:/Program Files/Google/Chrome/Application/chrome.exe'
 const URL = process.env.E2E_URL || 'http://127.0.0.1:8000/'
 const API = process.env.E2E_API || 'http://127.0.0.1:8000'
 const ROOT = 'D:/Pychrom Project/ai_video_multiagent'
-// 伪造出片产物用的源文件（随便两个真 mp4 就行，我们只验"能不能列出来/播起来"）
-const SRC = [
-  `${ROOT}/outputs/_trash/20260914_150418_a0fcfd944b0e/videos/shot_01.mp4`,
-  `${ROOT}/outputs/_trash/20260914_150418_a0fcfd944b0e/videos/shot_02.mp4`,
-]
+// 伪造出片产物用的源文件（随便两个真 mp4 就行，我们只验"能不能列出来/播起来"）。
+// ⚠️ 原来写死了 `outputs/_trash/20260914_150418_a0fcfd944b0e/videos/shot_0N.mp4` ——
+//    那批回收站目录 2026-09-19 清理时被删掉了，脚本从此 ENOENT（"验证脚本执行完成"
+//    那条 FAIL 就是它，跟产品无关）。现在改成**现扫**：outputs/ 下（含 _trash/）随便找
+//    两个 mp4，只有一个就复用同一个，一个都没有才报错让人先随便出一段片。
+function findMp4(dir, out = [], depth = 0) {
+  if (depth > 4 || out.length >= 4) return out
+  let entries = []
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return out }
+  for (const e of entries) {
+    if (out.length >= 4) break
+    const full = path.join(dir, e.name)
+    if (e.isDirectory()) findMp4(full, out, depth + 1)
+    else if (e.name.toLowerCase().endsWith('.mp4')) out.push(full)
+  }
+  return out
+}
+function pickSrc() {
+  const found = findMp4(path.join(ROOT, 'outputs'))
+  if (!found.length) {
+    throw new Error('outputs/ 下一个 mp4 都没有，没法伪造出片产物（先在界面上随便出一段片再来跑）')
+  }
+  return [found[0], found[1] || found[0]]
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const results = []
@@ -141,7 +160,10 @@ const detailProbe = () => page.evaluate(() => {
     })),
     参数: [...sd.querySelectorAll('.sd-params > div')].map((d) =>
       `${d.querySelector('dt')?.textContent.trim()}=${d.querySelector('dd')?.textContent.trim()}`),
-    中文: sd.querySelector('.sd-note')?.textContent.trim() || '',
+    // ⚠️ `.sd-note` 现在有**两个**（素材那块解释标签含义、提示词那块显示"你当时写的是"），
+    //    取第一个会拿到标签解释 → "带出了用户当时写的中文描述"那条断言假 FAIL。
+    //    要的是提示词那块里的那一个。
+    中文: sd.querySelector('.sd-promptblock .sd-note')?.textContent.trim() || '',
     提示词: sd.querySelector('.sd-prompt')?.textContent.trim() || '',
     无记录: (sd.querySelector('.sd-nofound')?.textContent || '').trim(),
     // 素材行必须是整行宽的（名字撑开、角色标签顶到右端），否则两列会显得空一半
@@ -160,7 +182,7 @@ const detailProbe = () => page.evaluate(() => {
 })
 
 async function makeDraft(kindLabel, name) {
-  await page.click('.head-actions .btn-ghost')
+  await page.click('.head-actions .add-material')
   await sleep(300)
   await page.$$eval('.addform .af-kinds button',
     (els, t) => els.find((e) => e.textContent.trim() === t).click(), kindLabel)
@@ -186,6 +208,8 @@ try {
 
   // ---------- 1) 伪造两段出片产物 ----------
   fs.mkdirSync(segDir(), { recursive: true })
+  const SRC = pickSrc()
+  console.log('  伪造源：', SRC.map((p) => path.basename(path.dirname(p)) + '/' + path.basename(p)).join('、'))
   SRC.forEach((src, i) => {
     fs.copyFileSync(src, path.join(segDir(), `seg_fake${i + 1}.mp4`))
   })
@@ -280,7 +304,9 @@ try {
   check('素材列出了 2 项、名字是用户认得的',
     (det.素材 || []).map((m) => m.名).join('/') === '林晚/雨夜街道',
     JSON.stringify(det.素材))
-  check('标了首帧 / 尾帧', (det.素材 || []).map((m) => m.角色).join('/') === '首帧/尾帧',
+  // 标签文案 2026-09-19 起是「首帧图 / 尾帧图」（`.sd-role` 走 App.vue 的 ROLE_LABEL），
+  // 原来这里写的是「首帧 / 尾帧」→ 文案改了之后一直假 FAIL。
+  check('标了首帧图 / 尾帧图', (det.素材 || []).map((m) => m.角色).join('/') === '首帧图/尾帧图',
     JSON.stringify((det.素材 || []).map((m) => m.角色)))
   // 靠肉眼在缩略图上看这条会看错（我第一遍就以为没顶到右边），所以用几何量卡死
   check('素材行是整行宽的、角色标签顶到右端',

@@ -404,11 +404,15 @@ class CharacterPatch(BaseModel):
 
     锚点是分镜提示词和定妆照共用的角色一致性描述；
     tts_voice 是 voice 那段文字描述的"降级落地"（具体一个音色 id），造音色样本用。
+
+    ratio 是**出图比例**（2026-09-27 加）：素材规划助手读文档时落下的那个值，
+    用户也能在「提示词」弹窗里改。空字符串＝清掉（前端会回落到默认 16:9）。
     """
     name: str | None = Field(None, min_length=1, max_length=40)
     anchor: str | None = Field(None, max_length=2000)
     voice: str | None = Field(None, max_length=500)
     tts_voice: str | None = Field(None, max_length=80)
+    ratio: str | None = Field(None, max_length=8)
 
 
 class CharacterCreate(BaseModel):
@@ -497,8 +501,10 @@ class AssetCreate(BaseModel):
 
 
 class AssetPatch(BaseModel):
+    """素材编辑。ratio 同 CharacterPatch.ratio —— 出图比例，可在「提示词」弹窗里改。"""
     name: str | None = Field(None, min_length=1, max_length=40)
     anchor: str | None = Field(None, max_length=2000)
+    ratio: str | None = Field(None, max_length=8)
 
 
 class BlockCreate(BaseModel):
@@ -1239,6 +1245,25 @@ def _remove_trash_dir(src: str) -> str:
     return ""
 
 
+def _remove_one_file(path: str) -> str:
+    """删**单个文件**。成功 / 本来就不存在 → `""`；失败 → 给人看的原因。
+
+    和 `_remove_trash_dir` 是同一条坑的两半：沙箱的安全删除护栏抛的是
+    **`SystemExit` 而不是 `OSError`**，只写 `except OSError` 会让它冒到 ASGI，
+    被 Starlette 变成一句 `text/plain` 的 "Internal Server Error" ——
+    前端连"为什么没删掉"都看不到（2026-09-27 实测：删文档时就是这么 500 的）。
+    """
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return ""
+    except SystemExit:                                      # 护栏在动手之前就拦下了
+        return _PURGE_BLOCKED_HINT
+    except OSError as exc:
+        return f"删除失败：{exc}"
+    return "" if not os.path.exists(path) else _PURGE_BLOCKED_HINT
+
+
 @app.get("/api/trash")
 def list_trash() -> dict:
     """回收站里有什么（删过的作品，还占着磁盘）。"""
@@ -1359,6 +1384,13 @@ def patch_character(task_id: str, index: int, patch: CharacterPatch) -> dict:
             char["anchor"] = patch.anchor.strip()
             char["stale"] = True
             changed = True
+        # 出图比例：改了也标记 stale —— 已经出的那张图是旧比例的，跟新设定对不上
+        if patch.ratio is not None:
+            want = _require_ratio(patch.ratio) if patch.ratio.strip() else PLAN_RATIO_DEFAULT
+            if want != char.get("ratio"):
+                char["ratio"] = want
+                char["stale"] = True
+                changed = True
         voice_changed = False
         if patch.voice is not None and patch.voice.strip() != char.get("voice", ""):
             char["voice"] = patch.voice.strip()
@@ -1379,12 +1411,10 @@ def patch_character(task_id: str, index: int, patch: CharacterPatch) -> dict:
                 char["tts_voice"] = picked
                 fname = str(char.get("voice_sample") or "")
                 if fname:
-                    try:
-                        old = os.path.join(_out_dir(task_id), "characters", fname)
-                        if os.path.isfile(old):
-                            os.remove(old)
-                    except OSError:
-                        pass
+                    # 删旧样本是**尽力而为**：删不掉也不能让这次 PATCH 失败（下次生成会覆盖它）。
+                    # ⚠️ 必须连 SystemExit 一起接 —— 沙箱护栏抛的是 SystemExit 不是 OSError，
+                    #    漏了它「改个音色描述」就会变成一句 500（2026-09-27 修的）。
+                    _remove_one_file(os.path.join(_out_dir(task_id), "characters", fname))
                     char["voice_sample"] = ""
         if changed:
             _persist(task_id)
@@ -1479,11 +1509,15 @@ def _history_versions(task_id: str, kind: str, safe: str) -> list[dict[str, Any]
 
 
 def _prune_history(task_id: str, kind: str, safe: str) -> None:
-    """只留最近 HISTORY_KEEP 版。删不掉（沙箱护栏等）就算了 —— 绝不让出图失败。"""
+    """只留最近 HISTORY_KEEP 版。删不掉（沙箱护栏等）就算了 —— 绝不让出图失败。
+
+    ⚠️ 要接 `SystemExit`：它继承 `BaseException` 不是 `Exception`，只写 `except Exception`
+    接不住（2026-09-27 全项目扫了一遍，好几处都是这个漏法）。
+    """
     for old in _history_versions(task_id, kind, safe)[HISTORY_KEEP:]:
         try:
             shutil.rmtree(os.path.join(_history_dir(task_id, kind, safe), old["name"]))
-        except Exception:                       # noqa: BLE001 - 收尾失败不影响出图
+        except (Exception, SystemExit):         # noqa: BLE001 - 收尾失败不影响出图
             pass
 
 
@@ -1492,12 +1526,18 @@ def _drop_history_dir(task_id: str, kind: str, safe: str, name: str) -> None:
 
     切完那一版的内容已经原样复制回当前文件了，而「当前这版」永远排在列表第一条 ——
     目录再留着，弹窗里同一张图就会出现两次。删不掉就算了，绝不让切版失败。
+
+    ⚠️⚠️ **必须连 `SystemExit` 一起接**（2026-09-27 修）：它继承自 `BaseException` 而**不是**
+    `Exception`，只写 `except Exception` 接不住。症状很隐蔽 —— 切版其实**已经成功并落盘**了
+    （磁盘上的图真的换了、`version` 也换了），但收尾这行抛出的 SystemExit 冒到 ASGI
+    变成 500，前端 `useMaterialHistory()` 收到失败就**不刷新**，用户看到的是
+    "点了没反应 + 一句报错"。沙箱的安全删除护栏、Windows 上文件被占用，都会走到这条路。
     """
     if not _HISTORY_NAME_RE.match(name or ""):
         return
     try:
         shutil.rmtree(os.path.join(_history_dir(task_id, kind, safe), name))
-    except Exception:                           # noqa: BLE001 - 收尾失败不影响切版
+    except (Exception, SystemExit):             # noqa: BLE001 - 收尾失败不影响切版
         pass
 
 
@@ -1755,9 +1795,11 @@ def reroll_character(task_id: str, index: int) -> dict:
         _material_files("character", project.characters[index]),
         str(_entry_field(project.characters[index], "version", "") or ""),
     )
+    # 删旧图**尽力而为**：删不掉也不该让"重新生成"失败 —— 下面生成的还是同名文件，
+    # 会直接覆盖（旧版已经在上面存进历史了）。⚠️ 别用裸 os.remove：护栏抛的是 SystemExit。
     for p in project.characters[index].images or []:
         if os.path.isfile(p):
-            os.remove(p)
+            _remove_one_file(p)
     project.characters[index].images = []
     project.characters[index].image_path = ""
     try:
@@ -3062,10 +3104,7 @@ def delete_character(task_id: str, index: int) -> dict:
             f"{pipeline._safe_char_name(removed.get('name', ''))}{suffix}.png",
         )
         if os.path.isfile(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+            _remove_one_file(p)      # 尽力而为，删不掉也不该让"删角色"失败
     with LOCK:
         _persist(task_id)
     return {"deleted": removed.get("name", "")}
@@ -3198,10 +3237,7 @@ def upload_asset_file(task_id: str, index: int, body: UploadBody) -> dict:
         safe = pipeline._safe_char_name(name)
         for fn in os.listdir(adir):
             if fn.startswith(f"snd_{safe}.") and fn != os.path.basename(path):
-                try:
-                    os.remove(os.path.join(adir, fn))
-                except OSError:
-                    pass
+                _remove_one_file(os.path.join(adir, fn))   # 尽力而为（同上）
     with open(path, "wb") as fh:
         fh.write(raw)
 
@@ -3303,6 +3339,13 @@ def patch_asset(task_id: str, index: int, patch: AssetPatch) -> dict:
             entry["anchor"] = patch.anchor.strip()
             entry["stale"] = True
             changed = True
+        # 出图比例（同 patch_character）
+        if patch.ratio is not None:
+            want = _require_ratio(patch.ratio) if patch.ratio.strip() else PLAN_RATIO_DEFAULT
+            if want != entry.get("ratio"):
+                entry["ratio"] = want
+                entry["stale"] = True
+                changed = True
         if changed:
             _persist(task_id)
         return dict(entry)
@@ -3321,10 +3364,7 @@ def delete_asset(task_id: str, index: int) -> dict:
         removed = assets.pop(index)
     for p in removed.get("images") or []:
         if os.path.isfile(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+            _remove_one_file(p)      # 尽力而为，删不掉也不该让"删角色"失败
     with LOCK:
         _persist(task_id)
     return {"deleted": removed.get("name", "")}
@@ -3559,10 +3599,7 @@ def delete_block(task_id: str, block_id: int) -> dict:
         if not os.path.isfile(p) and not os.path.isabs(rel):
             p = os.path.join(_out_dir(task_id), "images", rel)
         if os.path.isfile(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+            _remove_one_file(p)      # 尽力而为，删不掉也不该让"删角色"失败
     return {"deleted": block_id}
 
 
@@ -3664,9 +3701,9 @@ def reroll_asset(task_id: str, index: int) -> dict:
         _material_files("", project.assets[index]),
         str(_entry_field(project.assets[index], "version", "") or ""),
     )
-    for p in project.assets[index].images or []:
+    for p in project.assets[index].images or []:      # 尽力而为，同上
         if os.path.isfile(p):
-            os.remove(p)
+            _remove_one_file(p)
     try:
         pipeline._gen_assets(project, _out_dir(task_id), seed_salt=uuid.uuid4().hex[:8])
     except Exception as exc:
@@ -4443,10 +4480,7 @@ def upload_character_voice(task_id: str, index: int, body: UploadBody) -> dict:
     # 换样本要清掉旧后缀，否则目录里会留两份、重启后认到的是排序靠前的那份
     for fn in os.listdir(cdir):
         if fn.startswith(f"voice_{safe}."):
-            try:
-                os.remove(os.path.join(cdir, fn))
-            except OSError:
-                pass
+            _remove_one_file(os.path.join(cdir, fn))   # 尽力而为（同上）
     fname = f"voice_{safe}{ext}"
     with open(os.path.join(cdir, fname), "wb") as fh:
         fh.write(raw)
@@ -4654,6 +4688,535 @@ def assistant(body: AssistantBody) -> dict:
         "reply": reply,
         "created": {"characters": created_chars, "assets": created_assets},
         "skipped": skipped,
+        "rejected": rejected,
+        "suggestions": [
+            str(s).strip()[:40] for s in (data.get("suggestions") or []) if str(s).strip()
+        ][:4],
+    }
+
+
+# ============================================================ 素材规划助手（文档 → 素材）
+# 2026-09-27 斌哥提的：一个一个手填素材太慢，想"丢一份文档进去，让它把角色/场景/道具/音色
+# 连同各自的提示词先攒好，但先别生成，我核对完再点生成"。
+#
+# 与上面 `/api/assistant` 的分工：
+#   `/api/assistant`      —— 闲聊式对话，**凭空**帮你想素材，同名条目会跳过。
+#   `/api/tasks/{id}/assistant/plan` —— 读用户上传的**文档**抽取素材，同名条目会**改写**
+#                                       （这样"第二个场景改成黄昏"能落下去）。
+# 两条路都只写条目和锚点，**不出图、不出音、不占出图/出片额度** —— 生成永远由用户点。
+
+# 能直接当文本读的后缀。刻意不收 .html：满屏标签当上下文喂模型是噪音，不如让用户存成 md。
+DOC_TEXT_EXTS = (
+    ".md", ".markdown", ".txt", ".text", ".json", ".csv",
+    ".tsv", ".yaml", ".yml", ".srt", ".log",
+)
+# 需要解析器才能出文本的后缀（docx 用标准库解、pdf 找现成的库）
+DOC_BINARY_EXTS = (".docx", ".pdf")
+DOC_EXTS = DOC_TEXT_EXTS + DOC_BINARY_EXTS
+
+# 喂给模型的文档预算：单份 / 合计。剧本动辄几万字，全塞进去既慢又贵，
+# 截断比报错好 —— 超了就在上下文里写一行「（已截断）」让模型自己知道。
+_DOC_CHARS_PER_FILE = 15000
+_DOC_CHARS_TOTAL = 45000
+
+
+def _docs_dir(task_id: str) -> str:
+    return os.path.join(_out_dir(task_id), "docs")
+
+
+def _safe_doc_name(name: str) -> str:
+    """文档落盘名：只取 basename（防穿越）+ 洗掉路径非法字符，保留中文与原后缀。"""
+    base = os.path.basename(str(name or "").replace("\\", "/"))
+    base = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", base).strip().strip(".")
+    stem, ext = os.path.splitext(base)
+    stem = stem.strip()[:60]
+    if not stem:
+        raise HTTPException(status_code=422, detail="文件名不合法")
+    return f"{stem}{ext.lower()}"
+
+
+def _docx_text(raw: bytes) -> str:
+    """docx → 纯文本。**用标准库**（docx 就是个 zip，正文在 word/document.xml）。
+
+    不引 python-docx：项目 requirements 里没有它，而这点活儿 zipfile + ElementTree
+    就够 —— 少一个依赖就少一处"换台机器跑不起来"。
+    """
+    import io as _io
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    try:
+        with zipfile.ZipFile(_io.BytesIO(raw)) as zf:
+            xml = zf.read("word/document.xml")
+    except (zipfile.BadZipFile, KeyError, OSError):
+        return ""
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return ""
+    lines: list[str] = []
+    for para in root.iter(f"{ns}p"):
+        buf: list[str] = []
+        for node in para.iter():
+            if node.tag == f"{ns}t" and node.text:
+                buf.append(node.text)
+            elif node.tag == f"{ns}br":
+                buf.append("\n")
+            elif node.tag == f"{ns}tab":
+                buf.append("\t")
+        lines.append("".join(buf))
+    return "\n".join(lines)
+
+
+def _pdf_text(raw: bytes) -> str:
+    """pdf → 纯文本。按 PyMuPDF → pdfminer → pypdf 的顺序找一个能用的。
+
+    三个都不是项目依赖，**一个都没有时给一句人话**，而不是抛 ImportError
+    （用户看到 ModuleNotFoundError 只会以为是产品坏了）。扫描件 PDF 抽不出字，
+    走的是下面 `_doc_text` 那条"没读到文字"的提示。
+    """
+    import io as _io
+
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        fitz = None
+    if fitz is not None:
+        try:
+            with fitz.open(stream=raw, filetype="pdf") as doc:
+                return "\n".join(page.get_text() for page in doc)
+        except Exception:
+            return ""
+
+    try:
+        from pdfminer.high_level import extract_text as _pm_extract
+    except ImportError:
+        _pm_extract = None
+    if _pm_extract is not None:
+        try:
+            return _pm_extract(_io.BytesIO(raw))
+        except Exception:
+            return ""
+
+    try:
+        import pypdf
+    except ImportError:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "这台机器上没装能读 PDF 的库（PyMuPDF / pdfminer.six / pypdf 都没有）。"
+                "把文档另存成 md 或 txt 再传，一样能抽素材。"
+            ),
+        ) from None
+    try:
+        reader = pypdf.PdfReader(_io.BytesIO(raw))
+        return "\n".join((page.extract_text() or "") for page in reader.pages)
+    except Exception:
+        return ""
+
+
+def _doc_text(name: str, raw: bytes) -> str:
+    """按后缀把上传的文件变成文本；不支持的格式 / 读不出字都直接报清楚的原因。"""
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in DOC_EXTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"不支持的文件类型「{ext or '（无后缀）'}」，可以传：{'、'.join(DOC_EXTS)}",
+        )
+    if ext in (".docx",):
+        text = _docx_text(raw)
+    elif ext == ".pdf":
+        text = _pdf_text(raw)
+    else:
+        # md/txt 这类：先按 utf-8 读，读不动再试 gbk（Windows 记事本另存的老文件），
+        # 最后才用 replace 兜底 —— 宁可有个别乱码，也别整份文件读不进来。
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = raw.decode("gbk")
+            except UnicodeDecodeError:
+                text = raw.decode("utf-8", errors="replace")
+    # 统一换行 + 收掉连续空行：模型读起来省 token，截断也更划算
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not text:
+        raise HTTPException(
+            status_code=422,
+            detail=f"「{name}」里没读到文字（扫描件 PDF / 纯图文档读不出来），换一份文本版再传。",
+        )
+    return text
+
+
+def _list_docs(task_id: str) -> list[dict]:
+    """扫 docs/ 列出已上传的文档。**不解析正文** —— 列表要秒回，解析留给真正要用的那一刻。"""
+    ddir = _docs_dir(task_id)
+    if not os.path.isdir(ddir):
+        return []
+    out: list[dict] = []
+    for fn in sorted(os.listdir(ddir)):
+        path = os.path.join(ddir, fn)
+        if not os.path.isfile(path):
+            continue
+        ext = os.path.splitext(fn)[1].lower()
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        out.append({
+            "name": fn,
+            "ext": ext.lstrip("."),
+            "bytes": stat.st_size,
+            "mtime": int(stat.st_mtime),
+        })
+    return out
+
+
+@app.get("/api/tasks/{task_id}/docs")
+def list_docs(task_id: str) -> dict:
+    """素材规划助手左侧那排附件 chip 的数据源。"""
+    with LOCK:
+        _task(task_id)
+    return {"docs": _list_docs(task_id)}
+
+
+@app.post("/api/tasks/{task_id}/docs")
+def upload_doc(task_id: str, body: UploadBody) -> dict:
+    """上传一份文档（md / txt / docx / pdf…），**当场解析一遍确认能读**，读不出就拒收。
+
+    同名文件直接覆盖 —— 文档不像素材图，"同一份剧本改了一版再传"是最常见的用法，
+    留两份反而会让助手把旧版也抽一遍。
+    """
+    name = _safe_doc_name(body.filename)
+    raw = _decode_upload(body)
+    if len(raw) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="文档超过 20 MB，先精简一下再传")
+    text = _doc_text(name, raw)   # 解析失败在这里就 422，不会在 docs/ 里留个读不动的文件
+
+    with LOCK:
+        _task(task_id)
+        ddir = _docs_dir(task_id)
+        os.makedirs(ddir, exist_ok=True)
+        replaced = os.path.isfile(os.path.join(ddir, name))
+        with open(os.path.join(ddir, name), "wb") as fh:
+            fh.write(raw)
+
+    return {
+        "name": name,
+        "chars": len(text),
+        "replaced": replaced,
+        "preview": text[:200],
+        "docs": _list_docs(task_id),
+    }
+
+
+@app.delete("/api/tasks/{task_id}/docs/{name}")
+def delete_doc(task_id: str, name: str, confirm: bool = False) -> dict:
+    """删一份文档。`confirm=true` 是硬要求 —— 名字来自 URL，防手滑/防脚本误删。"""
+    if not confirm:
+        raise HTTPException(status_code=409, detail="删除文档需要 confirm=true")
+    safe = os.path.basename(name)
+    if not safe or safe != name:
+        raise HTTPException(status_code=400, detail="文档名不合法")
+    with LOCK:
+        _task(task_id)
+        path = os.path.join(_docs_dir(task_id), safe)
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail=f"没有这份文档：{safe}")
+        # 走 _remove_one_file：护栏拦下时给一句人话，而不是裸 SystemExit → text/plain 的 500
+        reason = _remove_one_file(path)
+        if reason:
+            raise HTTPException(status_code=500, detail=reason)
+    return {"ok": True, "docs": _list_docs(task_id)}
+
+
+# 素材图能出的比例，**必须与 image_provider.SIZE_TABLE 的键一致**（前端 AI_RATIOS 同源）。
+# 文档里写了画幅就照抄，没写就是 16:9 —— 见 ASSISTANT_PLAN_SYSTEM。
+PLAN_RATIOS = ("16:9", "9:16", "1:1", "4:3", "3:4")
+PLAN_RATIO_DEFAULT = "16:9"
+
+
+def _norm_ratio(value: Any) -> str:
+    """把模型给的 ratio 归一：不在白名单里的一律当"没说"，由调用方决定填默认值还是不动。"""
+    text = str(value or "").strip().replace("：", ":")
+    return text if text in PLAN_RATIOS else ""
+
+
+def _require_ratio(value: str) -> str:
+    """PATCH 进来的比例必须**明确合法**（这里是用户手点的，不该像模型那样宽容）。
+
+    脏值存进去的后果和 `ai_last` 那条一样：前端五颗 chip 会一颗都不高亮，
+    用户看到的是"一个都没选中"，比报个错更费解。
+    """
+    text = str(value or "").strip().replace("：", ":")
+    if text not in PLAN_RATIOS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"不支持的比例「{value}」，可选：{'、'.join(PLAN_RATIOS)}",
+        )
+    return text
+
+
+class AssistantPlanBody(BaseModel):
+    """素材规划助手的一轮。
+
+    message 可以为空 —— 只拖了文档、什么都没打就点发送是最自然的用法
+    （"按这份文档把素材攒齐"）。两者都空才拦。
+
+    docs 是这一轮要读的文档名。**`None`（前端没传这个字段）＝读这个作品下已上传的全部文档；
+    传了空数组＝一份都不读** —— 两者必须区分开：用户把附件 chip 全删掉之后，
+    助手不该还在背地里读那几份文档。
+    history 同 `/api/assistant`：由前端回传最近几轮，后端不存会话。
+    """
+    message: str = Field("", max_length=4000)
+    history: list[dict] = Field(default_factory=list)
+    docs: list[str] | None = None
+
+
+ASSISTANT_PLAN_SYSTEM = """你是「镜序 FRAMEFLOW」的素材规划助手。用户会给你**他自己的创作文档**
+（剧本 / 设定 / 大纲 / 人物小传 / 分场表…），你要从中把这部片子要用的素材抽出来、补齐成可直接出图的
+设定，写成条目落进作品。
+
+这一步**只落条目和提示词，不出图、不出音** —— 用户会先逐条核对，确认之后自己点生成。
+所以你的产出必须是"能直接拿去出图的描述"，不是"待办清单"。
+
+只输出这个 JSON 结构，不要多余字段：
+{
+  "reply": "给用户看的中文回复：先说抽到了什么（几个角色 / 场景 / 道具），再点出需要他核对或补充的地方。2-6 句，可以分行。",
+  "title": "作品名（文档里有明确片名才填，否则空串）",
+  "logline": "一句话故事（文档里看得出故事才填，否则空串）",
+  "style": "影像风格（文档里写了风格才填，否则空串）",
+  "characters": [{"name": "角色名", "anchor": "固定可复述的外貌特征", "voice": "声音设计", "ratio": "16:9"}],
+  "assets": [{"kind": "scene 或 prop", "name": "素材名", "anchor": "视觉锚点", "ratio": "16:9"}],
+  "suggestions": ["下一步建议1", "下一步建议2"]
+}
+
+画幅比例 ratio（给"出图时按什么比例出"用）：
+- 文档里**写明了画幅 / 比例 / 横竖屏**（如"竖屏短剧""16:9 电影画幅""抖音竖版"），
+  就填最接近的那一个：**16:9（横屏）/ 9:16（竖屏）/ 1:1（方图）/ 4:3 / 3:4**。
+- 文档里**没写**，一律填 **"16:9"**。
+- 只能是上面这五个值之一，不要写别的（写了也会被丢掉、退回 16:9）。
+- 同一个作品里各条可以不同（比如竖屏短剧里的人物定妆照也可以填 9:16）。
+
+抽取纪律（最重要）：
+- **只从文档里抽。** 文档里没有的角色 / 场景 / 道具，一个字都不要编。
+- 只提了名字、没有任何外貌描写的角色**也要抽**，anchor 用「文档未描写，待补充」占位，
+  并在 reply 里点名说清是哪几个 —— 用户要的是一份"待他补"的清单，不是被悄悄跳过的人。
+- name 必须是文档里出现过的**完整名字**（2 个字以上）。不要用「主角」「女主」「路人甲」这种占位称呼；
+  文档通篇只有称呼时，用最有辨识度的那个称呼，并在 reply 里说明。
+- 同一部戏里同一个角色只出现一次，不要因为换了称呼就抽两遍。
+- 场景按"故事发生地"抽（深山古道 / 城郊破庙），**不是**某个镜头的画面；道具只抽有戏份、要跨镜一致的。
+
+锚点纪律（写不对整条链路都会跑偏）：
+- 角色锚点：固定的、可复述的视觉事实 —— 年龄、发型发色、服装、显著特征。禁止"帅气""忧郁"这类
+  落不到画面的词；疤痕/痣等小特征要带程度词（浅淡/细微）。
+- 场景锚点：空间结构 + 光源方向 + 材质质感，**禁止出现任何人物**。
+- 道具锚点：材质 / 颜色 / 形状 / 磨损细节，禁止情绪词。
+- voice：年龄感 + 音色 + 语速语气，例如"清亮的少女音，语速偏快"。
+
+改已有素材：如果用户这句话是要**改**已经存在的角色 / 场景 / 道具（"第二个场景改成黄昏""林晚再年轻些"），
+就把同名条目**再写一遍**，anchor 填**改完之后的完整描述** —— 系统会用新值覆盖旧的。
+不要只写变化的那几个字，用户要的是可以直接拿去出图的完整描述。
+改的时候 ratio 也要一起写（用户没提比例就照文档 / 按上面那条填 16:9），别留空。
+
+行为准则：
+- 用户只是提问、或文档里确实没有素材可抽时，characters / assets 留空数组，并在 reply 里说清楚为什么。
+- reply 里要说清"这些只是条目和提示词，还没出图"，并给一个自然的下一步。"""
+
+
+@app.post("/api/tasks/{task_id}/assistant/plan")
+def assistant_plan(task_id: str, body: AssistantPlanBody) -> dict:
+    """素材规划助手一轮：读文档 → 抽素材与提示词 → 落进作品（**不出图、不出音**）。
+
+    与 `/api/assistant` 的关键差别是**同名条目会被改写**：规划助手最常见的第二个用法是
+    "把刚才那个场景改成黄昏"，跳过同名就永远改不动。
+    """
+    message = body.message.strip()
+    with LOCK:
+        task = _task(task_id)
+    project = task.get("project") or {}
+
+    # 要读哪几份文档：**没传 docs 字段**＝全部；传了（哪怕空数组）就按传的来，只保留真实存在的
+    have = {d["name"] for d in _list_docs(task_id)}
+    if body.docs is None:
+        want = sorted(have)
+    else:
+        want = [n for n in body.docs if n in have]
+    if not want and not message:
+        raise HTTPException(status_code=422, detail="传一份文档，或说一句话，总得给我点东西")
+
+    blocks: list[str] = []
+    used: list[str] = []
+    budget = _DOC_CHARS_TOTAL
+    for name in want:
+        try:
+            with open(os.path.join(_docs_dir(task_id), name), "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        try:
+            text = _doc_text(name, raw)
+        except HTTPException:
+            # 单份读不出来不该让整轮失败（用户可能混着传了一份扫描件），跳过即可
+            continue
+        if budget <= 0:
+            break
+        piece = text[:_DOC_CHARS_PER_FILE]
+        if len(piece) > budget:
+            piece = piece[:budget]
+        if len(piece) < len(text):
+            piece += "\n…（文档过长，此处已截断）"
+        budget -= len(piece)
+        blocks.append(f"--- {name} ---\n{piece}")
+        used.append(name)
+
+    history_lines = []
+    for item in (body.history or [])[-8:]:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or item.get("content") or "").strip()
+        if not text:
+            continue
+        who = "助手" if str(item.get("role")) == "assistant" else "用户"
+        history_lines.append(f"[{who}] {text[:600]}")
+
+    user = _assistant_context(task)
+    if blocks:
+        user += "\n\n用户上传的文档（素材只许从这里抽）：\n" + "\n\n".join(blocks)
+    else:
+        user += "\n\n（这一轮没有可读的文档，只能按上面的已有素材和用户的话来回答。）"
+    if history_lines:
+        user += "\n\n最近的对话：\n" + "\n".join(history_lines)
+    user += f"\n\n用户这句话：{message or '（没说话，只传了文档 —— 按文档把素材攒齐）'}"
+
+    try:
+        data = llm.chat_json(ASSISTANT_PLAN_SYSTEM, user, temperature=0.5)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail=f"助手调用失败：{type(exc).__name__}: {exc}"
+        ) from exc
+
+    created_chars: list[str] = []
+    updated_chars: list[str] = []
+    created_assets: list[str] = []
+    updated_assets: list[str] = []
+    rejected: list[str] = []
+
+    with LOCK:
+        project = task.get("project")
+        if not project:
+            raise HTTPException(status_code=409, detail="作品数据不完整")
+
+        # 标题/故事/风格只在用户还没定的时候写 —— 同 /api/assistant，助手不该覆盖用户的设定
+        title = str(data.get("title") or "").strip()
+        if title and str(project.get("title") or "") in ("", "未命名作品"):
+            project["title"] = title[:80]
+        logline = str(data.get("logline") or "").strip()
+        if logline and not str(project.get("logline") or "").strip():
+            project["logline"] = logline[:2000]
+        style = str(data.get("style") or "").strip()
+        if style and not str(project.get("style") or "").strip():
+            project["style"] = style[:500]
+
+        chars = project.setdefault("characters", [])
+        for raw_item in (data.get("characters") or [])[:20]:
+            if not isinstance(raw_item, dict):
+                continue
+            name = str(raw_item.get("name") or "").strip()[:40]
+            if not name:
+                continue
+            if _looks_like_junk_name(name):
+                rejected.append(name)
+                continue
+            anchor = str(raw_item.get("anchor") or "").strip()[:2000]
+            voice = str(raw_item.get("voice") or "").strip()[:500]
+            # ratio：模型没给（或给了白名单外的值）＝"没说" → 新建时填 16:9，改写时保留原值。
+            # ⚠️ 两者必须分开：改写时若无脑填默认值，用户上一轮定的 9:16 会被悄悄抹成 16:9。
+            ratio = _norm_ratio(raw_item.get("ratio"))
+            hit = next((c for c in chars if str(c.get("name") or "") == name), None)
+            if hit is not None:
+                # 同名＝用户在让它改这一条。空值不覆盖（模型没给的就保留原样）
+                if anchor and anchor != hit.get("anchor"):
+                    hit["anchor"] = anchor
+                    hit["anchor_en"] = ""   # 锚点换了，旧的英文锚点就作废了
+                if voice:
+                    hit["voice"] = voice
+                if ratio:
+                    hit["ratio"] = ratio
+                updated_chars.append(name)
+                continue
+            chars.append({
+                "name": name,
+                "anchor": anchor,
+                "anchor_en": "",
+                "voice": voice,
+                "tts_voice": "",
+                "voice_sample": "",
+                "image_path": "",
+                "images": [],
+                "ratio": ratio or PLAN_RATIO_DEFAULT,
+            })
+            created_chars.append(name)
+
+        assets = project.setdefault("assets", [])
+        for raw_item in (data.get("assets") or [])[:20]:
+            if not isinstance(raw_item, dict):
+                continue
+            name = str(raw_item.get("name") or "").strip()[:40]
+            if not name:
+                continue
+            # 素材名允许一个字（「刀」「伞」都算合理），只拦"整串都是助词"
+            if _looks_like_junk_name(name, min_len=1):
+                rejected.append(name)
+                continue
+            kind = str(raw_item.get("kind") or "prop").strip()
+            if kind not in ("scene", "prop"):
+                kind = "prop"
+            anchor = str(raw_item.get("anchor") or "").strip()[:2000]
+            ratio = _norm_ratio(raw_item.get("ratio"))
+            hit = next(
+                (a for a in assets
+                 if str(a.get("name") or "") == name and str(a.get("kind") or "") == kind),
+                None,
+            )
+            if hit is not None:
+                if anchor and anchor != hit.get("anchor"):
+                    hit["anchor"] = anchor
+                    hit["anchor_en"] = ""
+                if ratio:
+                    hit["ratio"] = ratio
+                updated_assets.append(name)
+                continue
+            assets.append({
+                "kind": kind, "name": name, "anchor": anchor,
+                "anchor_en": "", "images": [],
+                "ratio": ratio or PLAN_RATIO_DEFAULT,
+            })
+            created_assets.append(name)
+
+        # 新角色顺手分配一个不撞车的建议音色（只写 id，不合成样本 —— 合成要用户点）
+        assigned = tts.assign_voices(chars)
+        for ch in chars:
+            if not str(ch.get("tts_voice") or "").strip():
+                ch["tts_voice"] = assigned.get(str(ch.get("name") or ""), "")
+
+        _persist(task_id)
+        _save_meta(task_id)
+
+    reply = str(data.get("reply") or "").strip() or "我看过这份文档了。"
+    if rejected:
+        shown = "、".join(f"「{n}」" for n in rejected[:3])
+        reply += f"\n（这次给出的名字不完整（{shown}），我没有写进作品，麻烦让我重新生成一次。）"
+    if not (created_chars or created_assets or updated_chars or updated_assets):
+        reply += "\n（这一轮没有新增或修改任何素材。）"
+
+    return {
+        "task_id": task_id,
+        "reply": reply,
+        "docs_used": used,
+        "created": {"characters": created_chars, "assets": created_assets},
+        "updated": {"characters": updated_chars, "assets": updated_assets},
         "rejected": rejected,
         "suggestions": [
             str(s).strip()[:40] for s in (data.get("suggestions") or []) if str(s).strip()

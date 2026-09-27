@@ -197,7 +197,7 @@ try {
   console.log('='.repeat(74) + '\n')
 
   // ---------- 0) 建一个空白作品（走真实的「添加素材」流程） ----------
-  await page.click('.head-actions .btn-ghost')
+  await page.click('.head-actions .add-material')
   await sleep(300)
   await page.$$eval('.addform .af-kinds button',
     (els) => els.find((e) => e.textContent.trim() === '角色').click())
@@ -300,7 +300,13 @@ try {
   const after = await historyOf(createdTask, 0)
   check('切版后 version 换了', after.versions[0].version !== curVersion,
     `${curVersion} → ${after.versions[0].version}`)
-  check('接口层：切版后历史变 4 条（被顶掉的那版也留下了）', after.versions.length === 4,
+  // ⚠️ 期望是 **3 条不是 4 条** —— 别改成 4（改过一次，白跑）。
+  //    `material_history` 里有一条**有意设计的去重**（见后端那段 docstring）：
+  //    "跟当前这版一模一样的、以及彼此一模一样的，只保留最新的那一条"。
+  //    切回 V1 之后「当前」的图就是 V1 的内容，历史里那条 V1 会被合并掉 →
+  //    当前 + V2 + V3 = 3 条。（原来写 4 条是这条去重加进来之前的事。）
+  check('接口层：切版后历史是 3 条（当前 + 被顶掉的 2 版，重复的那条被合并）',
+    after.versions.length === 3,
     after.versions.map((v) => v.name || '(当前)').join(' / '))
 
   // ⚠️ 需求①的**核心断言**：没刷新浏览器，卡片上的图就换成新的了。
@@ -319,7 +325,7 @@ try {
 
   // ---------- 5) 弹窗自己也要刷新 ----------
   dlg = await dialogProbe()
-  check('切版后弹窗列表跟着刷新（还是 4 条）', dlg.版本数 === 4, `${dlg.版本数} 版`)
+  check('切版后弹窗列表跟着刷新（3 条，同上）', dlg.版本数 === 3, `${dlg.版本数} 版`)
   check('切完第一版变成「当前这版」',
     dlg.版本[0].当前 && dlg.版本[0].图src.includes('/files/'), JSON.stringify(dlg.版本[0]))
   check('刚被顶掉的绿那版出现在历史里（还能再切回去）',

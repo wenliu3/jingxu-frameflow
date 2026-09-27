@@ -46,7 +46,7 @@ async function shot(name) {
 
 async function pickKind(label) {
   if (!(await page.$('.addform'))) {
-    await page.click('.head-actions .btn-ghost')
+    await page.click('.head-actions .add-material')
     await sleep(250)
   }
   await page.$$eval('.addform .af-kinds button',
@@ -81,7 +81,9 @@ try {
   await pickKind('其他图片')
 
   // 2026-09-19：「AI 一键生成全部素材」从 01 的标题行撤掉了
-  // （斌哥：「你啥都没有，点这个意义不大」）。head-actions 里应该只剩「添加素材」。
+  // （斌哥：「你啥都没有，点这个意义不大」）。
+  // 2026-09-27：标题行里多了「AI 助手」（传文档攒素材，只落条目不出图），
+  //   所以这里**只断言"一键生成"没回来** + "添加素材"还在 —— 别再断言"只剩一颗"。
   const headBtns = await page.evaluate(() =>
     [...document.querySelectorAll('.head-actions button')].map((b) => b.textContent.trim()))
   check('01 标题行里没有「一键生成全部素材」了',

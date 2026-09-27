@@ -92,7 +92,7 @@ try {
 
   // 1) 建一个角色。添加流程：点「添加素材」→ 选「角色」→ 卡片直接出现在角色组里且是编辑态，
   //    在上面填名字（编辑态只有名字框，2026-09-15 起描述框已删），再保存。
-  await page.click('.head-actions .btn-ghost')
+  await page.click('.head-actions .add-material')
   await wait(300)
   await page.$$eval('.addform .af-kinds button',
     (els) => els.find((e) => e.textContent.trim() === '角色').click())

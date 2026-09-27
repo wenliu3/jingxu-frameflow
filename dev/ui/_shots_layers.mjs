@@ -50,7 +50,7 @@ async function shotStep02(name) {
 
 // 加一条素材。填了描述就不会去调文本模型设计锚点，快且不烧额度。
 async function addOne(kind, name, desc) {
-  await page.click('.head-actions .btn-ghost')
+  await page.click('.head-actions .add-material')
   await sleep(200)
   if (kind !== 'character') {
     await page.$$eval('.addform .seg button', (els, k) => els.find((e) => e.textContent.trim() === k).click(), kind)

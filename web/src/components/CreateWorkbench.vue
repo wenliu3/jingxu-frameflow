@@ -91,6 +91,13 @@ const items = computed(() => {
     out.character.push({
       key: `character:${i}`, kind: 'character', index: i, name: c.name,
       desc: c.images?.length ? '定妆照已就绪' : '定妆照待生成',
+      // 提示词＝这条素材的锚点。以前卡片上**看不到锚点**（唯一能改它的入口 09-17 撤了），
+      // 所以「AI 助手攒好素材、你核对完再生成」这条流程根本没法核对。
+      // 这里只**显示**（两行截断 + hover 看全文），不新增编辑入口 —— 改提示词走 AI 助手对话。
+      prompt: c.anchor || '',
+      // 出图比例：文档里写了就照抄，没写就是 16:9（后端 plan 落的 ratio）。
+      // 老素材 / 手动添加的条目上没有这个键 → 空串，弹窗里按默认 16:9 显示。
+      ratio: c.ratio || '',
       url: sheetUrl || faceUrl,
       // 出片时会送进模型的**那一张**（后端 _resolve_material_ref 是同一套规则，两边必须一致）：
       //   Ref2VA → 四视图设定图当参考图（信息最全，斌哥要的就是这个）
@@ -104,6 +111,8 @@ const items = computed(() => {
     out.voice.push({
       key: `voice:${i}`, kind: 'voice', index: i, name: c.name,
       desc: c.voice_sample ? `音色样本 · ${c.tts_voice || '未设定'}` : '音色待生成',
+      prompt: c.voice || '',
+      ratio: '',
       url: c.voice_sample ? api.characterVoiceUrl(props.taskId, c.voice_sample) : '',
       ready: !!c.voice_sample,
       ref: c,
@@ -123,6 +132,8 @@ const items = computed(() => {
       desc: bucket === 'audio'
         ? (ready ? '音频已就绪' : '音频待上传')
         : (ready ? '素材图已就绪' : (bucket === 'image' ? '图片待上传或生成' : '素材图待上传')),
+      prompt: a.anchor || '',
+      ratio: a.ratio || '',
       url: bucket === 'audio' ? '' : (sheetUrl || (ready ? api.assetImageUrl(props.taskId, a.images[0], a.version) : '')),
       audioUrl: ready && bucket === 'audio' ? `/files/${props.taskId}/assets/${String(a.images[0]).split(/[\\/]/).pop()}` : '',
       ready,
@@ -225,6 +236,148 @@ const frameItems = computed(() =>
   pickedItems.value.filter((x) => ['character', 'scene', 'prop', 'image'].includes(x.kind))
 )
 const frameRefs = computed(() => frameItems.value.map((x) => `${x.kind}:${x.index}`))
+
+// ---------------------------------------------------------------- 批量「自动生成」（2026-09-27）
+// 斌哥：「这边加一个按钮，就是自动生成，但是要选中才行…选中里面的素材，然后点这个自动生成
+// 还会自动对应那个对应的素材自动生成」。
+//
+// ⚠️ **和 2026-09-19 那次不一样**：那次撤掉 01 的选中，理由是"选了也不知道能有什么功能"
+//    （斌哥原话，见上面 `picked` 那段注释）。**现在有功能了**，所以选中重新长出来 ——
+//    但**规则跟 02 那套正好相反**：
+//      02 的 `picked` ＝"给这一段视频挑参考图"：I2V 下只能挑一张、场景至多一个、音色不能单独选；
+//      批量生成要的是"把这一批全出出来"：14 个场景要能全选、音色也要能选。
+//    所以**另起一个 `genPicked`**，千万别去改 `picked` 的规矩（会把 02 弄坏）。
+//
+// 出图用的提示词＝卡片上的 `it.prompt`（角色/场景/道具/图片＝锚点，音色卡＝voice 描述）——
+// 这就是"自动对应那个对应的素材"：AI 助手攒好的提示词直接当出图描述用，不用你再打一遍。
+const GEN_KINDS = ['character', 'scene', 'prop', 'image', 'voice']
+
+const genPicked = ref(new Set())
+const genRunning = ref(false)
+const genStop = ref(false)       // 点了「停止」→ 当前这张跑完就收工
+const genNow = ref('')           // 正在生成的那张卡的 key（卡片上显示"生成中"）
+const genNote = ref('')          // 进度 / 结果文字
+
+// 能被自动生成的两个条件：① 这一类有 AI 生成入口 ② **卡片上有提示词**
+// （没提示词就没东西可出 —— 卡片上也就没有勾选框，一眼能看出"这条还没攒提示词"）
+function canAutoGen(it) {
+  return GEN_KINDS.includes(it.kind) && !!String(it.prompt || '').trim()
+}
+
+const genSelectable = computed(() => allItems.value.filter(canAutoGen))
+const genPickedItems = computed(() => genSelectable.value.filter((it) => genPicked.value.has(it.key)))
+
+function isGenPicked(it) {
+  return genPicked.value.has(it.key)
+}
+
+function toggleGenPick(it) {
+  if (!canAutoGen(it) || genRunning.value) return
+  const next = new Set(genPicked.value)
+  if (next.has(it.key)) next.delete(it.key)
+  else next.add(it.key)
+  genPicked.value = next
+}
+
+function clearGenPick() {
+  genPicked.value = new Set()
+}
+
+// 分组级全选：14 个场景一个个点太累（这是 01 里唯一的批量入口）
+function groupSelectable(g) {
+  return g.items.filter(canAutoGen)
+}
+
+function groupAllPicked(g) {
+  const s = groupSelectable(g)
+  return s.length > 0 && s.every((it) => genPicked.value.has(it.key))
+}
+
+function toggleGroupPick(g) {
+  if (genRunning.value) return
+  const next = new Set(genPicked.value)
+  const all = groupAllPicked(g)
+  for (const it of groupSelectable(g)) {
+    if (all) next.delete(it.key)
+    else next.add(it.key)
+  }
+  genPicked.value = next
+}
+
+// 换作品时清掉（勾选是"这一部作品这一批"的事，跟过去就错了）
+watch(() => props.taskId, () => { genPicked.value = new Set(); genNote.value = '' })
+
+async function autoGenerate() {
+  const items = genPickedItems.value
+  if (!items.length || genRunning.value) return
+  // 这是**真花钱**的动作（每一项都是一次出图，角色一项还出两张），
+  // 所以按项目里既有的做法给一道确认闸 —— 别的删除/彻底删除也都是 window.confirm。
+  if (!window.confirm(
+    `自动生成这 ${items.length} 项？\n`
+    + '会用每张卡片上的提示词逐个出图（角色出定妆照 + 四视图，共 2 张），中途可以停。'
+  )) return
+
+  genRunning.value = true
+  genStop.value = false
+  const failed = []
+  const failedKeys = []
+  const doneKeys = []
+  let done = 0
+  try {
+    const id = await props.ensureTask()
+    if (!id) return
+    for (const it of items) {
+      if (genStop.value) break
+      genNow.value = it.key
+      genNote.value = `正在生成 ${done + 1}/${items.length}：${it.name}`
+      try {
+        if (it.kind === 'character') {
+          await api.generateCharacterPortrait(id, it.index, it.prompt, ratioOf(it))
+        } else if (it.kind === 'voice') {
+          // 音色没有画幅，也不给性别 —— 让后端按提示词里的线索挑（后端会用
+          // tts.pick_voice 兜底，挑不出性别就留空，不会硬猜）
+          await api.generateCharacterVoice(id, it.index, it.prompt, '')
+        } else {
+          await api.generateAssetImage(id, it.index, it.prompt, ratioOf(it))
+        }
+        done += 1
+        doneKeys.push(it.key)
+      } catch (err) {
+        // 单项失败不该拖垮整批 —— 记下来接着跑，最后一起说
+        failed.push(`${it.name}（${err.message}）`)
+        failedKeys.push(it.key)
+      }
+      await refreshTask()          // 出一张刷一张，别等全跑完才看见
+    }
+  } catch (err) {
+    say(err.message, 'error')
+  } finally {
+    genRunning.value = false
+    genNow.value = ''
+    const stopped = genStop.value ? '（已手动停止）' : ''
+    // 跑完勾选留哪些，三条规矩：
+    //   ① 成功的**取消** —— 免得手一抖又白出一遍
+    //   ② 失败的**留着** —— 改完提示词直接再点一次就能重试
+    //   ③ 点了「停止」时**还没跑的也留着** —— 停下来的意思就是"先不跑了"，不是"放弃剩下的"
+    const keep = new Set(failedKeys)
+    if (genStop.value) {
+      for (const it of items) {
+        if (!doneKeys.includes(it.key) && !failedKeys.includes(it.key)) keep.add(it.key)
+      }
+    }
+    genPicked.value = keep
+    if (failed.length) {
+      genNote.value = `完成 ${done} 项，失败 ${failed.length} 项${stopped}`
+      say(`自动生成：成功 ${done} 项，失败 ${failed.length} 项 —— ${failed.slice(0, 3).join('；')}`, 'error')
+    } else if (done) {
+      genNote.value = ''
+      say(`自动生成完成：${done} 项${stopped}`, 'ok')
+    } else {
+      genNote.value = ''
+    }
+  }
+}
+
 
 // ---------------------------------------------------------------- 上传
 const uploading = ref('')
@@ -514,14 +667,15 @@ function openAi(it) {
   const last = (it?.ref?.ai_last || {})[it?.kind] || {}
   aiPrompt.value = typeof last.prompt === 'string' ? last.prompt : ''
   aiGender.value = last.gender === 'male' ? 'male' : 'female'
-  // 场景是全景环境、其他图片常被直接当首帧 —— 两者都跟随作品画幅最自然；
-  // 角色定妆照按惯例是 1:1（音色用不到比例）
-  const fallbackRatio = ['scene', 'image'].includes(it?.kind)
-    ? (props.project?.aspect_ratio || '16:9')
-    : '1:1'
   // 存过的比例要**过一遍白名单**再进状态：脏值（手改过 project.json / 换过图片模型）
   // 会让所有比例 chip 都不高亮，用户看到的是"一个都没选中"，比不给默认值更费解
-  aiRatio.value = AI_RATIOS.includes(last.ratio) ? last.ratio : fallbackRatio
+  // 优先级：① 上次在这个弹窗里实际选的（`ai_last`，用户最近的意图）
+  //         ② AI 助手读文档时落下的（`entry.ratio` —— 文档说了 9:16 就该默认 9:16）
+  //         ③ 16:9（2026-09-27 斌哥定的统一默认，不再按类型分叉）
+  // ③ 与 `ratioOf()` 共用同一个函数，保证"提示词弹窗里显示的比例"和这里选中的一模一样。
+  aiRatio.value = AI_RATIOS.includes(last.ratio)
+    ? last.ratio
+    : ratioOf(it)
 }
 
 function closeAi() {
@@ -559,6 +713,281 @@ async function submitAi() {
     }
   } finally {
     aiBusy.value = false
+  }
+}
+
+// ---------------------------------------------------------------- 提示词 / 出图比例（2026-09-27）
+// 卡片上那两行提示词是**截断**的，长提示词看不全、核对不了；斌哥要的是点一下看全文。
+// 出图的四类（角色 / 场景 / 道具 / 其他图片）在同一个弹窗里顺带把**出图比例**显示出来 ——
+// 比例是 AI 助手读文档时落的（`entry.ratio`，文档没写就是 16:9），点「AI 生成」时会默认选它。
+//
+// ⚠️ **这个弹窗是可编辑的**（2026-09-27 斌哥第二句话："为啥点进去提示词和比例不能修改，
+//    应该可以修改才对啊"）。我第一版做成了只读，理由是"锚点的编辑入口 09-17 / 09-19 各撤过一次，
+//    别自作主张补" —— 但那两次撤的是**卡片上**的编辑入口，而这次是斌哥**明确要**的。
+//    教训：拿"以前撤过"当理由拒绝新需求之前，先分清"他当时不想要"和"我猜他不想要"。
+// ⚠️ `IMAGE_KINDS` 上面（"选中的素材"那一节）早就有了 —— 别在这里再声明一遍，会编译不过。
+const promptFor = ref(null)      // 正在看提示词的那个 item（null = 弹窗不显示）
+const pdText = ref('')           // 弹窗里那份**可编辑**的提示词
+const pdRatio = ref('')          // 弹窗里选中的比例
+const pdBusy = ref(false)
+
+// 提示词存在哪个字段：出图类在 `anchor`（外貌 / 画面锚点），音色类在 `voice`（声音设计）。
+// 两者都是后端早就支持的 PATCH 字段，所以这里不用改接口。
+function promptFieldOf(it) {
+  return it?.kind === 'voice' ? 'voice' : 'anchor'
+}
+
+function promptValueOf(it) {
+  const ref_ = it?.ref || {}
+  return String((promptFieldOf(it) === 'voice' ? ref_.voice : ref_.anchor) || '')
+}
+
+// 条目上**真的**存了比例吗（＝AI 助手从文档里读到的）。手动添加 / 老素材没有这个键。
+function ratioFromDoc(it) {
+  return AI_RATIOS.includes(String(it?.ratio || '').trim())
+}
+
+// 这条素材出图时会用的比例。必须与 openAi() 里那条优先级 **同一套规则** ——
+// 弹窗显示的要是和点「AI 生成」时选中的不一样，用户会以为显示错了。
+// ⚠️ 默认值统一是 **16:9**（2026-09-27 斌哥定："文档里没给明图片比例，就默认 16:9"）。
+//    以前这里按类型分叉（场景/图片跟作品画幅、角色 1:1），现在只有一条规则，
+//    因为 AI 助手落下来的条目**一定带 ratio**，走到这个默认值的只剩手动添加 / 老素材。
+function ratioOf(it) {
+  if (ratioFromDoc(it)) return String(it.ratio).trim()
+  return '16:9'
+}
+
+function openPrompt(it) {
+  promptFor.value = it
+  pdText.value = promptValueOf(it)
+  pdRatio.value = ratioOf(it)
+}
+
+function closePrompt() {
+  if (pdBusy.value) return
+  promptFor.value = null
+}
+
+// 有没有真的改动过 —— 没改就不给点「保存」，省得白跑一次 PATCH + 刷新
+const pdDirty = computed(() => {
+  const it = promptFor.value
+  if (!it) return false
+  return pdText.value.trim() !== promptValueOf(it).trim()
+    || (IMAGE_KINDS.includes(it.kind) && pdRatio.value !== ratioOf(it))
+})
+
+async function savePrompt() {
+  const it = promptFor.value
+  if (!it || pdBusy.value) return
+  const text = pdText.value.trim()
+  if (promptFieldOf(it) === 'anchor' && !text) {
+    say('提示词不能是空的', 'error')
+    return
+  }
+  const patch = {}
+  const field = promptFieldOf(it)
+  if (text !== promptValueOf(it).trim()) patch[field] = text
+  if (IMAGE_KINDS.includes(it.kind) && pdRatio.value !== ratioOf(it)) patch.ratio = pdRatio.value
+  if (!Object.keys(patch).length) {
+    promptFor.value = null
+    return
+  }
+  pdBusy.value = true
+  try {
+    // 角色与音色是同一个条目上的两个弹窗，都走 PATCH characters/{index}；
+    // 场景 / 道具 / 其他图片走 PATCH assets/{index}
+    const res = await withTask((id) => (
+      it.kind === 'character' || it.kind === 'voice'
+        ? api.patchCharacter(id, it.index, patch)
+        : api.patchAsset(id, it.index, patch)
+    ))
+    // withTask 已经把错误弹出来了；失败时**不关弹窗**，用户改两句就能重试
+    if (!res) return
+    await refreshTask()
+    // 改了锚点 → 后端会标 stale；改了音色描述 → 后端会重挑 TTS 音色并作废旧样本。
+    // 两句都说出来，免得用户以为"改个描述怎么样本没了"。
+    say(field === 'voice' ? '音色描述已保存（旧样本已作废，重新点「AI 生成」合成）' : '提示词已保存', 'ok')
+    promptFor.value = null
+  } finally {
+    pdBusy.value = false
+  }
+}
+
+
+// ---------------------------------------------------------------- 素材规划助手（2026-09-27）
+// 斌哥的原话：一个一个手填素材太慢 —— 想丢一份文档进去，让 AI 把角色/场景/道具/音色
+// **连同各自的提示词**先攒好，但**先别生成**，他核对完再自己点生成。
+//
+// 一轮 = 一次 POST /api/tasks/{id}/assistant/plan。与右侧那个「AI 创作助手」的分工：
+//   那边是闲聊式、**凭空**帮你想素材；这边读你**上传的文档**，而且同名条目会被**改写**
+//   （所以"把深山古道改成黄昏"能落下去，不是再建一条）。
+// 两条路都只写条目 + 锚点，**不出图、不出音、不占出图/出片额度** —— 生成永远由用户点。
+//
+// ⚠️ 弹窗同样必须 Teleport 到 body：外层 .create-shell 的 fade-in 是 transform，
+//    会给 position: fixed 造一个新的包含块，弹窗会被钉在长文档底部（踩过）。
+const AS_DOC_ACCEPT = '.md,.markdown,.txt,.text,.json,.csv,.tsv,.yaml,.yml,.srt,.log,.docx,.pdf'
+const AS_GREETING = '把剧本 / 设定文档拖进这个窗口（md、txt、docx、pdf 都行），我就按它把角色、场景、道具和各自的提示词先攒好，直接落进下面的素材区。这一步只写名字和提示词，不出图也不出音 —— 你逐条核对，确认了再自己点生成。'
+const AS_QUICK = [
+  { label: '按文档把素材攒齐', prompt: '按这份文档把素材都攒齐' },
+  { label: '只抽角色 + 音色', prompt: '只抽角色和他们的音色，场景道具先不管' },
+  { label: '场景再补两个', prompt: '再补两个文档里出现过、但我还没建的场景' },
+]
+
+const asOpen = ref(false)
+const asDocs = ref([])        // [{name, ext, bytes, mtime}] —— 这个作品下已上传的文档
+const asMsgs = ref([])        // 气泡。第一条是问候语，回传历史时要把它滤掉
+const asInput = ref('')
+const asBusy = ref(false)     // 正在等模型
+const asUploading = ref(false)
+const asDrag = ref(false)
+const asSuggest = ref([])     // 上一轮模型给的下一步建议（点一下就发出去）
+const asScroller = ref(null)
+const asFileInput = ref(null)
+
+// 没有文本模型时助手干不了活 —— 提前在头部标出来，别让用户传完文档才发现
+const asOnline = computed(() => !!String(props.cfg?.text_api_key || '').trim())
+const asChips = computed(() => (asSuggest.value.length ? asSuggest.value : []))
+const asShowQuick = computed(() => !asSuggest.value.length && asMsgs.value.length <= 1)
+
+function asStamp() {
+  const d = new Date()
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+async function asScroll() {
+  await nextTick()
+  const el = asScroller.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+function asPush(role, text, kind = '') {
+  asMsgs.value.push({ role, text, kind, time: asStamp() })
+  asScroll()
+}
+
+function fmtBytes(n) {
+  const v = Number(n) || 0
+  if (v < 1024) return `${v} B`
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`
+  return `${(v / 1024 / 1024).toFixed(1)} MB`
+}
+
+async function loadDocs() {
+  if (!props.taskId) { asDocs.value = []; return }
+  try {
+    const res = await api.listDocs(props.taskId)
+    asDocs.value = res.docs || []
+  } catch {
+    // 作品还没建出来时后端会 404 —— 这里静默，用户传第一个文件时 withTask 会把作品建好
+    asDocs.value = []
+  }
+}
+
+function openAssistant() {
+  asOpen.value = true
+  if (!asMsgs.value.length) {
+    asMsgs.value = [{ role: 'assistant', text: AS_GREETING, kind: 'greet', time: asStamp() }]
+  }
+  asScroll()
+  loadDocs()
+}
+
+function closeAssistant() {
+  // 传文件 / 等模型的过程中不让关：关了也拦不住请求，只会让用户以为没生效
+  if (asBusy.value || asUploading.value) return
+  asOpen.value = false
+}
+
+function asPickFiles(e) {
+  const files = Array.from(e.target.files || [])
+  e.target.value = ''      // 清空才能让「同一个文件再选一次」也触发 change
+  asUpload(files)
+}
+
+function asDrop(e) {
+  asDrag.value = false
+  const files = Array.from(e.dataTransfer?.files || [])
+  if (files.length) asUpload(files)
+}
+
+async function asUpload(files) {
+  if (!files.length || asUploading.value || asBusy.value) return
+  asUploading.value = true
+  try {
+    const id = await props.ensureTask()
+    if (!id) return
+    for (const f of files) {
+      try {
+        const res = await api.uploadDoc(id, f)
+        asPush('assistant', `已读入《${res.name}》：${res.chars} 字${res.replaced ? '（覆盖了同名的那一份）' : ''}。`)
+      } catch (err) {
+        // 读不出来的原因（扫描件 / 格式不支持）后端说得很具体，原样转给用户
+        asPush('assistant', `《${f.name}》没读进来：${err.message}`, 'bad')
+      }
+    }
+    await loadDocs()
+  } catch (err) {
+    say(err.message, 'error')
+  } finally {
+    asUploading.value = false
+    asScroll()
+  }
+}
+
+async function asRemoveDoc(name) {
+  if (!props.taskId || asBusy.value || asUploading.value) return
+  try {
+    const res = await api.deleteDoc(props.taskId, name)
+    asDocs.value = res.docs || []
+  } catch (err) {
+    say(err.message, 'error')
+  }
+}
+
+async function asSend(text) {
+  if (asBusy.value || asUploading.value) return
+  const msg = String(text ?? asInput.value).trim()
+  if (!msg && !asDocs.value.length) {
+    say('先传一份文档，或者写一句你要什么', 'error')
+    return
+  }
+  if (!asOnline.value) {
+    say('还没配文本模型：去「服务设置」填 DeepSeek Key，助手才能干活', 'error')
+    return
+  }
+  // 历史要在**推入这一句之前**取，否则同一句话会既在历史里又在 message 里
+  const hist = asMsgs.value
+    .filter((m) => m.kind !== 'greet')
+    .slice(-8)
+    .map((m) => ({ role: m.role, text: m.text }))
+
+  asInput.value = ''
+  asSuggest.value = []
+  asPush('user', msg || '（按这些文档把素材攒齐）')
+  asBusy.value = true
+  try {
+    const id = await props.ensureTask()
+    if (!id) return
+    // ⚠️ 显式带上当前附件清单：用户把 chip 全删了就是空数组 ——
+    //    不传这个字段后端才会"读全部"，那正是我们不想在"已清空附件"时发生的
+    const res = await api.assistantPlan(id, {
+      message: msg,
+      history: hist,
+      docs: asDocs.value.map((d) => d.name),
+    })
+    asPush('assistant', res.reply || '（没有回复）')
+    asSuggest.value = res.suggestions || []
+    const added = (res.created?.characters?.length || 0) + (res.created?.assets?.length || 0)
+    const changed = (res.updated?.characters?.length || 0) + (res.updated?.assets?.length || 0)
+    if (added || changed) {
+      await refreshTask()
+      say(`已落进素材区：新增 ${added} 条、改写 ${changed} 条 —— 都还没生成`, 'ok')
+    }
+  } catch (err) {
+    asPush('assistant', `这一轮没成功：${err.message}`, 'bad')
+  } finally {
+    asBusy.value = false
+    asScroll()
   }
 }
 
@@ -981,7 +1410,63 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
                  <svg v-else viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 3.2l1.5 3.9 3.9 1.5-3.9 1.5L10 14l-1.5-3.9L4.6 8.6l3.9-1.5L10 3.2Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /><path d="M15.4 13.4l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7.7-1.8Z" fill="currentColor" /></svg>
                  {{ groupBusy === 'all' ? '生成中…' : 'AI 一键生成全部素材（可选）' }}
                </button> -->
-          <button class="btn-ghost" type="button" :disabled="busy" @click="adding ? cancelAdd() : openAdd()">
+          <!-- 批量「自动生成」（2026-09-27 斌哥要的）：**先在卡片左上角勾选**，再点这颗。
+               每一项都用它自己卡片上的提示词出图 —— 也就是"自动对应那个对应的素材"，
+               不用你再打一遍描述。角色一项会出两张（定妆照 + 四视图）。
+               跑的时候这颗按钮变成「停止」，跑完成功的自动取消勾选、失败的留着（好重试）。
+               ⚠️ 选中**只在 01 做**，而且用的是另一套 `genPicked` —— 别和 02 的 `picked` 混，
+               那套的规矩是"挑这一段视频的参考图"（I2V 只挑一张 / 场景至多一个 / 音色不能选）。 -->
+          <button
+            v-if="genRunning"
+            class="btn-ghost stopbtn"
+            type="button"
+            title="当前这一项跑完就停，已经出来的不会撤"
+            @click="genStop = true"
+          >
+            <span class="spin" aria-hidden="true"></span>
+            停止
+          </button>
+          <button
+            v-else
+            class="btn-ghost"
+            type="button"
+            :disabled="busy || !genPickedItems.length"
+            :title="genPickedItems.length
+              ? `按每张卡片上的提示词逐个出图（已选 ${genPickedItems.length} 项）`
+              : '先在卡片左上角勾选要生成的素材（没有提示词的卡片不能勾，先用「提示词」攒一段）'"
+            @click="autoGenerate"
+          >
+            <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 3.2l1.5 3.9 3.9 1.5-3.9 1.5L10 14l-1.5-3.9L4.6 8.6l3.9-1.5L10 3.2Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /><path d="M15.4 13.4l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7.7-1.8Z" fill="currentColor" /></svg>
+            自动生成<span v-if="genPickedItems.length" class="gnum">{{ genPickedItems.length }}</span>
+          </button>
+          <button
+            v-if="genPickedItems.length && !genRunning"
+            class="quiet tiny"
+            type="button"
+            title="取消所有勾选"
+            @click="clearGenPick"
+          >清空</button>
+          <!-- 素材规划助手（2026-09-27 斌哥提的）：传一份文档，让它把角色/场景/道具/音色
+               连同各自的提示词先攒好，直接落进下面六组里。**只落条目和提示词**，
+               不出图、不出音、不占出图/出片额度 —— 用户逐条核对，确认了再自己点生成。
+               ⚠️ 和 09-19 撤掉的「AI 一键生成全部素材」不是一回事：那次撤的理由是
+               "01 刚进来六组都空，点它等于凭空造素材，跟用户想拍什么没关系"；
+               这一颗**有文档当输入**，抽的是用户自己的材料。 -->
+          <button
+            class="btn-ghost ai-assistant"
+            type="button"
+            :disabled="busy"
+            title="传一份剧本/设定文档，让它把角色、场景、道具、音色和各自的提示词先攒好 —— 只落条目，不出图不出音"
+            @click="openAssistant"
+          >
+            <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 3.2l1.5 3.9 3.9 1.5-3.9 1.5L10 14l-1.5-3.9L4.6 8.6l3.9-1.5L10 3.2Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /><path d="M15.4 13.4l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7.7-1.8Z" fill="currentColor" /></svg>
+            AI 助手
+          </button>
+          <!-- ⚠️ `.add-material` 是个**给测试脚本用的稳定钩子**：head-actions 里现在有两颗
+               .btn-ghost（AI 助手 + 添加素材），脚本里原来写死的 `.head-actions .btn-ghost`
+               会点到第一颗（＝AI 助手）上去 —— 2026-09-27 加按钮时 12 处脚本同时踩到。
+               以后再加按钮，脚本一律认这个类名，别再按下标/按类名数量找。 -->
+          <button class="btn-ghost add-material" type="button" :disabled="busy" @click="adding ? cancelAdd() : openAdd()">
             <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 4.5v11M4.5 10h11" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
             {{ adding ? '取消添加' : '添加素材' }}
           </button>
@@ -1008,6 +1493,9 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
       </div>
 
       <p v-if="progressNote" class="progress-note">{{ progressNote }}</p>
+      <!-- 批量生成的进度 / 结果。和上面的 progressNote 分开两行：
+           那一行是老的「一键生成全部素材」留下的（那条路已撤，但状态还留着）。 -->
+      <p v-if="genNote" class="progress-note">{{ genNote }}</p>
 
       <!-- 素材分组：与作品工作台的「素材工坊」是同一套版式 ——
            一行小标题 + 卡片网格，空态就一行灰字。改这里必须同步改 MaterialStudio.vue。 -->
@@ -1024,6 +1512,16 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
           <div class="mgroup-head">
             <span class="mlabel">{{ g.label }}</span>
             <span class="mcount">{{ g.items.length }} 项</span>
+            <!-- 分组级全选（2026-09-27）：14 个场景一个个点太累。
+                 只对"能自动生成"的条目生效 —— 没提示词的、上传型的（其他音频）不参与。 -->
+            <button
+              v-if="groupSelectable(g).length"
+              class="gall"
+              type="button"
+              :disabled="genRunning"
+              :title="`${groupAllPicked(g) ? '取消' : ''}勾选本组能自动生成的 ${groupSelectable(g).length} 项`"
+              @click="toggleGroupPick(g)"
+            >{{ groupAllPicked(g) ? '取消全选' : '全选' }}</button>
           </div>
 
           <div v-if="g.items.length" class="mgrid">
@@ -1031,7 +1529,7 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
               v-for="it in g.items"
               :key="it.key"
               class="mcard"
-              :class="{ voicing: it.kind === 'voice' }"
+              :class="{ voicing: it.kind === 'voice', picked: isGenPicked(it) }"
               :title="it.kind === 'voice' ? '音色跟着角色自动带上，不用单独选' : undefined"
             >
               <!-- 编辑态：整张卡片换成表单，点表单本身不要触发选中。
@@ -1059,10 +1557,28 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
               <template v-else>
                 <div
                   class="mthumb"
-                  :class="{ audio: isAudioKind(it.kind) }"
+                  :class="{ audio: isAudioKind(it.kind), gennow: genNow === it.key }"
                   :title="it.url && !isAudioKind(it.kind) ? '点击看大图，可下载' : ''"
                   @click="onThumbClick($event, it)"
                 >
+                  <!-- 勾选框（2026-09-27 加）。放在**缩略图左上角**、而且**只有它能触发选中**：
+                       01 上"点整张卡片就选中"这条 2026-09-19 被斌哥否过 ——
+                       原话是"点图片下面那块会莫名被选上"。所以卡片的点击仍然只用来放大看图，
+                       选中只认这一颗。没提示词的卡片不渲染它（没提示词就出不了图）。
+                       ⚠️ `@click.stop.prevent` 必须留：`.mthumb` 上挂着"点开大图"。 -->
+                  <label
+                    v-if="canAutoGen(it)"
+                    class="gpick"
+                    :class="{ on: isGenPicked(it), busy: genRunning }"
+                    :title="isGenPicked(it)
+                      ? '取消勾选'
+                      : '勾上它，之后可以点「自动生成」批量出图'"
+                    @click.stop.prevent="toggleGenPick(it)"
+                  >
+                    <input type="checkbox" :checked="isGenPicked(it)" :disabled="genRunning" tabindex="-1" />
+                    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M5 10.4l3.3 3.3L15 6.8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+                  </label>
+                  <div v-if="genNow === it.key" class="gnow"><span class="spin" aria-hidden="true"></span>生成中…</div>
                   <!-- 图片类用 img；音频类必须是 <audio> —— 用 <img> 指向 mp3
                        会渲染失败只剩 alt 文本（素材工坊那边踩过同一个坑） -->
                   <img v-if="it.url && it.kind !== 'voice' && it.kind !== 'audio'" :src="it.url" :alt="`${it.name} 素材图`" />
@@ -1085,6 +1601,12 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
                 <div class="mmeta">
                   <strong>{{ it.name }}</strong>
                   <p>{{ it.desc }}</p>
+                  <!-- 提示词**不在卡片上显示**（2026-09-27 斌哥定）：
+                       "点提示词那个按钮可以看到这些，所以这里的这些就可以不用显示了"。
+                       原先这里有一行两行截断的提示词，加了「提示词」弹窗之后就纯属重复，
+                       还把卡片撑得很高（12 张卡一屏看不全）。
+                       ⚠️ `it.prompt` 这个字段**要留着** —— 下面「提示词」按钮的 v-if 靠它判断
+                       （没提示词的素材不该出现这颗按钮）。 -->
                 </div>
                 <div class="mops">
                   <label class="tiny mup" :title="`上传${isAudioKind(it.kind) ? '音频' : '图片'}（直接作为素材，不走生成）`">
@@ -1104,6 +1626,22 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
                     :title="`看「${it.name}」出过的每一版，可以切回前面某一版`"
                     @click.stop="openHistory(it)"
                   >生成历史</button>
+                  <!-- 提示词（2026-09-27 斌哥定）：点开看 / 改这条素材的提示词。
+                       ⚠️ **按钮一直在**（只要这一类有提示词字段），不能写成 `v-if="it.prompt"` ——
+                       否则**没有提示词的卡片就永远拿不到提示词**：手填的素材没人给它写，
+                       「AI 生成」按设计又不写回锚点，就彻底断了（2026-09-27 加批量生成时发现的）。
+                       出图的素材（角色/场景/道具/其他图片）在同一个弹窗里改**出图比例**，
+                       文档里没写比例时默认 16:9（后端 plan 落的 ratio）。
+                       保存走 PATCH characters|assets/{index}，改完刷新素材区。 -->
+                  <button
+                    v-if="GEN_KINDS.includes(it.kind)"
+                    class="quiet tiny"
+                    type="button"
+                    :title="it.prompt
+                      ? `看 / 改「${it.name}」的提示词${IMAGE_KINDS.includes(it.kind) ? '和出图比例' : ''}`
+                      : `「${it.name}」还没有提示词 —— 点这里写一段，之后就能自动生成`"
+                    @click.stop="openPrompt(it)"
+                  >提示词</button>
                   <!-- 五类素材的 AI 生成入口：写一段描述，交给对应 Agent 处理。
                        角色 → 形象图 + 四视图设定图；场景 → 单张空镜；道具 → 三视图设定图；
                        其他图片 → 一整张完整画面（常直接当首/尾帧）；
@@ -1375,6 +1913,161 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
         <p v-if="segJob.status === 'failed'" class="segerr">{{ segJob.error }}</p>
       </div>
     </section>
+
+    <!-- 素材规划助手（2026-09-27）。同样必须 Teleport 到 body（理由同上：外层 fade-in 是
+         transform，会把 position: fixed 困在长文档底部）。
+         用法：拖文档进来 → 说一句（可以不说）→ 发送 → 助手把角色/场景/道具/音色和各自的
+         提示词落进下面的素材区。**不出图、不出音** —— 用户核对完再自己点生成。 -->
+    <Teleport to="body">
+      <div v-if="asOpen" class="pmask" @click.self="closeAssistant">
+        <div
+          class="as-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="素材规划助手"
+          @dragover.prevent="asDrag = true"
+          @dragleave.prevent="asDrag = false"
+          @drop.prevent="asDrop"
+        >
+          <header class="pd-head">
+            <h3>AI 助手 · 从文档攒素材</h3>
+            <span class="as-badge" :class="{ off: !asOnline }">{{ asOnline ? '文本模型已就绪' : '未配文本模型' }}</span>
+            <button class="btn-ghost xs" type="button" :disabled="asBusy || asUploading" @click="closeAssistant">关闭</button>
+          </header>
+
+          <div class="as-docs">
+            <button class="as-add" type="button" :disabled="asUploading || asBusy" @click="asFileInput && asFileInput.click()">
+              {{ asUploading ? '读入中…' : '＋ 传文档' }}
+            </button>
+            <input
+              ref="asFileInput"
+              class="as-file"
+              type="file"
+              multiple
+              :accept="AS_DOC_ACCEPT"
+              @change="asPickFiles"
+            />
+            <span v-for="d in asDocs" :key="d.name" class="as-chip">
+              <b>{{ d.name }}</b>
+              <i>{{ d.ext }} · {{ fmtBytes(d.bytes) }}</i>
+              <button
+                type="button"
+                :disabled="asBusy || asUploading"
+                title="从这一轮的附件里去掉（不会动素材区的任何东西）"
+                @click="asRemoveDoc(d.name)"
+              >×</button>
+            </span>
+            <span v-if="!asDocs.length" class="as-nodoc">还没有文档 —— 把文件拖进这个窗口，或点「＋ 传文档」</span>
+          </div>
+
+          <div ref="asScroller" class="athread">
+            <div v-for="(m, i) in asMsgs" :key="i" class="row" :class="m.role">
+              <div class="bubble" :class="{ bad: m.kind === 'bad' }">{{ m.text }}</div>
+            </div>
+            <div v-if="asBusy" class="row assistant">
+              <div class="bubble typing"><span class="spin" aria-hidden="true"></span>正在读文档、抽素材…</div>
+            </div>
+          </div>
+
+          <div v-if="asChips.length || asShowQuick" class="chips">
+            <template v-if="asChips.length">
+              <button v-for="s in asChips" :key="s" class="chip" type="button" :disabled="asBusy" @click="asSend(s)">{{ s }}</button>
+            </template>
+            <template v-else>
+              <button v-for="q in AS_QUICK" :key="q.label" class="chip" type="button" :disabled="asBusy" @click="asSend(q.prompt)">{{ q.label }}</button>
+            </template>
+          </div>
+
+          <footer class="afoot">
+            <div class="composer">
+              <textarea
+                v-model="asInput"
+                rows="1"
+                :disabled="asBusy || asUploading"
+                placeholder="想怎么抽就说一句（也可以什么都不说，直接点发送）"
+                aria-label="给素材规划助手的话"
+                @keydown.enter.exact.prevent="asSend()"
+              ></textarea>
+              <button class="btn-primary" type="button" :disabled="asBusy || asUploading" @click="asSend()">
+                <span v-if="asBusy" class="spin" aria-hidden="true"></span>
+                {{ asBusy ? '处理中…' : '发送' }}
+              </button>
+            </div>
+            <p class="as-note">
+              这一轮会读：{{ asDocs.length ? asDocs.map((d) => d.name).join('、') : '（没有文档，只按你这句话）' }}
+              · 只落条目和提示词，不出图不出音
+            </p>
+          </footer>
+
+          <div v-if="asDrag" class="as-dropmask">松手就把文档读进来</div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- 提示词（2026-09-27 斌哥定）。卡片上那两行是**截断**的，这里看全文；
+         出图的四类（角色/场景/道具/其他图片）顺带把**出图比例**一起改。
+         ⚠️ 这个弹窗是**可编辑**的（斌哥："为啥点进去提示词和比例不能修改，应该可以修改才对啊"）。
+         同样 Teleport 到 body（外层 fade-in 是 transform，会把 fixed 困在长文档底部）。 -->
+    <Teleport to="body">
+      <div v-if="promptFor" class="pmask" @click.self="closePrompt">
+        <div class="pdialog td-dialog" role="dialog" aria-modal="true" aria-label="提示词">
+          <header class="pd-head">
+            <h3>「{{ promptFor.name }}」的提示词</h3>
+            <button class="btn-ghost xs" type="button" :disabled="pdBusy" @click="closePrompt">关闭</button>
+          </header>
+          <p class="pd-hint">
+            <template v-if="promptFor.kind === 'voice'">
+              这是配音时用来挑音色的描述 —— 它只决定声音，不影响画面。
+              改完保存后，原来的音色样本会作废（它对应的是旧音色），重新点「AI 生成」合成一段新的。
+            </template>
+            <template v-else>
+              出图时用的就是这段描述 —— 想让它更准就直接在这里改。
+              也可以回「AI 助手」里说一句（比如"把深山古道改成黄昏"），它会就地改写这一条。
+            </template>
+          </p>
+          <textarea
+            v-model="pdText"
+            class="td-prompt"
+            :disabled="pdBusy"
+            maxlength="2000"
+            :placeholder="promptFor.kind === 'voice' ? '例如：清亮的少女音，语速偏快' : '例如：十八岁少女，乌黑及腰长发用红绳束起，月白交领襦裙'"
+            :aria-label="`${promptFor.name} 的提示词`"
+            @keydown.enter.ctrl.prevent="savePrompt"
+            @keydown.enter.meta.prevent="savePrompt"
+          ></textarea>
+
+          <!-- 比例只对**出图**的四类有意义（音色是音频，没有画幅）。
+               改这里会一起存进条目，下次点「AI 生成」默认就选它。 -->
+          <div v-if="IMAGE_KINDS.includes(promptFor.kind)" class="td-ratio">
+            <span class="pd-rlabel">出图比例</span>
+            <div class="seg">
+              <button
+                v-for="r in AI_RATIOS"
+                :key="r"
+                type="button"
+                :class="{ on: r === pdRatio }"
+                :disabled="pdBusy"
+                @click="pdRatio = r"
+              >{{ r }}</button>
+            </div>
+            <span class="pd-count">
+              {{ ratioFromDoc(promptFor)
+                ? '从文档里读到的比例，可以改'
+                : '文档里没写比例，默认 16:9' }}
+            </span>
+          </div>
+
+          <footer class="pd-foot">
+            <span class="pd-count">{{ pdText.length }} / 2000</span>
+            <button class="btn-ghost xs" type="button" :disabled="pdBusy" @click="closePrompt">取消</button>
+            <button class="btn-primary xs" type="button" :disabled="pdBusy || !pdDirty" @click="savePrompt">
+              <span v-if="pdBusy" class="spin" aria-hidden="true"></span>
+              {{ pdBusy ? '保存中…' : '保存' }}
+            </button>
+          </footer>
+        </div>
+      </div>
+    </Teleport>
 
     <!-- AI 生成：一段描述 → 对应 Agent 处理。
          角色出「正面定妆照 + 四视图设定图」，场景出「单张空镜（无人物）」，
@@ -1654,6 +2347,30 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
 .mgroups { display: flex; flex-direction: column; gap: 16px; }
 /* 与素材工坊同值：标题只有「标签 + 计数」两个词，按基线对齐 */
 .mgroup-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+/* 分组级全选：低调的链接感按钮，别抢了分组标题的注意力 */
+.gall { margin-left: auto; padding: 0; border: 0; background: transparent; color: var(--fg-3); font-size: 11px; cursor: pointer; }
+.gall:hover:not(:disabled) { color: var(--accent); text-decoration: underline; }
+.gall:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ---------- 批量「自动生成」的勾选（2026-09-27） ----------
+   ⚠️ 勾选框放在缩略图左上角、且**只有它触发选中** —— "点整张卡片就选中"这条 09-19 被否过
+   （"点图片下面那块会莫名被选上"），所以卡片点击仍然只用来放大看图。
+   图片类在缩略图上；音频类 `.mthumb.audio` 里是 <audio> 控件，左上角同样是空的，位置通用。 */
+.gpick { position: absolute; top: 6px; left: 6px; z-index: 2; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 5px; background: rgba(255, 255, 255, .92); color: transparent; cursor: pointer; }
+.gpick input { position: absolute; opacity: 0; pointer-events: none; }
+.gpick svg { width: 13px; height: 13px; }
+.gpick:hover { border-color: var(--accent); }
+.gpick.on { border-color: var(--accent); background: var(--accent); color: #fff; }
+.gpick.busy { cursor: not-allowed; opacity: .6; }
+/* 已勾选的卡片描个边，滚到下面也知道哪些选了 */
+.mcard.picked { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+/* 正在生成的那张：盖一层，写明"在跑"，而不是让用户对着空白缩略图猜 */
+.gnow { position: absolute; inset: 0; z-index: 1; display: flex; align-items: center; justify-content: center; gap: 6px; background: rgba(255, 255, 255, .72); color: var(--fg-2); font-size: 11.5px; }
+/* 标题行那颗「自动生成」上的数量角标 */
+.gnum { margin-left: 5px; padding: 1px 6px; border-radius: 999px; background: var(--accent-dim); color: var(--accent); font-size: 10.5px; }
+/* 跑的时候那颗按钮变成「停止」——给它一点警示色，和普通灰按钮区分开 */
+.stopbtn { border-color: var(--danger); color: var(--danger); }
+.stopbtn:hover:not(:disabled) { background: var(--danger-dim); }
 .mlabel { font-size: 13px; font-weight: 600; }
 .mcount { font-size: 11px; color: var(--fg-3); }
 /* 拖文件到某一类上时给点反馈（分组级的上传按钮已删，拖拽是这一层唯一的批量入口） */
@@ -1672,6 +2389,8 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
 .mmeta { padding: 8px 10px 4px; }
 .mmeta strong { display: block; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
 .mmeta p { margin: 2px 0 0; font-size: 11px; color: var(--fg-3); overflow-wrap: anywhere; }
+/* ⚠️ 原来这里有一条 `.mprompt`（两行截断显示提示词）—— 2026-09-27 斌哥让撤掉了，
+   提示词只在「提示词」弹窗里看 / 改。别再把它加回来。 */
 .mops { display: flex; gap: 4px; padding: 2px 6px 7px; flex-wrap: wrap; }
 .mops button { white-space: nowrap; }
 .mup { cursor: pointer; color: var(--mint); }
@@ -1762,6 +2481,52 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
    fixed 铺满 + 自己一套类名：这个入口只有「新建作品」页有（另一个平行组件
    MaterialStudio 没这个按钮），不为了一个弹窗去动全局 dialog 体系。 */
 .pmask { position: fixed; inset: 0; z-index: 60; background: rgba(32, 26, 22, .42); display: flex; align-items: center; justify-content: center; padding: 24px; }
+
+/* ---------- 素材规划助手弹窗（2026-09-27） ----------
+   比提示词弹窗大得多：它是"聊天 + 附件 + 长清单"，固定高度靠 .athread 内部滚动。
+   .row / .bubble / .composer / .chip 是从停用的 AiAssistant.vue 搬过来的同一套观感，
+   两处保持一致的对话样式，别再各写一套。 */
+.as-dialog { position: relative; width: min(760px, 100%); height: min(640px, 84vh); display: flex; flex-direction: column; gap: 10px; padding: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md); box-shadow: 0 18px 48px rgba(32, 26, 22, .22); }
+.as-dialog .pd-head h3 { flex: 1; }
+.as-badge { flex: none; padding: 2px 8px; border-radius: 999px; background: var(--accent-dim); color: var(--accent); font-size: 10.5px; }
+.as-badge.off { background: var(--surface-2); color: var(--warn); }
+
+.as-docs { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px; border: 1px dashed var(--line); border-radius: var(--r-sm); background: var(--surface-2); }
+.as-add { flex: none; padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--fg-2); font-size: 11px; cursor: pointer; }
+.as-add:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+.as-add:disabled { opacity: .5; cursor: not-allowed; }
+.as-file { display: none; }
+.as-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 4px 3px 9px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); font-size: 11px; }
+.as-chip b { font-weight: 600; color: var(--fg); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.as-chip i { font-style: normal; color: var(--fg-3); font-size: 10px; }
+.as-chip button { width: 16px; height: 16px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; background: var(--surface-2); color: var(--fg-3); font-size: 11px; line-height: 1; cursor: pointer; }
+.as-chip button:hover:not(:disabled) { background: var(--danger-dim); color: var(--danger); }
+.as-nodoc { font-size: 11px; color: var(--fg-3); }
+
+.athread { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 2px; display: flex; flex-direction: column; gap: 10px; scrollbar-width: thin; }
+.athread .row { display: flex; }
+.athread .row.user { justify-content: flex-end; }
+.athread .bubble { max-width: 86%; padding: 9px 12px; border-radius: 11px; background: var(--surface-2); color: var(--fg); font-size: 12.5px; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
+.athread .row.user .bubble { background: var(--accent); color: var(--accent-ink); border-bottom-right-radius: 3px; }
+.athread .row.assistant .bubble { border-bottom-left-radius: 3px; }
+.athread .bubble.bad { background: var(--danger-dim); color: var(--danger); }
+.athread .bubble.typing { display: inline-flex; align-items: center; gap: 7px; color: var(--fg-2); }
+
+.as-dialog .chips { flex: none; display: flex; flex-wrap: wrap; gap: 6px; }
+.as-dialog .chip { padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--fg-2); font-size: 11px; cursor: pointer; }
+.as-dialog .chip:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+.as-dialog .chip:disabled { opacity: .5; cursor: not-allowed; }
+
+.afoot { flex: none; display: flex; flex-direction: column; gap: 6px; }
+.composer { display: flex; align-items: flex-end; gap: 8px; padding: 7px 7px 7px 12px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface-2); }
+.composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+.composer textarea { flex: 1; min-height: 22px; max-height: 96px; padding: 4px 0; border: 0; background: transparent; font-size: 12.5px; line-height: 1.6; resize: none; }
+.composer textarea:focus { outline: none; box-shadow: none; border-color: transparent; }
+.composer textarea:hover { border-color: transparent; }
+.as-note { margin: 0; font-size: 10.5px; line-height: 1.6; color: var(--fg-3); overflow-wrap: anywhere; }
+
+/* 拖拽悬停提示：盖住整个弹窗，说明"松手会发生什么" */
+.as-dropmask { position: absolute; inset: 0; display: grid; place-items: center; border: 1px dashed var(--accent); border-radius: var(--r-md); background: var(--accent-dim); color: var(--accent); font-size: 13px; font-weight: 600; pointer-events: none; }
 .pdialog { width: min(560px, 100%); display: flex; flex-direction: column; gap: 10px; padding: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md); box-shadow: 0 18px 48px rgba(32, 26, 22, .22); }
 .pd-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .pd-head h3 { margin: 0; font-size: 14px; }
@@ -1770,6 +2535,16 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
 .pdialog textarea { min-height: 104px; resize: vertical; font-size: 12.5px; line-height: 1.6; font-family: inherit; }
 .pd-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .pd-count { font-size: 11px; color: var(--fg-3); }
+/* 提示词弹窗：正文可长（剧本抽出来的锚点可能几百字），限高内部滚动。
+   2026-09-27 起是**可编辑**的 textarea（斌哥要能改）—— 所以别写 white-space: pre-wrap，
+   textarea 自己会折行；`font-family: inherit` 必须有，否则会掉回等宽字体。
+   高度交给 `.pdialog textarea` 那条既有规则（min-height 104px + resize: vertical）。 */
+.td-dialog { width: min(620px, 100%); }
+.td-prompt { max-height: 42vh; }
+/* 比例那一行：chips 是可点的（`pdRatio`）；保存中会 disabled，
+   这时要把灰化压回去 —— 否则用户看不清自己刚选的是哪一颗 */
+.td-ratio { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.td-ratio .seg button:disabled { opacity: 1; cursor: default; }
 /* 比例选择靠左（margin-right:auto 把字数与按钮挤到右边），窄屏会自动折行 */
 .pd-ratio { display: flex; align-items: center; gap: 6px; margin-right: auto; }
 .pd-rlabel { font-size: 11px; color: var(--fg-3); }

@@ -82,7 +82,7 @@ try {
   console.log('='.repeat(74) + '\n')
 
   // 先建一张「其他图片」素材 —— 分镜工作台那侧的勾选条要有东西可勾
-  await page.click('.head-actions .btn-ghost')
+  await page.click('.head-actions .add-material')
   await sleep(300)
   await page.$$eval('.addform .af-kinds button',
     (els) => els.find((e) => e.textContent.trim() === '其他图片').click())

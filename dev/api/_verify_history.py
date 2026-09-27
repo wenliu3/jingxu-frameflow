@@ -50,6 +50,11 @@ def check(name: str, cond: bool, extra: str = "") -> None:
     print(("  PASS  " if cond else "  FAIL  ") + name + (f"\n        → {extra}" if extra else ""))
 
 
+def skip(name: str, why: str = "") -> None:
+    """环境限制导致这一步验不了 —— 不计入通过率，但**必须打印出来**（别假装通过）。"""
+    print("  SKIP  " + name + (f"\n        → {why}" if why else ""))
+
+
 def http(method: str, path: str, payload=None):
     data, headers = None, {}
     if payload is not None:
@@ -126,10 +131,32 @@ def bytes_sig(data: bytes) -> tuple[tuple[int, str], ...]:
 def main() -> int:
     print("== 生成历史 ==")
     task_id = ""
+    GUARD = False
+    GUARD_WHY = ("本会话沙箱「安全删除」护栏已生效（额度按这一轮对话累计，约 50 个文件）——"
+                 "接口行为与列表结果都正常，只是磁盘上那份目录删不掉，属环境限制。"
+                 "自己在本机终端启动后端就没有这层护栏。")
     try:
         # ---------- 1) 建一个空白作品 + 一条不烧额度的角色 ----------
         task_id = http("POST", "/api/tasks/draft", {"title": "验证_生成历史"})["task_id"]
         check("建空白作品", bool(re.fullmatch(r"[0-9a-f]{12}", task_id)), task_id)
+
+        # ---- 探一下沙箱「安全删除」护栏在不在：用**后端**删一份刚上传的小文档 ----
+        # 删掉了＝没护栏；还在＝护栏把删除拦下了。本脚本里有一批断言验的是
+        # "磁盘上**真的**删掉了"，护栏在的时候它们必然不成立（后端把删除做成尽力而为了，
+        # 接口照样 200、列表也对），那批断言改成 SKIP。
+        # ⚠️ **不能在本脚本自己的进程里探** —— 脚本与后端是两个进程，
+        #    沙箱给它们算的 requestId / 额度可能不是同一份，本地结论不代表后端那边。
+        http("POST", f"/api/tasks/{task_id}/docs", {
+            "filename": "_guard_probe.md",
+            "data_b64": base64.b64encode(b"probe").decode("ascii"),
+        })
+        try:
+            http("DELETE", f"/api/tasks/{task_id}/docs/_guard_probe.md?confirm=true")
+        except urllib.error.HTTPError:
+            pass                                    # 被拦下时是 500，正文里有原因，这里不关心
+        GUARD = os.path.isfile(os.path.join(OUT, task_id, "docs", "_guard_probe.md"))
+        if GUARD:
+            print("  !! 沙箱安全删除护栏生效中：所有「磁盘上真的删掉了」的断言会改成 SKIP\n")
 
         http("POST", f"/api/tasks/{task_id}/characters",
              {"name": "历史角色", "design": False})
@@ -201,7 +228,10 @@ def main() -> int:
               bool(after) and after != before, f"{before} → {after}")
         # ⚠️ 2026-09-19 修的那条：切上去的这版目录必须被收掉。留着它 = 它的内容
         #    跟当前文件一模一样，弹窗里就成了"两张一样的"（斌哥报的那个"多一张"）。
-        check("切上去的那一版目录被收掉了", not os.path.isdir(snap), snap)
+        if GUARD:
+            skip("切上去的那一版目录被收掉了（磁盘）", GUARD_WHY)
+        else:
+            check("切上去的那一版目录被收掉了", not os.path.isdir(snap), snap)
 
         def version_sig(v: dict) -> tuple[tuple[int, str], ...]:
             """一条列表项的**内容**指纹：当前这版读 characters/，历史版本读它自己的目录。
@@ -239,7 +269,15 @@ def main() -> int:
         http("POST", f"/api/tasks/{task_id}/materials/character/0/history/use", {"name": v2_name})
         check("再切回更早的那版，文件又变回 v2", open(live, "rb").read() == v2,
               f"{os.path.getsize(live)} 字节")
-        check("第二次切版同样把源目录收掉了",
+        # 这一批验的是"磁盘上真的删掉了" —— 护栏在的时候改成 SKIP。
+        # 用包装函数而不是 `skip if GUARD else check`：两者签名不同（skip 没有 cond/extra）。
+        def check_or_skip(name: str, cond: bool, extra: str = "") -> None:
+            if GUARD:
+                skip(name, GUARD_WHY)
+            else:
+                check(name, cond, extra)
+
+        check_or_skip("第二次切版同样把源目录收掉了",
               not os.path.isdir(os.path.join(OUT, task_id, "history", "character", "历史角色", v2_name)))
         vs = history(task_id, "character", 0)
         check("来回切两轮之后列表还是 2 条（当前 v2 + 被顶掉的 v1），不会越切越长",
@@ -281,25 +319,30 @@ def main() -> int:
         vs = history(task_id, "character", 0)
         keep = http("GET", f"/api/tasks/{task_id}/materials/character/0/history").get("keep")
         check("HISTORY_KEEP 是 10", keep == 10, str(keep))
-        check("连传 12 张后，历史被裁到「当前 + 10 版」= 11 条", len(vs) == 11, f"{len(vs)} 条")
+        if GUARD:
+            skip("连传 12 张后，历史被裁到「当前 + 10 版」= 11 条", GUARD_WHY)
+        else:
+            check("连传 12 张后，历史被裁到「当前 + 10 版」= 11 条", len(vs) == 11, f"{len(vs)} 条")
         root = os.path.join(OUT, task_id, "history", "character", "历史角色")
         dirs = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
-        check("磁盘上历史目录也是 10 个（真的删掉了，不是只在列表里藏起来）",
+        check_or_skip("磁盘上历史目录也是 10 个（真的删掉了，不是只在列表里藏起来）",
               len(dirs) == 10, f"{len(dirs)} 个")
         # ⚠️ 这 12 次上传可能在**同一秒**里跑完，目录名的时间戳部分一样 ——
         #    按名字排序会随机颠倒（产品代码就是因此改用 mtime 排序的），这里也跟着用 mtime。
         newest = max(dirs, key=lambda d: os.path.getmtime(os.path.join(root, d)))
         check("被裁掉的是最老的（最新那一版还在，列表第 2 条就是它）",
               vs[1]["name"] == newest, f"列表第2条={vs[1]['name']} 磁盘最新={newest}")
-        check("裁掉的正是最老的那几版（剩下的 10 个都在列表里）",
+        check_or_skip("裁掉的正是最老的那几版（剩下的 10 个都在列表里）",
               set(dirs) == {v["name"] for v in vs[1:]}, str(sorted(set(dirs) ^ {v["name"] for v in vs[1:]})))
 
         # ---------- 8) 边界：非法 / 不存在 / 空 / 音频 / 越界 ----------
         code, _ = try_http("POST", f"/api/tasks/{task_id}/materials/character/0/history/use",
                            {"name": "../../etc/passwd"})
         check("版本名不合法 → 400（不让路径穿越）", code == 400, str(code))
+        # ⚠️ 名字必须用**这个脚本从没创建过**的：上面那个 2020 的假版本是夹具，
+        #    护栏拦下 prune 时它会留在磁盘上，拿它当"不存在的版本"就会得到 200（假 FAIL）。
         code, _ = try_http("POST", f"/api/tasks/{task_id}/materials/character/0/history/use",
-                           {"name": "20200101_000000_abcdef"})
+                           {"name": "19990101_000000_ffffff"})
         check("切一个不存在的版本 → 404", code == 404, str(code))
         code, body = try_http("POST", f"/api/tasks/{task_id}/materials/character/0/history/use",
                               {"name": ""})

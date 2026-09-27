@@ -86,6 +86,37 @@ export const api = {
     )
   },
 
+  // ---------- 素材规划助手：文档 → 素材与提示词（2026-09-27） ----------
+  // 与 assistantChat 的分工：那条是凭空聊天想素材；这条读用户**上传的文档**抽取素材，
+  // 而且同名条目会被**改写**（"第二个场景改成黄昏"能落下去）。
+  // ⚠️ 两者都只写条目和提示词，**不出图、不出音、不占出图/出片额度**。
+  listDocs(taskId) {
+    return request(`/api/tasks/${taskId}/docs`)
+  },
+
+  // 上传即解析：后端读不出字（扫描件 / 格式不支持）会直接 422，前端弹提示即可。
+  // 同名文件是**覆盖**（同一份剧本改了一版再传是最常见的用法）。
+  uploadDoc(taskId, file) {
+    return uploadFile(`/api/tasks/${taskId}/docs`, file)
+  },
+
+  deleteDoc(taskId, name) {
+    return request(`/api/tasks/${taskId}/docs/${encodeURIComponent(name)}?confirm=true`, {
+      method: 'DELETE',
+    })
+  },
+
+  // docs 传数组＝只读这几份；**不传这个字段**＝读作品下全部文档。
+  // 传空数组＝一份都不读（用户把附件全删了就不该还在背地里读）。
+  assistantPlan(taskId, { message = '', history = [], docs = null } = {}) {
+    const body = { message, history }
+    if (docs !== null) body.docs = docs
+    return request(`/api/tasks/${taskId}/assistant/plan`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  },
+
   // 上传/录制角色音色样本（不碰任何模型接口，与 rerollCharacterVoice 互补）。
   // 录制出来的 Blob 没有文件名，这里显式给一个带正确后缀的名字，
   // 否则后端只能按默认 .png 处理、兜底成 .mp3。
