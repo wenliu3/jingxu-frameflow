@@ -1777,23 +1777,23 @@ const engineState = computed(() => {
         </div>
 
         <div class="mgroup" v-if="cfg.video_backend === 'comfyui'">
-          <!-- 2026-09-19 傍晚：**工作流选择补回面板**（这本来就是 REF2VA.md 里的计划：
+          <!-- 2026-09-19 傍晚：**工作流选择补回面板**（这本来就是 docs/REF2VA.md 里的计划：
                "服务配置面板增加「视频模式」选项"）。原来这里没有它，用户只能从 LoRA 下拉里猜
                —— 斌哥就是这么"选了 i2v"的（其实只选了 I2V 那条的 LoRA），工作流还是 Ref2VA，
                于是 02 里照样能多选、照样没有首尾帧，看起来就像 bug。
                现在切工作流会**把配套的 LoRA 与步数一起带出来**，不用记哪个配哪个。
-               ⚠️ 措辞用 REF2VA.md 自己那套：首帧/首尾帧 vs 全能参考，别再造"单图参考"这种词。 -->
+               ⚠️ 措辞用 docs/REF2VA.md 自己那套：首帧/首尾帧 vs 全能参考，别再造"单图参考"这种词。 -->
           <div class="mgtitle">视频流程 · 工作流与画质</div>
           <label class="mfield">
             <span>视频工作流</span>
             <select v-model="cfg.video_workflow" class="url-input" @change="onWorkflowChange">
               <option value="i2v">I2V · 首帧 / 首尾帧（图就是视频第一帧，构图被钉住）</option>
-              <option value="ref2va">Ref2VA · 全能参考（图只当参考，最多 3 张，画面放开）</option>
+              <option value="ref2va">Ref2VA · 全能参考（图只当参考，最多 9 张，画面放开）</option>
             </select>
           </label>
           <p class="chint">
             <b>I2V</b>：选的图 = 视频的<b>第一帧</b>（再显式挑一张就是尾帧），最多两张，构图由那张图定死。
-            <b>Ref2VA</b>：选的图 = <b>参考</b>（把人物 / 场景钉住，画面放开），最多三张，
+            <b>Ref2VA</b>：选的图 = <b>参考</b>（把人物 / 场景钉住，画面放开），最多九张，
             没有首尾帧一说。两者是不同权重、不同输入口，切换时配套的 LoRA 与步数会一起换。
           </p>
           <label class="mfield">

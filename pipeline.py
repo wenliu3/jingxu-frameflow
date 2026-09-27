@@ -712,9 +712,19 @@ def render_block_image(
     return os.path.join(img_dir, f"block_{block.block_id:02d}.png")
 
 
-def _save_outputs(out_dir: str, project, shots: list[Shot]) -> None:
+def _save_outputs(
+    out_dir: str, project, shots: list[Shot], project_json: dict | None = None
+) -> None:
+    """写 project.json / shots.json / preview.html。
+
+    `project_json` 非空时用它写 project.json。调用方 `app._persist` 会传一份
+    "dump(project) + 条目上的自定义键（version / stale / ai_last）" 合并结果 ——
+    那些键 `Project.from_dict` 不认，走裸的 `dump(project)` 会被丢掉。
+    传空时保持老行为（pipeline 内部两条调用链用它）。
+    """
+    payload = project_json if project_json is not None else dump(project)
     with open(os.path.join(out_dir, "project.json"), "w", encoding="utf-8") as fh:
-        json.dump(dump(project), fh, ensure_ascii=False, indent=2)
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
     with open(os.path.join(out_dir, "shots.json"), "w", encoding="utf-8") as fh:
         json.dump([s.to_dict() for s in shots], fh, ensure_ascii=False, indent=2)
     with open(os.path.join(out_dir, "preview.html"), "w", encoding="utf-8") as fh:

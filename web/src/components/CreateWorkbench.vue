@@ -190,7 +190,8 @@ function togglePick(it) {
     //    多选，等于骗人：多出来的图进不了模型，写提示词那一步却会引用模型根本收不到的
     //    <Picture 2>。所以 I2V 下勾第二张就把上一张顶掉 —— 灰底那句提示（见模板 .pl-head）
     //    会说明这件事。（2026-09-19 斌哥："如果没选 ref2v 就不能在那里选多个图片，就要提示"。）
-    //    Ref2VA 不受影响：那份工作流有 ref_image_0/1/2 三个参考口，最多三张。
+    //    Ref2VA 不受影响：那份工作流的参考图口是 ref_image_0…_8 共 9 个（见
+    //    server/app.py 的 REF2VA_MAX_REFS），多选才有意义。
     if (!isRef2va.value && IMAGE_KINDS.includes(it.kind)) {
       ;[...next]
         .filter((k) => IMAGE_KINDS.some((p) => k.startsWith(`${p}:`)))
@@ -504,11 +505,23 @@ const GENDERS = [
 
 function openAi(it) {
   aiFor.value = it
-  aiPrompt.value = ''
-  aiGender.value = 'female'
+  // 上次对这个素材生成时填的描述 / 比例 / 性别 → **填回弹窗**（2026-09-27 斌哥提的：
+  // 出一版不满意、想改两句重出，弹窗却是空的，只能从头重打一遍）。
+  // 后端每次「AI 生成」成功都会在素材条目上留一份 `ai_last`（见 app._remember_ai_input），
+  // 与 `version` / `stale` 同一条路传到页面；上传型素材没有这个字段，走下面的默认值。
+  // ⚠️ 按**弹窗种类**取槽：角色条目上挂着形象图与音色两个弹窗，各存各的，
+  //    不分开的话生成完音色会把形象图那次的描述顶掉。
+  const last = (it?.ref?.ai_last || {})[it?.kind] || {}
+  aiPrompt.value = typeof last.prompt === 'string' ? last.prompt : ''
+  aiGender.value = last.gender === 'male' ? 'male' : 'female'
   // 场景是全景环境、其他图片常被直接当首帧 —— 两者都跟随作品画幅最自然；
   // 角色定妆照按惯例是 1:1（音色用不到比例）
-  aiRatio.value = ['scene', 'image'].includes(it?.kind) ? (props.project?.aspect_ratio || '16:9') : '1:1'
+  const fallbackRatio = ['scene', 'image'].includes(it?.kind)
+    ? (props.project?.aspect_ratio || '16:9')
+    : '1:1'
+  // 存过的比例要**过一遍白名单**再进状态：脏值（手改过 project.json / 换过图片模型）
+  // 会让所有比例 chip 都不高亮，用户看到的是"一个都没选中"，比不给默认值更费解
+  aiRatio.value = AI_RATIOS.includes(last.ratio) ? last.ratio : fallbackRatio
 }
 
 function closeAi() {
@@ -1126,7 +1139,7 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
           class="wf-chip"
           :class="{ on: isRef2va }"
           :title="isRef2va
-            ? '当前工作流：Ref2VA · 全能参考 —— 选中的图只当参考（最多 3 张），没有首尾帧；要改去右上角「服务设置」'
+            ? '当前工作流：Ref2VA · 全能参考 —— 选中的图只当参考（最多 9 张），没有首尾帧；要改去右上角「服务设置」'
             : '当前工作流：I2V · 首帧 / 首尾帧 —— 选中的图就是视频第一帧（只吃 1 张），可另挑一张尾帧；要改去右上角「服务设置」'"
         >{{ isRef2va ? 'Ref2VA · 全能参考' : 'I2V · 首帧 / 首尾帧' }}</span>
       </header>
@@ -1172,11 +1185,11 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
                这里选完立刻能在上面的「本次视频素材」看见 —— 效果是明摆着的。
                音色不在其中：它跟着角色自动带上，不用选。 -->
           <div v-if="selectableItems.length" class="picklist">
-            <!-- 这句要随工作流变：I2V 只吃一张图，多选没用；Ref2VA 能接三张。
+            <!-- 这句要随工作流变：I2V 只吃一张图，多选没用；Ref2VA 能接九张。
                  灰底一行不起眼，但它是"为什么我只能勾一张"的唯一解释。 -->
             <span class="pl-head">
               <template v-if="isRef2va">
-                点一下勾选素材，最多 3 张图一起进模型（音色跟着角色自动带上，不用选）
+                点一下勾选素材，最多 9 张图一起进模型（音色跟着角色自动带上，不用选）
               </template>
               <template v-else>
                 点一下勾选素材 —— 当前 I2V 工作流<b>只吃一张图</b>（这张就是视频的<b>第一帧</b>），

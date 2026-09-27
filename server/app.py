@@ -64,7 +64,7 @@ SERVICE_DEFAULTS = {
     "video_lora": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
     # 用哪份 ComfyUI 工作流（2026-09-19 加）。**默认 i2v，不自动切**：
     #   i2v    = comfyui/h3_i2v_api.json —— 单张首帧（最多再加一张尾帧）
-    #   ref2va = comfyui/h3_r2v_api.json —— 最多 3 张参考图 + 音频参考
+    #   ref2va = comfyui/h3_r2v_api.json —— 最多 9 张参考图 + 音频参考（见 REF2VA_MAX_REFS）
     # ⚠️ Ref2VA 那份要**额外下 3 个模型文件**（见那份文件里的 _必须的模型文件）。
     # 所以这里绝不能"检测到文件就自动切"—— 文件我早就放进去了，模型没下的话
     # 一自动切就变成"每次出片都失败"。必须由人显式打开。
@@ -266,7 +266,7 @@ def _video_config_error(cfg: dict) -> str | None:
         return (
             "文生视频模式尚未接入。它需要一份「不含首帧图输入」的工作流"
             "（宽高改由 ResolutionSelector 提供），现有 i2v 工作流的宽高是从首帧图量的，"
-            "不能直接把图摘掉。请按 REF2VA.md 里的导出步骤，从 ComfyUI 模板库导出 "
+            "不能直接把图摘掉。请按 docs/REF2VA.md 里的导出步骤，从 ComfyUI 模板库导出 "
             "MiniMax H3 T2V 的 API 工作流，存为 comfyui/h3_t2v_api.json"
         )
     backend = cfg.get("video_backend", "comfyui")
@@ -805,16 +805,48 @@ def _reload(task_id: str) -> tuple[Project | None, list[Shot]]:
     return project, shot_list
 
 
+def _merge_entry_extras(merged: dict[str, Any], raw: dict[str, Any]) -> None:
+    """把 raw 条目上**不属于 dataclass 的自定义键**补回 dump 出来的 project。
+
+    `Project.from_dict` / `Character.from_dict` / `Asset.from_dict` 只认声明过的字段，
+    `asdict` 也只吐声明过的字段 —— 于是挂在条目上的自定义键（`version` / `stale` /
+    `ai_last`）在 `_persist()` 写 project.json 时会被**悄悄丢掉**。
+    实测代价：磁盘上真实作品的 project.json 里连 `version` 都没有 ——
+    一重启后端，卡片 URL 就少了 `?v=`，cache-busting 失效，又变回
+    "重新生成后要刷新浏览器才看到新图"（2026-09-19 斌哥报过的那条）。
+
+    两边按下标一一对应：dataclass 的顺序就是 raw 的顺序（都是从同一个 raw 建出来的）。
+    只补 `merged` 里没有的键，不动 dataclass 认得的字段。
+    """
+    for key in ("characters", "assets"):
+        m_list = merged.get(key) or []
+        r_list = raw.get(key) or []
+        for m, r in zip(m_list, r_list):
+            if not isinstance(m, dict) or not isinstance(r, dict):
+                continue
+            for k, v in r.items():
+                if k not in m:
+                    m[k] = v
+
+
 def _persist(task_id: str) -> None:
-    """把内存里的状态同步写回 preview.html、shots.json 与 blocks.json。"""
+    """把内存里的状态同步写回 project.json、shots.json 与 blocks.json。
+
+    ⚠️ project.json 写的是**合并后**的 dict，不是裸的 `dump(project)` ——
+    条目上还有 dataclass 不认的自定义键（见 `_merge_entry_extras`），
+    直接 dump 会让它们每写一次盘就丢一次。
+    """
     task = _task(task_id)
-    project = Project.from_dict(task["project"]) if task.get("project") else None
+    raw = task.get("project") or {}
+    project = Project.from_dict(raw) if raw else None
     shots = [
         Shot.from_dict(r, int(r["shot_id"]))
         for r in task.get("shots", [])
     ]
     if project:
-        pipeline._save_outputs(_out_dir(task_id), project, shots)
+        merged = pipeline.dump(project)
+        _merge_entry_extras(merged, raw)
+        pipeline._save_outputs(_out_dir(task_id), project, shots, project_json=merged)
     if task.get("blocks") is not None:
         pipeline._save_blocks(
             _out_dir(task_id),
@@ -1749,6 +1781,40 @@ def reroll_character(task_id: str, index: int) -> dict:
     return updated
 
 
+def _remember_ai_input(
+    entry: dict[str, Any], kind: str, prompt: str, *, ratio: str = "", gender: str = ""
+) -> None:
+    """记下这次「AI 生成」弹窗里填的描述，以及选的比例 / 性别。
+
+    只服务一个目的：**下次对同一个素材再点「AI 生成」时，弹窗把上次填的填回去**
+    （2026-09-27 斌哥提的：出一版不满意，想改两句重出，结果弹窗是空的，只能从头重打）。
+
+    ⚠️ 按**弹窗种类**分槽存（`entry["ai_last"][kind]`），不是一个条目一份：
+    角色条目上挂着两个弹窗（形象图 / 音色，都写 `project.characters[i]`），
+    只存一份的话，生成完音色会把形象图那次的描述顶掉 —— 再打开形象图弹窗
+    看到的就是音色描述。`kind` 就是前端那个 `item.kind`。
+
+    ⚠️ 它**不是素材描述**，所以：
+      - 不写回 `anchor`（`anchor` 是跨镜头一致性的锚，会被下游出图/出片消费，
+        写进去等于把"这次随手写的口语"固化成设定）；
+      - 卡片上不显示，只有弹窗读它；
+      - 上传型素材（自己传图/传音频）不会写这个字段 —— 那不是"AI 生成过的"。
+    前端读的是 `entry.ai_last[item.kind]`（`get_task` 直接回 `task["project"]` 原始
+    dict，所以自定义字段能原样传到页面，与 `version` / `stale` 同一条路）。
+    """
+    rec: dict[str, Any] = {"prompt": prompt}
+    if ratio:
+        rec["ratio"] = ratio
+    if gender:
+        rec["gender"] = gender
+    rec["at"] = datetime.now(timezone.utc).isoformat()
+    slots = entry.get("ai_last")
+    if not isinstance(slots, dict):     # 手改过的 project.json 里可能是个脏值
+        slots = {}
+    slots[kind] = rec
+    entry["ai_last"] = slots
+
+
 @app.post("/api/tasks/{task_id}/characters/{index}/portrait")
 def generate_character_portrait(
     task_id: str, index: int, body: CharacterPortraitBody
@@ -1867,6 +1933,8 @@ def generate_character_portrait(
         if sheet_path:
             entry["sheet"] = sheet_path
         entry["version"] = uuid.uuid4().hex[:6]
+        # 弹窗记忆：下次再点「AI 生成」时把这段描述与比例填回去
+        _remember_ai_input(entry, "character", want, ratio=ratio)
         entry.pop("stale", None)
         _persist(task_id)
         updated = dict(entry)
@@ -1974,6 +2042,8 @@ def generate_asset_image(task_id: str, index: int, body: AssetGenerateBody) -> d
             entry = task["project"]["assets"][index]
             entry["images"] = [path]
             entry["version"] = uuid.uuid4().hex[:6]
+            # 弹窗记忆：下次再点「AI 生成」时把这段描述与比例填回去
+            _remember_ai_input(entry, "scene", want, ratio=ratio)
             entry.pop("stale", None)
             _persist(task_id)
             updated = dict(entry)
@@ -2021,6 +2091,8 @@ def generate_asset_image(task_id: str, index: int, body: AssetGenerateBody) -> d
             entry = task["project"]["assets"][index]
             entry["images"] = [path]
             entry["version"] = uuid.uuid4().hex[:6]
+            # 弹窗记忆：下次再点「AI 生成」时把这段描述与比例填回去
+            _remember_ai_input(entry, "image", want, ratio=ratio)
             entry.pop("stale", None)
             _persist(task_id)
             updated = dict(entry)
@@ -2058,17 +2130,30 @@ def generate_asset_image(task_id: str, index: int, body: AssetGenerateBody) -> d
         entry = task["project"]["assets"][index]
         entry["sheet"] = path
         entry["version"] = uuid.uuid4().hex[:6]
+        # 弹窗记忆：道具恒 16:9（弹窗里也没有比例选项），只记描述
+        _remember_ai_input(entry, "prop", want)
         entry.pop("stale", None)
         _persist(task_id)
         updated = dict(entry)
     return updated
 
 
-def _save_voice_sample(task: dict, task_id: str, index: int, character, voice_id: str) -> dict:
+def _save_voice_sample(
+    task: dict,
+    task_id: str,
+    index: int,
+    character,
+    voice_id: str,
+    remember: dict[str, Any] | None = None,
+) -> dict:
     """合成音色样本并落库。`/voice`（自动配）与 `/voice/generate`（AI 挑）共用。
 
     voice_id 由调用方定好：reroll 那条走 `tts.assign_voices`，AI 生成那条走配音 Agent
     并已在外面校验过。这里只管"合成 + 写回"，不再碰音色选择逻辑。
+
+    `remember` 只有 `/voice/generate`（用户自己填过描述的那条）才传：
+    把弹窗里填的描述与性别记进 `entry["ai_last"]`，下次打开弹窗填回去。
+    自动配的那条（`/voice`）没填过任何东西，传了反而会把用户的描述覆盖掉。
     """
     character.tts_voice = voice_id or tts.default_voice()
     fname = tts.sample_filename(character.name)
@@ -2086,6 +2171,8 @@ def _save_voice_sample(task: dict, task_id: str, index: int, character, voice_id
         entry["tts_voice"] = character.tts_voice
         entry["voice_sample"] = fname
         entry["version"] = uuid.uuid4().hex[:6]
+        if remember:
+            _remember_ai_input(entry, **remember)
         _persist(task_id)
         return dict(entry)
 
@@ -2163,6 +2250,7 @@ def generate_character_voice(task_id: str, index: int, body: VoiceGenerateBody) 
 
     与 `/voice`（reroll）的分工：那条按角色**已有的** voice 描述自动配；
     这条按用户**当场写的**一句话配，用户描述优先。
+    另外这条会把描述与性别记进 `ai_last`，下次打开「AI 生成音色」弹窗时填回去。
 
     ⚠️ 音频池是**预置音色**（minimax 27 个 / edge 8 个），模型造不出新音色 ——
     所谓"AI 生成音色"，实际是让模型从池子里挑最贴的那一个，再拿它合成样本。
@@ -2196,7 +2284,12 @@ def generate_character_voice(task_id: str, index: int, body: VoiceGenerateBody) 
         ) from exc
 
     voice_id = _verified_voice_id(picked.get("voice_id", ""), voices, gender, body.prompt)
-    return _save_voice_sample(task, task_id, index, c, voice_id)
+    # remember：这条是"用户自己填过描述"的那条，描述与性别要留给下次弹窗当默认值。
+    # kind="voice" —— 角色条目上形象图与音色是两个槽，别互相顶掉（见 _remember_ai_input）。
+    return _save_voice_sample(
+        task, task_id, index, c, voice_id,
+        remember={"kind": "voice", "prompt": body.prompt.strip(), "gender": gender},
+    )
 
 
 @app.get("/api/voices")
@@ -2560,6 +2653,19 @@ def _seg_sidecar(task_id: str, name: str) -> dict[str, Any] | None:
         return None
 
 
+# Ref2VA 能接几张参考图。**真值来自官方节点的 schema，不是猜的**：
+#   comfy_extras/nodes_minimax_h3.py → MiniMaxH3ReferenceToVideo.define_schema()
+#   io.Autogrow.Input("ref_images", template=io.Autogrow.TemplatePrefix(
+#       input=io.Image.Input("ref_image", ...), prefix="ref_image_", min=0, max=9))
+# 即 ref_images.ref_image_0 … ref_image_8，共 9 个（Autogrow，可增长）。
+# ⚠️ 2026-09-27 之前这里写的是 3 —— 那是照 `comfyui/h3_r2v_ui.json`（UI 导出文件）里
+#    "只连了 3 条"反推的，**没查节点 schema**。第 4 张起其实完全接得进去，白白被丢掉
+#    （斌哥："一个场景很多角色，不是放不了这么多图片？"）。
+# ⚠️ 判断"某个节点有几个口"要查 schema 或 `GET /object_info/<节点名>`，
+#    **别拿 UI 导出文件里连了几条当上限** —— 这份文件里只连了 3 条而已。
+REF2VA_MAX_REFS = 9
+
+
 @app.post("/api/tasks/{task_id}/segment/video")
 def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
     """按「选中的素材 + 已编排的提示词」生成一段视频。
@@ -2608,14 +2714,15 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
         print(f"[出片] 这些素材没带上（没有图 / 引用对不上）：{'、'.join(missing)}")
 
     notes: list[str] = []
-    # Ref2VA 只有 ref_image_0/1/2 三个参考口。第 4 张会被拼成 ref_image_3 ——
-    # 那是工作流里不存在的输入，ComfyUI 会直接拒单。所以在这里就截断，并说清楚少了谁。
-    if wf_ref2va and len(paths) > 3:
+    # Ref2VA 的参考图口是 `ref_image_0 … ref_image_8` 共 9 个（见 REF2VA_MAX_REFS）。
+    # 第 10 张会被拼成 `ref_image_9` —— 那才是工作流里不存在的输入，ComfyUI 会直接拒单。
+    # 所以在这里就截断，并说清楚少了谁。
+    if wf_ref2va and len(paths) > REF2VA_MAX_REFS:
         notes.append(
-            f"Ref2VA 最多吃 3 张参考图，多的这次没带上："
-            f"{'、'.join(m['name'] for m in resolved[3:])}。"
+            f"Ref2VA 最多吃 {REF2VA_MAX_REFS} 张参考图，多的这次没带上："
+            f"{'、'.join(m['name'] for m in resolved[REF2VA_MAX_REFS:])}。"
         )
-        resolved = resolved[:3]
+        resolved = resolved[:REF2VA_MAX_REFS]
         paths = [m["path"] for m in resolved]
 
     # 用户在选择器里显式挑的首/尾帧优先（2026-09-19）。挑的那张通常也在 frames 里，

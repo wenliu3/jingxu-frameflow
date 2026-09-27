@@ -158,7 +158,7 @@ MODEL_SOURCE=hf bash deploy_comfyui.sh
 
 > 注意：DSW 网关地址需要阿里云登录态，本机程序直连必须用脚本建好的 pinggy 隧道地址；
 > 免费隧道地址约 60 分钟会变，变了就重新 `cat tunnel_url.txt` 再填一次。
-> 详细的穿透原理与实测对比见 `comfyui-tunnel-guide.md`。
+> 详细的穿透原理与实测对比见 [`docs/comfyui-tunnel-guide.md`](docs/comfyui-tunnel-guide.md)。
 
 | | 方案 A：外接 API | 方案 B：租卡自建 | 方案 C：魔搭免费实例 |
 | --- | --- | --- | --- |
@@ -193,8 +193,10 @@ H3 官方其实有**四种输入模式**，上面覆盖到三种用法，还差�
 | FL2VA 首尾帧 | 2 张图，锚定首尾 | 被两张图夹住 | fl2va |
 | **Ref2VA 全能参考** | ≤9 图 + ≤3 视频 + ≤3 音频 | **图只锁身份，构图交给提示词** | **ref2va** |
 
-**Ref2VA 是另一套权重**，不是上面任一模式里的开关，目前尚未接入。只有它能做到
-「用人物图锁身份、构图完全交给提示词」。接入步骤见 [`REF2VA.md`](REF2VA.md)。
+**Ref2VA 是另一套权重**（不是上面任一模式里的开关），只有它能做到
+「用人物图锁身份、构图完全交给提示词」。**已接入**：在「服务设置 → 视频工作流」里
+切成 `Ref2VA · 全能参考` 即可（默认仍是 `I2V`）。切换前要先在 ComfyUI 实例上下
+`ref2va` 那份权重，细节见 [`docs/REF2VA.md`](docs/REF2VA.md)。
 
 > ⚠️ 别把「首尾帧」当成 Ref2VA。首尾帧给的两张图仍然是**画面帧**，会锁定构图；
 > Ref2VA 给的图是**角色参考图**，只锁人物身份，机位景别全部由提示词决定。
@@ -248,11 +250,13 @@ ai_video_multiagent/
 ├─ video_agent.py           # 命令行批量图生视频（断点续跑）
 ├─ doctor.py                # 配置自检
 ├─ schemas.py               # Project / Shot 数据结构
+├─ tts.py                   # 音色挑选与语音合成
+├─ ref_plan.py              # H3 提示词编排与审计（分段时长、[Shot N] 标记）
 ├─ deploy_comfyui.sh        # 租卡环境一键部署（AutoDL / 有公网 IP 的服务器）
 ├─ deploy_comfyui_ms.sh     # ModelScope DSW 一键部署 + pinggy 隧道
-├─ comfyui-tunnel-guide.md  # DSW 内网穿透原理与实测对比
-├─ REF2VA.md                # 全能参考模式（角色参考图 + 提示词）接入指引
-├─ comfyui/h3_i2v_api.json  # 图生视频 ComfyUI 工作流（API 格式）
+├─ comfyui/                 # ComfyUI 工作流模板（h3_i2v_api.json 等，API 格式）
+├─ docs/                    # 文档：H3 提示词规则、隧道指南、REF2VA 接入指引
+├─ dev/                     # 开发期验证脚本（接口 / 界面 / E2E，非产品代码，见 dev/README.md）
 ├─ web/                     # Vue 3 + Vite 前端
 └─ outputs/                 # 作品产物（本地数据，不入库）
 ```

@@ -10,7 +10,7 @@
   "_调参指南": {
     "length": "总帧数，必须满足 length % 17 == 5（如 73=3秒、107=4.5秒、176=7.3秒）。帧越多越慢。",
     "steps": "⚠️ 这份挂的是 **4 步** turbo LoRA，所以服务配置里的「采样步数」要改成 4（video_steps）。留在 8 会出伪影。",
-    "参考图槽位": "ref_images.ref_image_0/1/2 最多三张，由 video_provider 动态注入（模板里只留 ref_image_0 指向节点 100，其余按需补 LoadImage）。**没连线的槽位不要预先摆在这里** —— 未接线节点会参与 ComfyUI 的输入校验。",
+    "参考图槽位": "ref_images.ref_image_0 … _8 共 9 张（上限取自官方节点 schema：io.Autogrow.TemplatePrefix(prefix=\"ref_image_\", min=0, max=9)）。由 video_provider 动态注入：模板里只留 ref_image_0 指向节点 100，其余按需补 LoadImage。⚠️ 2026-09-27 之前这里写的是「最多三张」—— 那是照 h3_r2v_ui.json 里只连了 3 条反推的，错的。**没连线的槽位不要预先摆在这里** —— 未接线节点会参与 ComfyUI 的输入校验。",
     "音频参考": "ref_audios.ref_audio_0 可选；本项目的角色音色走这里（I2V 那条路是完全没有音频口的）。",
     "seed": "RandomNoise.noise_seed 固定则结果可复现，改成 'randomize' 语义请直接换随机数。"
   },
