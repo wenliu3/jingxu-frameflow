@@ -26,6 +26,7 @@ ModelScope 只是第一个实现。抽成接口是为了将来换即梦 / 豆包
 from __future__ import annotations
 
 import os
+import random
 import time
 from abc import ABC, abstractmethod
 
@@ -43,6 +44,12 @@ DEFAULT_NEGATIVE = (
     "extra fingers, extra limbs, fused fingers, distorted face, deformed hands, "
     "malformed limbs, text, watermark, signature, lowres, blurry, jpeg artifacts"
 )
+
+# 429 退避重试（2026-09-28）。魔搭免费 API 不承诺并发 —— 素材工坊的「自动生成」
+# 提到 4 路并发后，429 Throttling 会变成常态而非异常。统一在这里退避重试：
+# 最坏多花 ~22 秒，比让用户对着一张"失败"卡片再手点一次要好。
+RETRY_MAX = 4
+RETRY_BASE_DELAY = 1.5          # 1.5s → 3s → 6s → 12s，各加 ≤0.6s 抖动防齐步重试
 
 
 def _require_env(name: str) -> str:
@@ -111,6 +118,24 @@ class ModelScopeProvider(ImageProvider):
             headers["X-ModelScope-Task-Type"] = task_type
         return headers
 
+    @staticmethod
+    def _request(method: str, url: str, retries: int = RETRY_MAX, **kwargs):
+        """带 429 退避重试的 requests 调用（提交与轮询共用）。
+
+        只重试 429（限流），**不重试 5xx**：轮询阶段缺 X-ModelScope-Task-Type 头时
+        服务端会返回 500 "task not found"，那是真实错误，重试只会掩盖问题
+        （见 _headers 的注释）。
+        """
+        resp = requests.request(method, url, **kwargs)
+        for attempt in range(retries):
+            if resp.status_code != 429:
+                return resp
+            delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.6)
+            print(f"      ModelScope 429 限流，{delay:.1f}s 后重试（{attempt + 1}/{retries}）")
+            time.sleep(delay)
+            resp = requests.request(method, url, **kwargs)
+        return resp
+
     def generate(
         self,
         prompt: str,
@@ -154,7 +179,7 @@ class ModelScopeProvider(ImageProvider):
         if seed is not None:
             payload["seed"] = seed
 
-        submitted = requests.request(
+        submitted = self._request(
             "post",
             f"{self.base}/images/generations",
             headers=self._headers(async_mode=True),
@@ -169,7 +194,7 @@ class ModelScopeProvider(ImageProvider):
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             time.sleep(self.poll_interval)
-            polled = requests.request(
+            polled = self._request(
                 "get",
                 f"{self.BASE}/tasks/{task_id}",
                 headers=self._headers(task_type="image_generation"),

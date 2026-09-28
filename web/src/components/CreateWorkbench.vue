@@ -252,11 +252,50 @@ const frameRefs = computed(() => frameItems.value.map((x) => `${x.kind}:${x.inde
 // 这就是"自动对应那个对应的素材"：AI 助手攒好的提示词直接当出图描述用，不用你再打一遍。
 const GEN_KINDS = ['character', 'scene', 'prop', 'image', 'voice']
 
+// ⚠️ 2026-09-28：从"逐项串行"改成**两条通道各自并发**（斌哥定的数）：
+//   · 图像（魔搭）→ 4 路。魔搭官方对免费 API-Inference 的原话是"会根据实际平台压力
+//     灵活调整速率限制，请勿用于需要高并发以及 SLA 保障的场景"，4 是稳妥上限；
+//     429 退避重试在后端 `image_provider._request` 里兜底。
+//   · 音色（MiniMax t2a_v2）→ 2 路 + 最小发起间隔 3.2 秒。MiniMax 只按 RPM 限流
+//     （充值 20 RPM / 免费 10 RPM，官方不公布并发数），2 路全速约 20-30 RPM 会顶到上限，
+//     用"最小间隔"把节奏压到 ≈18 次/分钟。**免费档（10 RPM）请把间隔改成 6000**。
+const IMG_POOL = 4
+const VOICE_POOL = 2
+const VOICE_GAP_MS = 3200
+
 const genPicked = ref(new Set())
 const genRunning = ref(false)
-const genStop = ref(false)       // 点了「停止」→ 当前这张跑完就收工
-const genNow = ref('')           // 正在生成的那张卡的 key（卡片上显示"生成中"）
+const genStop = ref(false)       // 点了「停止」→ 已发出去的这几项跑完就收工（HTTP 请求没法撤回）
+const genNow = ref(new Set())    // 正在生成的那几张卡的 key（并发下是多个；卡片盖"生成中"层）
 const genNote = ref('')          // 进度 / 结果文字
+
+// 音色请求的"发车时刻表"：先**同步占位**再等待 —— 占位发生在 await 之前，
+// 两个 worker 不会因竞态挤在同一毫秒发车。
+let voiceNextAt = 0
+async function voiceSlot() {
+  const at = Math.max(Date.now(), voiceNextAt)
+  voiceNextAt = at + VOICE_GAP_MS
+  const wait = at - Date.now()
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+}
+
+// 并发池：limit 个 worker 从同一个队列取活。停止 = 不再取新活，
+// 已经在跑的那几项照常跑完（结果照样统计、照样刷新）。
+async function runPool(items, limit, run) {
+  const queue = [...items]
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(limit, queue.length)) },
+    async () => {
+      for (;;) {
+        if (genStop.value) return
+        const it = queue.shift()
+        if (!it) return
+        await run(it)
+      }
+    },
+  )
+  await Promise.all(workers)
+}
 
 // 能被自动生成的两个条件：① 这一类有 AI 生成入口 ② **卡片上有提示词**
 // （没提示词就没东西可出 —— 卡片上也就没有勾选框，一眼能看出"这条还没攒提示词"）
@@ -264,7 +303,16 @@ function canAutoGen(it) {
   return GEN_KINDS.includes(it.kind) && !!String(it.prompt || '').trim()
 }
 
-const genSelectable = computed(() => allItems.value.filter(canAutoGen))
+// ⚠️ 2026-09-28 修：音频（voice）此前**勾得上但不参与批量** ——
+// `allItems` 出于 02 的参考图规则不含音色（"音色跟着角色自动带上、不能单独选"，
+// 见 togglePick 里的 `if (it.kind === 'voice') return`），可原来这里的
+// `allItems.filter(canAutoGen)` 把音频一并滤掉了：勾选框照渲染、勾选也记进 `genPicked`，
+// 但顶部按钮的数字与 `autoGenerate` 的任务列表都拿不到它（"音频没有自动生成"就是这个）。
+// GEN_KINDS 里本来就有 voice（autoGenerate 也有 voice 分支），两处必须一致 ——
+// 所以在这里**单独把 voice 补回来**，不动 allItems 本身（别把 02 的规则弄坏）。
+const genSelectable = computed(
+  () => [...allItems.value, ...items.value.voice].filter(canAutoGen),
+)
 const genPickedItems = computed(() => genSelectable.value.filter((it) => genPicked.value.has(it.key)))
 
 function isGenPicked(it) {
@@ -314,23 +362,37 @@ async function autoGenerate() {
   // 所以按项目里既有的做法给一道确认闸 —— 别的删除/彻底删除也都是 window.confirm。
   if (!window.confirm(
     `自动生成这 ${items.length} 项？\n`
-    + '会用每张卡片上的提示词逐个出图（角色出定妆照 + 四视图，共 2 张），中途可以停。'
+    + '会用每张卡片上的提示词出图（角色出定妆照 + 四视图，共 2 张）。\n'
+    + '图像 4 路并发、音色 2 路并发，中途可以停。'
   )) return
 
   genRunning.value = true
   genStop.value = false
+  genNow.value = new Set()
+  voiceNextAt = 0                 // 这一批从"现在"开始排发车时刻
   const failed = []
   const failedKeys = []
   const doneKeys = []
   let done = 0
+
+  const markNow = (key, on) => {
+    const next = new Set(genNow.value)
+    if (on) next.add(key)
+    else next.delete(key)
+    genNow.value = next
+  }
+
   try {
     const id = await props.ensureTask()
     if (!id) return
-    for (const it of items) {
-      if (genStop.value) break
-      genNow.value = it.key
-      genNote.value = `正在生成 ${done + 1}/${items.length}：${it.name}`
+
+    // 一项一份活：成功记 done，失败留着（最后汇总），跑完刷一次任务快照。
+    // 并发下 genNote 只报"已完成 X/Y"，不再指认"正在跑哪张" ——
+    // 正在跑的那几张由卡片上的"生成中"层负责显示。
+    const one = async (it) => {
+      markNow(it.key, true)
       try {
+        if (it.kind === 'voice') await voiceSlot()   // 音色先等发车时刻（RPM 节流）
         if (it.kind === 'character') {
           await api.generateCharacterPortrait(id, it.index, it.prompt, ratioOf(it))
         } else if (it.kind === 'voice') {
@@ -346,14 +408,25 @@ async function autoGenerate() {
         // 单项失败不该拖垮整批 —— 记下来接着跑，最后一起说
         failed.push(`${it.name}（${err.message}）`)
         failedKeys.push(it.key)
+      } finally {
+        markNow(it.key, false)
+        // "已处理"= 成功 + 失败（失败项也走完了，不该让进度条看着卡住）
+        genNote.value = `已处理 ${done + failed.length}/${items.length}`
       }
       await refreshTask()          // 出一张刷一张，别等全跑完才看见
     }
+
+    // 图像与音色**各自排队**：两个通道的额度体系不同（魔搭按天 500 次/模型、
+    // MiniMax 按分钟 20 RPM），混在一个池里会让慢的那类白占快的那类的并发位。
+    await Promise.all([
+      runPool(items.filter((it) => it.kind !== 'voice'), IMG_POOL, one),
+      runPool(items.filter((it) => it.kind === 'voice'), VOICE_POOL, one),
+    ])
   } catch (err) {
     say(err.message, 'error')
   } finally {
     genRunning.value = false
-    genNow.value = ''
+    genNow.value = new Set()
     const stopped = genStop.value ? '（已手动停止）' : ''
     // 跑完勾选留哪些，三条规矩：
     //   ① 成功的**取消** —— 免得手一抖又白出一遍
@@ -1420,7 +1493,7 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
             v-if="genRunning"
             class="btn-ghost stopbtn"
             type="button"
-            title="当前这一项跑完就停，已经出来的不会撤"
+            title="不再开新项；已发出去的这几项跑完就停，已经出来的不会撤"
             @click="genStop = true"
           >
             <span class="spin" aria-hidden="true"></span>
@@ -1432,7 +1505,7 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
             type="button"
             :disabled="busy || !genPickedItems.length"
             :title="genPickedItems.length
-              ? `按每张卡片上的提示词逐个出图（已选 ${genPickedItems.length} 项）`
+              ? `按每张卡片上的提示词出图（已选 ${genPickedItems.length} 项；图像 4 路 / 音色 2 路并发）`
               : '先在卡片左上角勾选要生成的素材（没有提示词的卡片不能勾，先用「提示词」攒一段）'"
             @click="autoGenerate"
           >
@@ -1557,7 +1630,7 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
               <template v-else>
                 <div
                   class="mthumb"
-                  :class="{ audio: isAudioKind(it.kind), gennow: genNow === it.key }"
+                  :class="{ audio: isAudioKind(it.kind), gennow: genNow.has(it.key) }"
                   :title="it.url && !isAudioKind(it.kind) ? '点击看大图，可下载' : ''"
                   @click="onThumbClick($event, it)"
                 >
@@ -1578,7 +1651,7 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
                     <input type="checkbox" :checked="isGenPicked(it)" :disabled="genRunning" tabindex="-1" />
                     <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M5 10.4l3.3 3.3L15 6.8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
                   </label>
-                  <div v-if="genNow === it.key" class="gnow"><span class="spin" aria-hidden="true"></span>生成中…</div>
+                  <div v-if="genNow.has(it.key)" class="gnow"><span class="spin" aria-hidden="true"></span>生成中…</div>
                   <!-- 图片类用 img；音频类必须是 <audio> —— 用 <img> 指向 mp3
                        会渲染失败只剩 alt 文本（素材工坊那边踩过同一个坑） -->
                   <img v-if="it.url && it.kind !== 'voice' && it.kind !== 'audio'" :src="it.url" :alt="`${it.name} 素材图`" />
