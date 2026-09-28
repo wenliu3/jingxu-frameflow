@@ -38,7 +38,7 @@
 | `_verify_history_ui.mjs` | 生成历史弹窗 + 重生成后就地换图（`?v=` 缓存击穿） |
 | `_verify_library.mjs` | 「我的作品」页顶部区块（含反向断言：撤掉的东西别长回来） |
 | `_verify_other_image_ui.mjs` | 「其他图片」的 AI 生成入口 |
-| `_verify_pick_ui.mjs` | 素材勾选交互（卡片级点击与小圆圈都已撤掉） |
+| `_verify_pick_ui.mjs` | 素材勾选交互（卡片级点击与小圆圈都已撤掉）+ 选素材区的**分组 / 搜索**（2026-09-28） |
 | `_verify_prompt_ui.mjs` | 「让 AI 帮写」按钮接线（只调一次、直接写回输入框） |
 | `_verify_promptout.mjs` | 编排结果预览：界面只出现人话，机器文字不许进 DOM |
 | `_verify_records.mjs` | 「生成记录」tab（数据源为后端磁盘产物 `segments/`） |
@@ -50,6 +50,7 @@
 | `_shots_add.mjs` | 截图：「添加素材」新流程 |
 | `_shots_layers.mjs` | 截图：01 准备素材「一行一层」版式 |
 | `_shots_workspace.mjs` | 截图：工作台（素材工坊）版式 |
+| `_shots_readme.mjs` | **README 配图**：我的作品 / 素材工坊 / 分镜工作台 / 服务配置 → 直接写 `docs/images/`（不点生成按钮、Key 与隧道地址自动打码） |
 
 ## dev/e2e/ —— 端到端冒烟（Node + puppeteer-core）
 
