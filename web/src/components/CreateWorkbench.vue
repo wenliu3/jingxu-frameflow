@@ -223,6 +223,46 @@ const pickedItems = computed(() => allItems.value.filter((it) => picked.value.ha
 // 入口把素材勾进这一段视频。音色不在其中：它跟着角色自动带上，不能单独选（见 togglePick）。
 const selectableItems = computed(() => allItems.value.filter((it) => it.kind !== 'voice'))
 
+// ---------------------------------------------------------------- 选素材的分组 + 搜索（2026-09-28）
+// 背景（斌哥截图报的）：素材一多（30+），平铺成一坨小 chip 全靠扫名字，找不到要选哪个。
+// 改成按组分段：每组一行小标题（标签 + 已选/总数）+ 组内**一行横滑**（不换行，垂直空间可控），
+// 加一个搜索框（记得名字时最快）；空组折叠成一行灰字，不再占地方。
+// 不弹窗的理由：选素材是**每个分镜都要做的高频动作**，弹窗要开关两次 + 打断
+// "看着素材写提示词"的视线；分组的价值就地就能拿到。
+const pickQuery = ref('')
+
+const PICK_GROUPS = [
+  { key: 'character', label: '角色', empty: '暂无角色素材' },
+  { key: 'scene', label: '场景', empty: '暂无场景素材' },
+  { key: 'prop', label: '道具', empty: '暂无道具素材' },
+  { key: 'otherImage', label: '其他图片', empty: '暂无其他图片' },
+  { key: 'otherAudio', label: '其他音频', empty: '暂无其他音频' },
+]
+
+const pickGroups = computed(() => {
+  const q = pickQuery.value.trim().toLowerCase()
+  return PICK_GROUPS.map((g) => {
+    const all = items.value[g.key] || []
+    const matched = q
+      ? all.filter((it) => String(it.name || '').toLowerCase().includes(q))
+      : all
+    return {
+      ...g,
+      total: all.length,
+      pickedCount: all.filter((it) => picked.value.has(it.key)).length,
+      items: matched,
+    }
+  })
+})
+
+// 搜索时只留"有匹配"的组（空组也不留）；没搜索时全保留，空组走 empty 灰字。
+// 组内顺序**不按已选重排**：点了会跳位，连选第二个的时候就找不到刚才那张了。
+const pickView = computed(() => {
+  if (!pickQuery.value.trim()) return { groups: pickGroups.value, noMatch: false }
+  const hit = pickGroups.value.filter((g) => g.items.length)
+  return { groups: hit, noMatch: !hit.length }
+})
+
 const selCharacters = computed(() => pickedItems.value.filter((x) => x.kind === 'character').map((x) => x.name))
 const selProps = computed(() => pickedItems.value.filter((x) => x.kind === 'prop').map((x) => x.name))
 const selScene = computed(() => pickedItems.value.find((x) => x.kind === 'scene')?.name || '')
@@ -1807,20 +1847,38 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
                 再勾一张会替掉上一张；要让多张图都进模型，去「服务配置」把视频工作流切成 Ref2VA
               </template>
             </span>
-            <div class="pl-grid">
-              <button
-                v-for="it in selectableItems"
-                :key="it.key"
-                type="button"
-                class="pl-item"
-                :class="{ on: isPicked(it) }"
-                :title="isPicked(it) ? '取消选择' : '选进这一段视频'"
-                @click="togglePick(it)"
-              >
-                <img v-if="it.url" :src="it.url" :alt="it.name" />
-                <span v-else class="pl-ph">{{ { character: '角', scene: '景', prop: '道', image: '图', audio: '音' }[it.kind] || '素' }}</span>
-                <em>{{ it.name }}</em>
-              </button>
+            <!-- 分组 + 横滑 + 搜索（2026-09-28，见 script 里 pickGroups 的注释）。
+                 不再平铺成一坨：每组一行，组内横滑；空组折叠成一行灰字。 -->
+            <div class="pl-search">
+              <input
+                v-model="pickQuery"
+                type="search"
+                placeholder="搜索素材名…"
+                aria-label="搜索素材"
+              />
+            </div>
+            <p v-if="pickView.noMatch" class="pl-none">没有找到匹配的素材 —— 换个关键词试试</p>
+            <div v-for="g in pickView.groups" :key="g.key" class="pl-group">
+              <div class="pl-ghead">
+                <b>{{ g.label }}</b>
+                <span v-if="g.total" class="pl-gcount">{{ g.total }} 项<template v-if="g.pickedCount"> · 已选 {{ g.pickedCount }}</template></span>
+              </div>
+              <div v-if="g.total" class="pl-row">
+                <button
+                  v-for="it in g.items"
+                  :key="it.key"
+                  type="button"
+                  class="pl-item"
+                  :class="{ on: isPicked(it) }"
+                  :title="isPicked(it) ? '取消选择' : '选进这一段视频'"
+                  @click="togglePick(it)"
+                >
+                  <img v-if="it.url" :src="it.url" :alt="it.name" />
+                  <span v-else class="pl-ph">{{ { character: '角', scene: '景', prop: '道', image: '图', audio: '音' }[it.kind] || '素' }}</span>
+                  <em>{{ it.name }}</em>
+                </button>
+              </div>
+              <p v-else class="pl-none">{{ g.empty }}</p>
             </div>
           </div>
         </div>
@@ -2509,7 +2567,19 @@ const running = computed(() => composing.value || segJob.value?.status === 'runn
    上面显示"已选了什么"，下面负责"去选"。 */
 .picklist { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
 .pl-head { display: block; margin-bottom: 9px; font-size: 11.5px; color: var(--fg-3); }
+/* .pl-grid 是 2026-09-28 之前"平铺一坨"的版式，已被下面的分组版替换（留样式以防回退） */
 .pl-grid { display: flex; flex-wrap: wrap; gap: 7px; }
+/* 分组 + 横滑 + 搜索（2026-09-28，见 script 里 pickGroups 的注释）。
+   每组一行、组内不换行靠横滑 —— 面板高度只跟"组数"有关，素材多少都稳。 */
+.pl-search { margin-bottom: 10px; }
+.pl-search input { width: 100%; padding: 6px 10px; font-size: 11.5px; }
+.pl-group + .pl-group { margin-top: 10px; }
+.pl-ghead { display: flex; align-items: baseline; gap: 6px; margin-bottom: 6px; }
+.pl-ghead b { font-size: 11.5px; font-weight: 600; color: var(--fg-2); }
+.pl-gcount { font-size: 10.5px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
+.pl-row { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 3px; }
+.pl-row .pl-item { flex: none; }
+.pl-none { margin: 2px 0 0; font-size: 11px; color: var(--fg-3); }
 .pl-item { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px 4px 4px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--fg); font-size: 12px; cursor: pointer; transition: border-color 0.15s var(--ease), background 0.15s var(--ease); }
 .pl-item:hover { border-color: var(--fg-3); }
 .pl-item.on { border-color: var(--accent); background: var(--accent-dim); }

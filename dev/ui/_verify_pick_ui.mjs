@@ -36,6 +36,7 @@ const API = process.env.E2E_API || 'http://127.0.0.1:8000'
 const ROOT = 'D:/Pychrom Project/ai_video_multiagent'
 const CHAR = '勾选验证角色'
 const SCENE = '勾选验证场景'
+const PROP = '勾选验证道具'       // 2026-09-28 加：分组断言要有"第三类"才立得住
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const results = []
@@ -172,9 +173,15 @@ try {
   const isR2v = String(wfCfg.video_workflow || '') === 'ref2va'
   await jpost(`/api/tasks/${createdTask}/characters`, { name: CHAR, design: false })
   await jpost(`/api/tasks/${createdTask}/assets`, { kind: 'scene', name: SCENE, design: false })
+  // 道具（2026-09-28）：分组断言要覆盖"角色/场景/道具"三类非空组
+  await jpost(`/api/tasks/${createdTask}/assets`, { kind: 'prop', name: PROP, design: false })
   const png = pngSolid(240, 150, [201, 74, 58])
   await jpost(`/api/tasks/${createdTask}/characters/0/upload`, {
     filename: 'v.png', data_b64: png.toString('base64'),
+  })
+  // 道具是 assets 里第二个（index 1：scene 是 0）—— 上传一张图，分组断言里它才在
+  await jpost(`/api/tasks/${createdTask}/assets/1/upload`, {
+    filename: 'p.png', data_b64: pngSolid(240, 150, [88, 160, 88]).toString('base64'),
   })
   // 再给这个角色造一张「四视图设定图」：手搓一个历史版本、切上去，它就会落到 sheet 字段。
   // 卡片/预览显示的是这张（蓝），而出片喂给模型的是单张定妆照（红）—— 两个不同文件，
@@ -310,7 +317,9 @@ try {
   const plHead = await page.evaluate(() =>
     (document.querySelector('.picklist .pl-head')?.textContent || '').replace(/\s+/g, ' ').trim())
   if (isR2v) {
-    check('勾选条提示写明了"最多 3 张图"', plHead.includes('3 张'), plHead)
+    // ⚠️ 上限是 9 张（REF2VA_MAX_REFS，2026-09-19 从 3 张改成 9 张那次提交）；
+    //    这条断言当时漏改，2026-09-28 跑回归时才发现 —— 改实现时记得回来改断言。
+    check('勾选条提示写明了"最多 9 张图"', plHead.includes('9 张'), plHead)
   } else {
     check('勾选条提示写明了"I2V 只吃一张、再勾会替掉"', plHead.includes('只吃一张'), plHead)
   }
@@ -326,9 +335,87 @@ try {
     check('I2V：勾第二张会顶掉第一张（只吃一张图）',
       !p.已选.includes(CHAR) && p.已选.includes(SCENE), JSON.stringify(p.已选))
   }
-  // 收尾：清空已选，后面的断言从干净状态开始
+  // 收尾：清空已选，后面的断言从干净状态开始。
+  // ⚠️ Ref2VA 下两个都选着，只点 SCENE 清不干净（CHAR 还留在选中）—— 2026-09-28
+  //    跑回归才发现这条"收尾"是按 I2V 写的（那时点 SCENE 会顶掉 CHAR）。补一次 CHAR。
+  if ((await pickProbe()).已选.includes(CHAR)) {
+    await clickPickItem(CHAR)
+    await sleep(300)
+  }
   await clickPickItem(SCENE)
   await sleep(300)
+
+  // ---------- 6c) 分组 + 搜索（2026-09-28） ----------
+  // 斌哥截图报的："素材很多的时候，这里就很难看要选到哪个"（平铺成一坨小 chip）。
+  // 改成按组分段（角色/场景/道具/其他图片/其他音频）+ 组内一行横滑 + 搜索框；
+  // 空组折叠成一行灰字。这里验的是渲染结构，不验像素。
+  const groupProbe = () => page.evaluate(() => ({
+    组: [...document.querySelectorAll('.picklist .pl-group')].map((g) => ({
+      标签: (g.querySelector('.pl-ghead b')?.textContent || '').trim(),
+      计数: (g.querySelector('.pl-gcount')?.textContent || '').replace(/\s+/g, ' ').trim(),
+      项: [...g.querySelectorAll('.pl-item em')].map((e) => (e.textContent || '').trim()),
+      空: (g.querySelector('.pl-none')?.textContent || '').trim(),
+      行数: g.querySelectorAll('.pl-row').length,
+    })),
+    有搜索框: !!document.querySelector('.picklist .pl-search input'),
+    提示: (document.querySelector('.picklist .pl-none')?.textContent || '').trim(),
+  }))
+  const setPickQuery = (v) => page.evaluate((val) => {
+    const i = document.querySelector('.picklist .pl-search input')
+    if (!i) return false
+    i.value = val
+    i.dispatchEvent(new Event('input', { bubbles: true }))
+    return true
+  }, v)
+
+  let g = await groupProbe()
+  const labels = g.组.map((x) => x.标签)
+  check('素材条按组分段：五个组齐（角色/场景/道具/其他图片/其他音频）',
+    g.组.length === 5 && ['角色', '场景', '道具', '其他图片', '其他音频'].every((x) => labels.includes(x)),
+    JSON.stringify(labels))
+  const gRole = g.组.find((x) => x.标签 === '角色') || { 项: [], 计数: '' }
+  const gScene = g.组.find((x) => x.标签 === '场景') || { 项: [] }
+  const gProp = g.组.find((x) => x.标签 === '道具') || { 项: [] }
+  check('各归各组：角色/场景/道具的项没有互相串组',
+    gRole.项.includes(CHAR) && !gRole.项.includes(SCENE) && !gRole.项.includes(PROP)
+    && gScene.项.includes(SCENE) && !gScene.项.includes(CHAR) && !gScene.项.includes(PROP)
+    && gProp.项.includes(PROP) && !gProp.项.includes(CHAR),
+    JSON.stringify({ 角色: gRole.项, 场景: gScene.项, 道具: gProp.项 }))
+  check('组头带数量（"N 项"）', String(gRole.计数).includes('项'), gRole.计数)
+  check('空组折叠成一行灰字（其他图片）', (g.组.find((x) => x.标签 === '其他图片')?.空 || '').length > 0,
+    JSON.stringify(g.组.map((x) => [x.标签, x.空])))
+  check('非空组都渲染成一行横滑（.pl-row）', g.组.filter((x) => x.行数 > 0).length >= 3,
+    JSON.stringify(g.组.map((x) => x.行数)))
+  check('有搜索框', g.有搜索框 === true)
+
+  await setPickQuery(CHAR)
+  await sleep(400)
+  g = await groupProbe()
+  check('搜索角色名：只剩「角色」组、组内只剩它',
+    g.组.length === 1 && g.组[0].标签 === '角色' && g.组[0].项.length === 1 && g.组[0].项[0] === CHAR,
+    JSON.stringify(g.组.map((x) => [x.标签, x.项])))
+
+  await setPickQuery('不存在的素材xyz')
+  await sleep(400)
+  g = await groupProbe()
+  check('搜不到：给一句提示而不是空白一片', g.组.length === 0 && g.提示.includes('没有找到'), g.提示)
+
+  await setPickQuery('')
+  await sleep(400)
+  g = await groupProbe()
+  check('清空搜索：五个组都回来', g.组.length === 5, JSON.stringify(g.组.map((x) => x.标签)))
+  // 复位后再点一下：开关照常工作。写成"状态被切换"而不是"必然选中"——
+  // 不依赖进入 6c 时 CHAR 选没选（那由 6b 的收尾决定），断言才不会被上游改动连累。
+  const beforePick = (await pickProbe()).已选.includes(CHAR)
+  check('搜索复位后素材条还能点', await clickPickItem(CHAR) === true)
+  await sleep(400)
+  p = await pickProbe()
+  check('点一下真的切换了选中状态（结构没被搜索搞坏）',
+    p.已选.includes(CHAR) === !beforePick, `before=${beforePick} after=${p.已选.includes(CHAR)}`)
+  if (p.已选.includes(CHAR)) {   // 复原成未选，别把状态留给后面的断言
+    await clickPickItem(CHAR)
+    await sleep(300)
+  }
 
   // ---------- 7) 「首尾帧」这一行已经整行摘掉（2026-09-19 斌哥定） ----------
   // 理由：首尾帧只对 I2V / fl2va 成立，Ref2VA 那份工作流的节点没有尾帧口 —— 他固定用 Ref2VA，
