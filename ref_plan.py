@@ -225,6 +225,26 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip().rstrip(".")
 
 
+# 参考槽位的**种类顺序** —— 它决定 `<Picture N>` 的编号，是提示词与出片两边共用的契约。
+#
+# ⚠️ 出片那一侧（`server/app.py::start_segment_video`）必须按**同一个规则**给参考图
+#    排序：ComfyUI 按上传顺序收图（`ref_image_0 … ref_image_8`，见 video_provider），
+#    而提示词是按这份顺序写的。两边一旦错位，就是"提示词说 `<Picture 2>` 是那把剑，
+#    模型收到的第 2 张却是背景"—— 从画面上看只会觉得"参考没生效"，很难查回来。
+REF_KIND_ORDER = ("character", "prop", "scene", "image", "audio")
+
+
+def kind_rank(kind: str) -> int:
+    """素材种类 → 它在参考槽位里的排位（不认识的种类排最后，不去猜它的位置）。
+
+    稳定排序的 key：同一种类内保持用户点选的先后（见 start_segment_video 的调用点）。
+    """
+    try:
+        return REF_KIND_ORDER.index(str(kind or ""))
+    except ValueError:
+        return len(REF_KIND_ORDER)
+
+
 def build_ref_plan(
     project,
     *,
@@ -241,10 +261,16 @@ def build_ref_plan(
     顺序规则（决定了 tag 编号，改之前想清楚）：
       **角色 → 道具 → 场景 → 其他图片 → 最后音频（角色音色 + 其他音频）**
     图片编号连续占 `<Picture 1..N>`；音频**另起一号**占 `<Audio 1..M>`。
+    这份顺序就是 `REF_KIND_ORDER` —— 出片那一侧（`server/app.py::start_segment_video`）
+    按同一个规则给参考图排序，见那里的注释：**它和这里是同一个契约，改一处必须改两处**。
 
     `images` / `audios` 是「其他图片 / 其他音频」类素材的名字 —— 它们是**用户自己上传的**，
     对"没有任何图像/文本 API，只有 ComfyUI"的用户来说，这就是全部的素材来源，
     所以编排器必须能吃下它们，不能只认角色/道具/场景。
+
+    ⚠️ **"用素材的哪张图"这条规则不在这里**，在 `schemas.Character.primary_image` /
+    `schemas.Asset.primary_image`：设定图（sheet）优先，没有才退回单张。这里只负责
+    **排序与编号** —— 但两件事必须一起对，否则"提示词说的那张"和"模型收到的那张"不是同一张。
 
     extra_views>0 时，每个角色额外带 1 张其它视角（侧面/全身）来加强身份保真 ——
     会多占槽位，9 张上限下别开太大。
@@ -260,12 +286,18 @@ def build_ref_plan(
         if c is None:
             plan.warnings.append(f"角色「{name}」不在 project.characters 里，已跳过")
             continue
+        # ⚠️ 第一张图必须与出片时**实际上传的那张**是同一张（2026-09-29 修）：
+        #    Ref2VA 下 `_resolve_material_ref` 给角色用的是四视图设定图（sheet），
+        #    而这里从前写死 `image_path`（单张正面照）—— manifest 那份"连线操作单"指的
+        #    文件于是跟真正进模型的不是同一个。取哪张只有 `Character.primary_image` 一处
+        #    （I2V / 首尾帧那条链路另说：那里首帧必须是单张正面照）。
+        first = c.primary_image
         paths: list[str] = []
-        if c.image_path:
-            paths.append(c.image_path)
+        if first:
+            paths.append(first)
         if extra_views > 0 and c.images:
             for p in c.images:
-                if p != c.image_path and len(paths) <= extra_views:
+                if p != first and len(paths) <= extra_views:
                     paths.append(p)
         if not paths:
             plan.warnings.append(f"角色「{name}」还没有定妆照 → 无法作为参考图")
@@ -303,13 +335,21 @@ def build_ref_plan(
                 )
                 aud_i += 1
 
-    # ---- 道具：主视图
+    # ---- 道具：三视图设定图（sheet）优先，没有才退回单张主视图 / 上传图
+    # ⚠️ **不能只看 `a.images`（2026-09-29 修）**：道具走「AI 生成」产出的是**一张三视图**，
+    #    产物只落 `a.sheet`、`images` 恒为空（见 `schemas.Asset.sheet` 与
+    #    `server/app.py::generate_asset_image` 的落库注释）。从前这里只读 `a.images[0]`，
+    #    于是**六个道具全被判成"还没有素材图"**：出片时一张都用不上，提示词里一个道具
+    #    都引用不到，卡片上还挂着黄字「道具「旧铁剑」还没有素材图 → 无法作为参考图」。
+    #    "取哪张图"这条规则只有 `Asset.primary_image` 一处 —— 必须与出片时的
+    #    `_resolve_material_ref` 给出同一个答案，否则编号与实际上传的图会对不上。
     for name in props:
         a = project.asset_of(name, "prop")
         if a is None:
             plan.warnings.append(f"道具「{name}」不在 project.assets 里，已跳过")
             continue
-        if not a.images:
+        path = a.primary_image
+        if not path:
             plan.warnings.append(f"道具「{name}」还没有素材图 → 无法作为参考图")
             continue
         if img_i >= MAX_IMAGES:
@@ -318,7 +358,7 @@ def build_ref_plan(
         subject_i += 1
         plan.slots.append(
             RefSlot(
-                kind="image", index=img_i, tag=f"<Picture {img_i + 1}>", path=a.images[0],
+                kind="image", index=img_i, tag=f"<Picture {img_i + 1}>", path=path,
                 role="prop", label=name, retention="fully_preserved",
                 subject=f"<Subject {subject_i}>",
                 note=_clean(a.anchor_en) or f"the prop named {name}",

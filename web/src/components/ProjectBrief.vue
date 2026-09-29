@@ -154,8 +154,11 @@ const assetGroups = computed(() => {
   return groups
 })
 
+// 道具与 CreateWorkbench / 后端 `Asset.primary_image` 同一口径：优先「三视图设定图」
+// （sheet）—— 「AI 生成」给道具出的就是它，`images` 恒为空（2026-09-29 修）。
+// 只读 images[0] 会让已生成好的道具显示成"待生成"，按钮文案也跟着错。
 function mainImage(a) {
-  return (a.images && a.images[0]) || ''
+  return a.sheet || (a.images && a.images[0]) || ''
 }
 
 function viewsOfAsset(a) {

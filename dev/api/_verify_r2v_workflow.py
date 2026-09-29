@@ -226,6 +226,34 @@ check("LoRA 是 ref2v 4step", found.get("LoraLoaderModelOnly") == need["lora"],
 check("步数默认就是 4（配 4step LoRA）", r2v_raw["9"]["inputs"]["steps"] == 4,
       str(r2v_raw["9"]["inputs"]["steps"]))
 
+# ⚠️ ref_image_size 是**必填**（2026-09-29 踩到）：官方给节点加了这个必填输入之后，
+#    我们导出时还没有它 —— 出片直接 400 `Required input is missing`，而界面上只显示
+#    "400 Bad Request"（那时的 _submit 把响应体丢了）。这条断言就是防它再漏。
+h3_node = next((v for v in r2v_raw.values()
+                if isinstance(v, dict) and v.get("class_type") == "MiniMaxH3ReferenceToVideo"), {})
+check("H3 节点带了 ref_image_size（schema 里必填，缺了直接 400）",
+      (h3_node.get("inputs") or {}).get("ref_image_size") in ("match", "max"),
+      f"ref_image_size={(h3_node.get('inputs') or {}).get('ref_image_size')!r}（只能是 match / max）")
+
+# _submit 拒单时要把 ComfyUI 的 node_errors 翻成人话 —— 从前只剩一句 "400 Bad Request"
+class _FakeResp:
+    status_code = 400
+    text = ""
+    def json(self):
+        return {
+            "error": {"type": "prompt_outputs_failed_validation",
+                      "message": "Prompt outputs failed validation"},
+            "node_errors": {"104": {"class_type": "MiniMaxH3ReferenceToVideo", "errors": [
+                {"type": "required_input_missing",
+                 "message": "Required input is missing: ref_image_size",
+                 "extra_info": {"input_name": "ref_image_size"}}]}},
+        }
+
+_msg = vp.ComfyUIVideoProvider._prompt_error_text(_FakeResp())
+check("400 的报错里带上了「哪个节点缺什么」（不再只有一句 Bad Request）",
+      "104" in _msg and "ref_image_size" in _msg and "Required input is missing" in _msg,
+      _msg.replace("\n", " | "))
+
 sig_c = inspect.signature(vp.ComfyUIVideoProvider.generate)
 sig_a = inspect.signature(vp.ApiVideoProvider.generate)
 check("两个 provider 的 generate 签名一致（老坑：少一个参数就 TypeError）",

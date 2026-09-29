@@ -122,7 +122,11 @@ const items = computed(() => {
   assets.value.forEach((a, i) => {
     const bucket = ['prop', 'scene', 'image', 'audio'].includes(a.kind) ? a.kind : 'prop'
     const target = bucket === 'image' ? 'otherImage' : bucket === 'audio' ? 'otherAudio' : bucket
-    const ready = !!a.images?.length
+    // ⚠️ 道具的 ready **不能只看 images**（2026-09-29 修）：道具走「AI 生成」产出的
+    // 是**三视图设定图**，只落 `sheet`、`images` 恒为空 —— 从前这里写 `!!a.images?.length`，
+    // 于是已生成好的道具一直显示「还没有素材图」，出片时还会被后端判成"没带上"。
+    // 与后端 `_resolve_material_ref` 的口径保持一致：道具看 sheet 或 images，其余看 images。
+    const ready = bucket === 'prop' ? !!(a.sheet || a.images?.length) : !!a.images?.length
     // 道具的「三视图设定图」（sheet）优先显示 —— 它信息量最大；
     // 还没出三视图但有单件图时退回单件图。它不进 images，只作总览。
     // version 同角色：就地覆盖 + URL 不变 = 浏览器不重新请求（见上面 character 那段注释）。

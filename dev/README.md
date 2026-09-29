@@ -21,6 +21,7 @@
 | `_verify_history.py` | 生成历史：写图前快照、切回某一版、只留最近 10 版、路径穿越防护 |
 | `_verify_other_image.py` | 「其他图片」AI 生成的接口校验（kind 放行/黑名单、reroll 保护） |
 | `_verify_optimize_prompt.py` | 「让 AI 帮写」：中文进、中文出 |
+| `_verify_poll_resilience.py` | 出片轮询容错：隧道抖一下不能把整条片子弄丢（全程打桩，不联网） |
 | `_verify_portrait_prompt.py` | 角色定妆照提示词链路（零外部调用） |
 | `_verify_purge_errors.py` | 「彻底删除」失败时能给出可读的错误 |
 | `_verify_r2v_workflow.py` | Ref2VA 多参考图工作流接线（全程离线，不碰 ComfyUI） |
@@ -64,5 +65,7 @@
 
 | 脚本 | 用途 |
 | --- | --- |
+| `check_comfyui_models.py` | 查实例上的 ComfyUI 缺哪个模型文件 / 哪个节点，并给出下载命令（出片失败先跑这个） |
+| `check_portrait_chain.py` | 复现「某个角色出形象图失败」的整条链，打印原始报错 |
 | `crop_ref.py` | 把豆包 / 即梦产出的多视角角色拼贴图裁成单视角图 |
 | `test_collage_edit.py` | 「整张拼贴直发 Edit 模型」路线实验（一次调用出四个视角） |

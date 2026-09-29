@@ -275,6 +275,7 @@ ai_video_multiagent/
 ├─ ref_plan.py              # H3 提示词编排与审计（分段时长、[Shot N] 标记）
 ├─ deploy_comfyui.sh        # 租卡环境一键部署（AutoDL / 有公网 IP 的服务器）
 ├─ deploy_comfyui_ms.sh     # ModelScope DSW 一键部署 + pinggy 隧道
+├─ tunnel_aliyun.sh         # 用自己的阿里云服务器做跳板（替代 pinggy，地址固定不过期）
 ├─ comfyui/                 # ComfyUI 工作流模板（h3_i2v_api.json 等，API 格式）
 ├─ docs/                    # 文档：H3 提示词规则、隧道指南、REF2VA 接入指引
 ├─ dev/                     # 开发期验证脚本（接口 / 界面 / E2E，非产品代码，见 dev/README.md）
@@ -285,7 +286,8 @@ ai_video_multiagent/
 ## 常见问题
 
 **面板里 ComfyUI 显示红点「连不上」？**
-实例没在跑或隧道过期。在实例里重跑 `start_comfyui.sh`，拿新的 `tunnel_url.txt` 地址填进面板。
+实例没在跑或隧道断了。在实例里重跑一次隧道脚本：走 pinggy 的话地址每 60 分钟会变，
+拿新的 `tunnel_url.txt` 填进面板；用 `tunnel_aliyun.sh`（自己的服务器做跳板）地址固定，重跑那一个脚本即可。
 可以先 `curl -m 10 https://<隧道地址>/system_stats` 验证通不通。
 
 **生成失败了去哪看原因？**

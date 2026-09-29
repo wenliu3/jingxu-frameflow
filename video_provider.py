@@ -233,6 +233,11 @@ class ComfyUIVideoProvider:
         self.poll_interval = poll_interval
         self.timeout = timeout_per_shot
 
+    # 轮询时能容忍的**连续**失败次数（poll_interval 默认 10 秒 → 约 5 分钟）。
+    # 覆盖隧道断线重连、ComfyUI 短暂卡住；真断了就如实报错，不无限等。
+    # 见 _wait 的 docstring。
+    _POLL_TOLERANCE = 30
+
     def generate(
         self,
         image_path: str,
@@ -262,8 +267,8 @@ class ComfyUIVideoProvider:
         workflow = self._build_workflow(
             video_prompt, duration, image_name, audio, last_frame_name, megapixels, extra_refs
         )
-        if self._is_ref2va(workflow):
-            self._preflight_models(workflow)
+        # 缺模型文件要**在提交前**就说清楚（哪条工作流都一样 —— 见 _preflight_models 的注释）
+        self._preflight_models(workflow)
         prompt_id = self._submit(workflow)
         filename, subfolder = self._wait(prompt_id)
         self._download(filename, subfolder, out_path)
@@ -271,13 +276,17 @@ class ComfyUIVideoProvider:
 
     # ---- 四步协议 ----
 
-    # 工作流里"点名要用某个模型文件"的节点 —— 缺文件时 ComfyUI 的报错是
-    # `value not in list: unet_name: 'xxx' not in [...]`，看着像工作流坏了。
+    # 工作流里"点名要用某个模型文件"的节点 → (节点类型, 字段名, 它在 ComfyUI 的哪个模型目录)。
+    # 目录要写对：下载命令是按它拼的，写错就等于把人指到沟里。
     _MODEL_INPUTS = (
-        ("UNETLoader", "unet_name"),
-        ("CLIPLoader", "clip_name"),
-        ("LoraLoaderModelOnly", "lora_name"),
+        ("UNETLoader", "unet_name", "diffusion_models"),
+        ("CLIPLoader", "clip_name", "text_encoders"),
+        ("LoraLoaderModelOnly", "lora_name", "loras"),
+        ("VAELoader", "vae_name", "vae"),
     )
+    # 实例上的 ComfyUI 目录（deploy_comfyui_ms.sh / deploy_comfyui.sh 都装在这里）
+    _INSTANCE_DIR = "/mnt/workspace/ComfyUI"
+    _MODEL_REPO = "Comfy-Org/MiniMax-H3"
 
     @staticmethod
     def _is_ref2va(workflow: dict) -> bool:
@@ -287,17 +296,26 @@ class ComfyUIVideoProvider:
         )
 
     def _preflight_models(self, workflow: dict) -> None:
-        """Ref2VA 要**另外 3 个模型文件**（unet / clip / lora）。提交前对着实例的清单
-        点一次名，缺什么就直说 —— 别让用户对着一句 "value not in list" 猜。
+        """提交前对着实例的模型清单点一次名：缺哪个就直说，并给出**能照着做**的下载命令。
 
-        只在 Ref2VA 这条路上跑（i2v 那几个文件本来就在，白查一遍要 3 个来回）。
+        为什么不等 ComfyUI 自己报：它给的是
+        `value not in list: unet_name: 'xxx' not in [...]` —— 文件名在里面，但看着像工作流坏了，
+        用户不知道该去哪儿补、补到哪个目录。而缺模型正是"出片失败"里最常见的一类
+        （换模式要换权重，见 docs/REF2VA.md）。
+
+        ⚠️ **两条工作流都查（2026-09-29 改）**：从前只在 Ref2VA 那条路上查，理由是
+        "i2v 那几个文件本来就在"。可那是**实例上的状态**，不是代码能替用户假设的事 ——
+        100GB 的盘装不下两套权重（fl2va 约 72GB + ref2va 约 36GB），删掉一套是常规操作；
+        这时再切回另一条路，就只剩上面那句天书了。代价是每次出片多 4 个 HTTP 往返，
+        相对一次几分钟的出片可以忽略。
+
         查不动（网络/接口问题）就放行，交给 _submit 去报真正的错。
         """
-        missing: list[str] = []
+        missing: list[tuple[str, str, str]] = []      # (目录, 文件名, 字段名)
         for node in workflow.values():
             if not isinstance(node, dict):
                 continue
-            for cls, field in self._MODEL_INPUTS:
+            for cls, field, folder in self._MODEL_INPUTS:
                 if str(node.get("class_type")) != cls:
                     continue
                 want = str((node.get("inputs") or {}).get(field) or "").strip()
@@ -312,16 +330,25 @@ class ComfyUIVideoProvider:
                 except Exception:                       # noqa: BLE001 - 查不动就别拦
                     return
                 if want not in opts:
-                    missing.append(f"{field} = {want}")
-        if missing:
-            raise RuntimeError(
-                "ComfyUI 上找不到这些模型文件：" + "；".join(missing)
-                + "。这一份 Ref2VA 工作流要额外下载："
-                  "unet = minimax_h3_ref2va_pruned_int8_convrot.safetensors、"
-                  "clip = qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors、"
-                  "lora = minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
-                  "（VAE 两个文件与 I2V 共用，不用重下）。下完刷新 ComfyUI 再出片即可。"
-            )
+                    missing.append((folder, want, field))
+        if not missing:
+            return
+
+        # 按**实际缺的那几个文件**拼命令 —— 别写死某一套权重的名字，
+        # 不然切到另一条路时给的就是错的下载清单（这正是 2026-09-29 那次踩的）。
+        cmds = "；".join(
+            f"modelscope download --model {self._MODEL_REPO} {folder}/{name} --local_dir models"
+            for folder, name, _ in missing
+        )
+        raise RuntimeError(
+            "ComfyUI 上找不到这些模型文件："
+            + "；".join(f"{field} = {name}" for _, name, field in missing)
+            + f"。在**实例的终端**里执行：① cd {self._INSTANCE_DIR}  ② {cmds}"
+              "（自建 / 租卡环境把 `modelscope download --model X Y --local_dir Z` 换成 "
+              "`huggingface-cli download X Y --local-dir Z`）。"
+              "下完在 ComfyUI 页面刷新一下再出片即可；想先确认齐没齐，"
+              "在本机项目根跑 python dev/tools/check_comfyui_models.py。"
+        )
 
     def _upload(self, image_path: str) -> str:
         with open(image_path, "rb") as fh:
@@ -440,22 +467,93 @@ class ComfyUIVideoProvider:
         return wf
 
     def _submit(self, workflow: dict) -> str:
+        """提交工作流，返回 prompt_id。
+
+        ⚠️ **400 的响应体必须带出来（2026-09-29 修）**。ComfyUI 拒单时把**原因**
+        写在响应体里（`node_errors` 里逐节点列出"缺哪个必填输入 / 哪个值不在列表里"），
+        而这里从前是 `raise_for_status()` 先抛出 —— 抛出去的那句话只有
+        `400 Client Error: Bad Request for url: ...`，**真正的原因被丢掉了**。
+        那次的现象就是这么一句没头没脑的 400，最后是拿 /object_info 手工比 schema
+        才查出来（节点新增了一个必填输入 `ref_image_size`，我们模板里没有）。
+        现在把响应体解析出来一起报，并把 node_errors 压成一行行的"哪个节点缺什么"。
+        """
         payload = {"prompt": workflow, "client_id": self.client_id}
         resp = requests.post(f"{self.base}/prompt", json=payload, timeout=60)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise RuntimeError(self._prompt_error_text(resp))
         data = resp.json()
         if data.get("error"):
             raise RuntimeError(f"ComfyUI 拒绝了工作流：{json.dumps(data, ensure_ascii=False)[:500]}")
         return data["prompt_id"]
 
+    @staticmethod
+    def _prompt_error_text(resp: "requests.Response") -> str:
+        """把 ComfyUI 拒单的响应体翻成人话（拿不到原文就退回状态码）。"""
+        try:
+            body = resp.json()
+        except Exception:                                     # noqa: BLE001
+            return f"ComfyUI 拒绝了工作流（HTTP {resp.status_code}）：{resp.text[:400]}"
+        err = body.get("error") or {}
+        head = str(err.get("message") or "").strip() or "ComfyUI 拒绝了工作流"
+        lines = [f"ComfyUI 拒绝了工作流（HTTP {resp.status_code}）：{head}"]
+        # node_errors: {"104": {"errors": [{"message": "...", "extra_info": {...}}]}}
+        for nid, info in (body.get("node_errors") or {}).items():
+            cls = str((info or {}).get("class_type") or "")
+            for item in (info or {}).get("errors") or []:
+                msg = str(item.get("message") or "").strip()
+                extra = item.get("extra_info") or {}
+                detail = str(extra.get("input_name") or extra.get("value") or "").strip()
+                bits = " ".join(x for x in (detail, str(extra.get("received_value") or "").strip()) if x)
+                lines.append(f"  · 节点 {nid}{f'（{cls}）' if cls else ''}：{msg}"
+                             + (f" → {bits}" if bits else ""))
+        if len(lines) == 1:
+            lines.append("  " + json.dumps(err.get("details") or body, ensure_ascii=False)[:400])
+        return "\n".join(lines)
+
     def _wait(self, prompt_id: str) -> tuple[str, str]:
-        """轮询 history 直到完成，返回 (filename, subfolder)。"""
+        """轮询 history 直到完成，返回 (filename, subfolder)。
+
+        ⚠️ **轮询必须容错（2026-09-29 修）**。H3 跑一条 10 秒的片实测要 **31 分钟**
+        （见 `__init__` 里那段注释），这中间隧道抖一下、断几秒是常有的事。从前这里
+        一次 `requests.get` 失败就直接抛出去 —— **整条片子白跑**；而 ComfyUI 那边其实
+        还在照常生成，只是我们这边不问了。用户看到"出片失败"，去 ComfyUI 里却找得到片子。
+        所以这里分两类：
+          · 连接类错误 / 5xx：**记一笔接着等**（ComfyUI 上的任务不受影响，隧道重连后
+            `/history` 照样能查），连续失败到 `_POLL_TOLERANCE` 次才放弃
+          · 4xx：是真出错（prompt_id 不认、请求不合法），立刻抛，别傻等
+        """
         deadline = time.monotonic() + self.timeout
+        streak = 0
         while time.monotonic() < deadline:
             time.sleep(self.poll_interval)
-            resp = requests.get(f"{self.base}/history/{prompt_id}", timeout=30)
-            resp.raise_for_status()
-            history = resp.json()
+            try:
+                resp = requests.get(f"{self.base}/history/{prompt_id}", timeout=30)
+                resp.raise_for_status()
+                history = resp.json()
+            except Exception as exc:                      # noqa: BLE001
+                code = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+                if 400 <= code < 500:                     # 不是"抖一下"，重试没用
+                    raise
+                streak += 1
+                if streak == 1:
+                    print(
+                        f"[出片] 轮询失败（连续 {streak} 次）：{type(exc).__name__}: {exc}"
+                        " —— 继续等，ComfyUI 那边多半还在跑"
+                    )
+                if streak >= self._POLL_TOLERANCE:
+                    raise RuntimeError(
+                        f"连续 {streak} 次联系不上 ComfyUI"
+                        f"（约 {streak * self.poll_interval / 60:.0f} 分钟），"
+                        f"没能确认这一条的结果：{type(exc).__name__}: {exc}。"
+                        f"片子可能已经在 ComfyUI 那边跑完了（prompt_id={prompt_id}）——"
+                        "去它的 output 目录找一下，或者在镜序里重跑一次。"
+                    ) from exc
+                continue
+
+            if streak:
+                print(f"[出片] 轮询恢复（连续失败 {streak} 次后又能联系上）")
+                streak = 0
+
             if not history:
                 continue
             entry = history[prompt_id]

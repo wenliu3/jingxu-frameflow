@@ -312,8 +312,10 @@ def _video_error_text(exc: Exception) -> str:
     if not url:
         return f"没有配置 ComfyUI 地址：点右上角「服务配置」填进去。原始报错：{text[:200]}"
     return (
-        f"连不上 ComfyUI（{url}）。最常见的原因是隧道过期 —— 到 GPU 实例上重跑 "
-        f"deploy_comfyui.sh，把新地址填进「服务配置」。原始报错：{text[:300]}"
+        f"连不上 ComfyUI（{url}）。最常见的原因是**隧道断了** —— 到 GPU 实例上重跑一次隧道脚本："
+        f"走 pinggy 的话地址每 60 分钟会变，换了记得把新地址填回「服务配置」；"
+        f"用自己服务器做跳板（tunnel_aliyun.sh）地址固定，重跑那一个脚本即可。"
+        f"详见 docs/comfyui-tunnel-guide.md。原始报错：{text[:300]}"
     )
 
 
@@ -2602,7 +2604,8 @@ def _resolve_material_ref(
     """把 "character:0" / "scene:0" / "prop:1" / "image:0" / "audio:0" 解析成
     `{ref, kind, name, path}`；解析不出来（或那张图不存在）返回 None。
 
-    道具用主视图（images[0]），场景/图片/音频用唯一那张。
+    道具优先用**三视图设定图**（sheet），没有才退回主视图（images[0]）
+    —— 与角色同一套逻辑（2026-09-29 修，见下）。场景/图片/音频用唯一那张。
 
     角色走哪张图由 `prefer_sheet` 决定（2026-09-19 斌哥定）：
       - False（I2V / 首尾帧那条链路）：用**正面定妆照**（image_path）—— 那张是要当**首帧**
@@ -2610,6 +2613,24 @@ def _resolve_material_ref(
       - True（Ref2VA 多图参考）：优先用**四视图设定图**（sheet）—— 参考图不是帧，给的信息
         越多越好：一张里就有大特写 + 正/侧/背三个全身，正是用户做这张图的目的。
         （他的原话："我上传那个角色图肯定是要多视角那个啊"。）没有设定图才退回单张。
+
+    ⚠️ **道具必须和角色一样优先吃 sheet —— 2026-09-29 修**。这是个接口断层，
+    六个道具做了也全用不上：
+      - 「AI 生成」那条路（`_gen_asset_image`）给道具出的是**三视图设定图**，
+        产物只落在 `a.sheet`，**`images` 恒为空**（见那里的落库注释与 `_load_task_from_disk`）。
+      - 而这里从前对非角色素材**只读 `a.images[0]`** → 恒为空 → 返回 None →
+        被记成"这次没带上"，前端卡片也显示"还没有素材图"。
+        斌哥实测现象：选中「旧铁剑」出片，toast 报"这些素材这次没带上（还没有图）：旧铁剑"，
+        卡片上却是黄字"道具「旧铁剑」还没有素材图 → 无法作为参考图"——图明明已经生成好了。
+      所以道具与角色同规则：`prefer_sheet` 为真（Ref2VA）时优先 sheet，没有才退回单视图。
+
+    ⚠️ **"用素材的哪张图"这条规则只有一处**：`Character.primary_image` /
+    `Asset.primary_image`（2026-09-29 收拢）。这里和提示词那一侧
+    （`ref_plan.build_ref_plan`）读的是同两个属性 —— 从前两边各写各的，道具那次分叉
+    就是"图早就生成好了，提示词却说它没有素材图"。改规则请改 schemas.py，别在这儿加分支。
+
+    ⚠️ **返回顺序 ≠ 参考图编号**：这里只负责"解析出哪张图"，`<Picture N>` 的编号是
+    `start_segment_video` 按 `ref_plan.REF_KIND_ORDER` 重排后定的（见那里的注释）。
 
     ⚠️ **索引一律是列表的全局下标**：角色 = `project.characters[i]`，
     其余 = `project.assets[i]`（**不是「同类内的序号」**）。
@@ -2635,16 +2656,32 @@ def _resolve_material_ref(
         chars = project.characters
         if 0 <= i < len(chars):
             c = chars[i]
-            if prefer_sheet and c.sheet and os.path.isfile(c.sheet):
-                path, name = c.sheet, c.name
+            # ⚠️ 取哪张图只有 `Character.primary_image` 一处（2026-09-29 修）：
+            #    提示词那一侧的 `ref_plan.build_ref_plan` 读的是同一个属性。
+            #    多一道 isfile：设定图被删掉时退回单张定妆照，别整条引用解析不出来。
+            if prefer_sheet:
+                best = c.primary_image
+                path, name = (best if os.path.isfile(best) else c.image_path), c.name
             else:
                 path, name = c.image_path, c.name
     else:
         assets = project.assets
         if 0 <= i < len(assets) and str(assets[i].kind or "") == kind:
             a = assets[i]
-            path = a.images[0] if a.images else ""
             name = a.name
+            # 道具的特殊分支（2026-09-29 修，见 docstring）：三视图设定图落在 sheet，
+            # images 恒空；只读 images[0] 会让"已经生成好的道具"永远解析不出来。
+            # ⚠️ **取哪张图这条规则只有 `Asset.primary_image` 一处** —— 提示词那一侧的
+            #    `ref_plan.build_ref_plan` 读的是同一个属性，两边必须给出同一个答案，
+            #    否则会出现"提示词说的是那把剑、上传的却是背景"。
+            #    这里多一道 isfile：设定图被删掉时退回单张，别整条引用解析不出来。
+            # ⚠️ 只对 `prop` 这么做。场景/图片/音频没有 sheet 的概念（`_ASSET_FILE_NAME`
+            #    里也只给 scene/image 重指），给它们读 sheet 只会读到空串。
+            if kind == "prop" and prefer_sheet:
+                best = a.primary_image
+                path = best if os.path.isfile(best) else (a.images[0] if a.images else "")
+            else:
+                path = a.images[0] if a.images else ""
     if not path:
         return None
     return {"ref": f"{kind}:{i}", "kind": kind, "name": name or f"{kind}{i}", "path": path}
@@ -2751,6 +2788,16 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
             name = _ref_display_name(project, str(ref).strip())
             if name not in missing:
                 missing.append(name)
+
+    # ⚠️ **参考图的顺序 = 提示词里 `<Picture N>` 的编号顺序**，两者必须一致（2026-09-29 修）。
+    #    出片时按这个列表的顺序连线：第 1 张进 `ref_images.ref_image_0`，第 2 张 `ref_image_1`…
+    #    （见 video_provider._build_workflow），而提示词里的 `<Subject 1> is the person shown
+    #    in <Picture 1>` 是按**种类**编号的 —— 编号规则在 ref_plan.REF_KIND_ORDER：
+    #    **角色 → 道具 → 场景 → 其他图片**。
+    #    前端发过来的 `frames` 是它自己列表的顺序（角色 → 场景 → 道具），只要同时选了道具和
+    #    场景，两边就会错位：提示词说 `<Picture 2>` 是那把剑，模型收到的第 2 张却是场景图。
+    #    稳定排序，同一种类内保持用户点选的先后。
+    resolved.sort(key=lambda m: ref_plan.kind_rank(m["kind"]))
     paths = [m["path"] for m in resolved]
     if missing:
         print(f"[出片] 这些素材没带上（没有图 / 引用对不上）：{'、'.join(missing)}")

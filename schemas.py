@@ -41,6 +41,21 @@ class Character:
                                  # crop_ref 是独立的离线工具，**没有任何产品代码调用它**，
                                  # 所以改版式不影响链路。
 
+    @property
+    def primary_image(self) -> str:
+        """Ref2VA 出片时真正送进模型的那张：**四视图设定图（sheet）优先**，没有才退回单张正面定妆照。
+
+        与 `Asset.primary_image` 同一套规则、同一个理由：出图有两条路，产物落在两个字段上
+        ——「AI 生成」出的是拼版设定图（只落 `sheet`），上传/单张出图落在 `image_path`。
+        提示词那一侧（`ref_plan.build_ref_plan` 的 `<Picture N>`）与出片那一侧
+        （`server/app.py::_resolve_material_ref`）必须看同一处，否则两边说的不是同一张图。
+
+        ⚠️ **I2V / 首尾帧那条链路不能用这个**：那里第一张图要当**首帧**，必须是单张正面
+        定妆照（`image_path`）—— 四格拼图当首帧＝视频第一秒就是四个人并排。
+        所以 `_resolve_material_ref` 里它是挂在 `prefer_sheet`（= Ref2VA）下面的。
+        """
+        return self.sheet or self.image_path
+
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Character":
         images = [str(x) for x in (d.get("images") or [])]
@@ -84,6 +99,24 @@ class Asset:
                                  # 与 Character.sheet 同理：只作总览与留档，**不进 images** ——
                                  # 下游要的是单件图，拼图会被模型读成"画面里有三件道具"。
                                  # 场景不搞多视角（一张全景就够），所以没有 scene 的 sheet。
+
+    @property
+    def primary_image(self) -> str:
+        """这个素材**出片时真正送进模型的那张图**（没有就返回空串）。
+
+        道具与角色同规则：优先「三视图设定图」（`sheet`）—— 「AI 生成」那条路
+        （`server/app.py::generate_asset_image`）给道具产出的就是它，而且
+        **只落 `sheet`、`images` 恒为空**（见上面 `sheet` 的注释）。上传的图则落在
+        `images[0]`（`_ASSET_FILE["prop"]` → `prop_<名>_front.png`），所以两处都要看。
+
+        ⚠️ **这条规则只能有一处**。两个地方必须给出同一个答案：
+          - `ref_plan.build_ref_plan` —— 决定提示词里哪个素材是 `<Picture N>`
+          - `server/app.py::_resolve_material_ref` —— 决定出片时真正上传哪张图
+        两边各写各的，就会"提示词说的是那把剑、模型收到的却是背景"。2026-09-29 之前
+        `ref_plan` 那份只读 `images[0]`，于是**六个道具全被判成"还没有素材图"**：
+        出片时一张都用不上，卡片上还挂着黄字提示 —— 图明明早就生成好了。
+        """
+        return self.sheet or (self.images[0] if self.images else "")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Asset":

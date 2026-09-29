@@ -60,12 +60,23 @@ FILES=(
 )
 # ref2va：全能参考模式（Ref2VA）——用角色参考图锁定身份、构图交给提示词，
 # 这才是「人物图 + 提示词、不出分镜图」那条路线需要的权重。
-# 与 fl2va 是两个独立 checkpoint，同一时刻只能挂一个。
-# ⚠️ 存储：这个文件约 20GB，先确认实例盘放得下（DSW 常驻盘通常很小，
+# 与 fl2va 是两个独立 checkpoint，同一时刻只能挂一个（切模式只换工作流，见 docs/REF2VA.md）。
+#
+# ⚠️ **三个文件缺一不可（2026-09-29 修）**：从前这里只加了 unet 那一个，于是"照脚本
+#    部署完"仍然出不了片 —— `comfyui/h3_r2v_api.json` 还要求：
+#      ① 换一个 text_encoder：nvfp4_awq 那份，**与 fl2va 用的 int8_convrot 不是同一个文件**；
+#      ② 换一个 ref2v 专用 LoRA（fl2v 那两个用不了）。
+#    实测现象：出片直接失败，报「ComfyUI 上找不到这些模型文件：unet_name = …；clip_name = …；
+#    lora_name = …」—— 那句话由 `video_provider._preflight_models` 在提交前点名。
+# ⚠️ 存储：三个合计约 36GB（19.5 + 14.6 + 1.8），先确认实例盘放得下（DSW 常驻盘通常很小，
 #    必要时把 M 指到临时盘再把 models/ 软链回去）。
 # 不需要就 WANT_REF2VA=0 bash deploy_comfyui_ms.sh 跳过。
 if [ "${WANT_REF2VA:-1}" = "1" ]; then
-  FILES+=("diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors")
+  FILES+=(
+    "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+    "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+    "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+  )
 fi
 for f in "${FILES[@]}"; do
   if [ -f "$M/$f" ]; then

@@ -2,7 +2,9 @@
 
 > 状态：**代码已接入**（2026-09-19：`comfyui/h3_r2v_api.json` + `video_provider.ref_image_paths` +
 > `server/app.py` 的 `video_workflow` 配置，离线 `_verify_r2v_workflow.py` 全过）。
-> **仍未做的**：① 实例上下模型文件；② 一次真实出片；③ 音频参考没接。
+> **仍未做的**：① 实例上那份 **text_encoder 与 LoRA** 还没下（见「现在缺什么」）；
+> ② 一次真实出片；③ 音频参考没接。
+> （2026-09-29 实测复核：节点已就绪，只差模型文件。）
 
 ## 一句话
 
@@ -45,9 +47,50 @@ H3 有两个任务专用 checkpoint，**同一份 ComfyUI 部署一次只能挂�
 
 | # | 缺的东西 | 状态 |
 | --- | --- | --- |
-| 1 | `minimax_h3_ref2va_pruned_int8_convrot.safetensors`（约 20GB） | deploy 脚本**已加下载**（`WANT_REF2VA=1`，默认开） |
-| 2 | ComfyUI 版本含 `MiniMaxH3ReferenceToVideo` 节点 | **待升级**（该节点 2026-08-03 随 PR #15224 合并） |
-| 3 | `comfyui/h3_r2v_api.json`（API 格式工作流） | **待导出**，见下方步骤 3 |
+| 1 | Ref2VA 的**三个**模型文件（见下表，合计约 36GB） | ⬜ **还差 text_encoder 与 LoRA**。deploy 脚本 2026-09-29 已补齐清单（`WANT_REF2VA=1`，默认开） |
+| 2 | ComfyUI 版本含 `MiniMaxH3ReferenceToVideo` 节点 | ✅ 已就绪（2026-09-29 查 `/object_info`：节点在，`h3_r2v_api.json` 用到的节点一个不缺） |
+| 3 | `comfyui/h3_r2v_api.json`（API 格式工作流） | ✅ 已就绪 |
+
+### Ref2VA 到底要哪三个文件
+
+⚠️ **别只下 unet** —— 这是最容易漏的一处：Ref2VA 用的 text_encoder **与 I2V 那份不是同一个文件**
+（`nvfp4_awq` vs `int8_convrot`），LoRA 也是专用的（fl2v 那两个用不了）。
+只下 unet 的话，出片会直接失败并报
+「ComfyUI 上找不到这些模型文件：unet_name = …；clip_name = …；lora_name = …」
+（那句话由 `video_provider._preflight_models` 在提交前点名，就是为了一句话讲清楚缺哪个）。
+
+| 放到实例的哪个目录 | 文件名 | 大小 |
+| --- | --- | --- |
+| `ComfyUI/models/diffusion_models/` | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.5 GB |
+| `ComfyUI/models/text_encoders/` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | 14.6 GB |
+| `ComfyUI/models/loras/` | `minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors` | 1.8 GB |
+
+VAE 两个文件与 I2V 共用，**不用重下**。仓库：`Comfy-Org/MiniMax-H3`（魔搭与 HuggingFace 同名）。
+
+### ⚠️ 100GB 的盘装不下两套：换模式就得先删另一套
+
+ModelScope 实例的持久化盘是 **100GB**（JupyterLab 右下角/悬停能看到占用），而两套权重
+加起来约 **108GB**（fl2va 约 72 + ref2va 约 36）—— **同时留着是不可能的**。
+2026-09-29 实测：只装了 fl2va 那套时已经占 79.4GB，再下 36GB 直接爆盘。
+
+所以切到 Ref2VA 时先腾地方（下面是把 fl2va 那套删掉，约腾 66GB）：
+
+```bash
+cd /mnt/workspace/ComfyUI/models
+rm -f diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors              # 37.5G
+rm -f text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors          # 25.3G
+rm -f loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors        # 1.8G
+rm -f loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors   # 1.8G
+df -h /mnt/workspace        # 确认真的腾出来了（rm -f 不报错≠文件在那儿）
+```
+
+⚠️ **`vae/` 那两个文件千万别删** —— `minimax_h3_video_vae_fp16`（4.9G）与
+`minimax_h3_audio_vae_fp32`（0.6G）是**两条路共用**的，删了 Ref2VA 一样出不了片。
+
+删错了想回去：`WANT_REF2VA=0 bash deploy_comfyui_ms.sh`（脚本幂等，只补缺的），
+再把服务配置里的「视频工作流」切回 i2v 即可。备注：**别把模型放 `/tmp`** ——
+`/mnt/workspace` 是持久的，`/tmp` 实例一重启就没了（实例单次约 8 小时 + 1 小时无操作关机），
+等于每次开机重下 36GB。
 
 ## 操作步骤
 
@@ -59,17 +102,25 @@ bash deploy_comfyui_ms.sh          # ModelScope 实例
 bash deploy_comfyui.sh             # 自建 / 租卡环境
 ```
 
-只想下参考图权重、不重跑其他步骤时，直接拉单文件：
+只想下参考图权重、不重跑其他步骤时，直接拉这三个文件（**一个都不能少**）：
 
 ```bash
 cd /mnt/workspace/ComfyUI
-modelscope download --model Comfy-Org/MiniMax-H3 \
+for f in \
   diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors \
-  --local_dir models
+  text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors ; do
+  [ -f "models/$f" ] && { echo "已有 $f，跳过"; continue; }
+  modelscope download --model Comfy-Org/MiniMax-H3 "$f" --local_dir models
+done
 ```
 
-⚠️ **盘空间先确认**：这个文件约 20GB。DSW 常驻盘通常很小，
-放不下就 `--local_dir` 指到临时盘，再把 `models/diffusion_models/` 软链回去。
+下完在 ComfyUI 页面上**刷新一下**（让它重新扫模型目录；重开一次页面也行），
+再回「镜序」点生成即可 —— 提交前 `_preflight_models` 会替你点名核对。
+想先确认下齐没齐，在项目根跑：`python dev/tools/check_comfyui_models.py`。
+
+⚠️ **盘空间先确认**：三个合计约 36GB（19.5 + 14.6 + 1.8）。DSW 常驻盘通常很小，
+放不下就 `--local_dir` 指到临时盘，再把 `models/diffusion_models/` 等软链回去。
 
 ### 步骤 2 · 升级 ComfyUI
 
@@ -147,7 +198,7 @@ print([k for k in d if 'MiniMaxH3' in k])
 | --- | --- | --- |
 | 参考图输入字段名 | `ref_images` | ✅ `ref_images`（`h3_r2v_ui.json` 里带真实连线编号） |
 | 多图传参形式（数组 or 多个输入） | 待定 | ✅ **多个独立输入**：`ref_images.ref_image_0` … `_8`（Autogrow） |
-| 尺寸模式字段名 / 取值 | `ref_image_size` = `match` \| `max` | ✅ 同推测（`match` 缩到生成画布面积，`max` 短边 2048、最准但慢数倍） |
+| 尺寸模式字段名 / 取值 | `ref_image_size` = `match` \| `max` | ✅ 同推测（`match` 缩到生成画布面积，`max` 短边 2048、最准但慢数倍）。⚠️ **它是必填** —— 2026-09-29 出片报 400 就是因为它不在工作流里（见下） |
 | 参考图上限 | 9 张 | ✅ **9 张**。官方源码 `comfy_extras/nodes_minimax_h3.py`：`Autogrow.TemplatePrefix(prefix="ref_image_", min=0, max=9)`。⚠️ 2026-09-27 前代码里误按 3 张截断（照 UI 导出文件里只连了 3 条反推的） |
 | 参考视频 / 参考音频字段 | `ref_videos` / `ref_audios` | ✅ `ref_videos`（3 个）/ `ref_video_audios`（3 个）/ `ref_audios`（3 个），同样 0 起编号 |
 | 切回 I2VA 是否要改 UNETLoader | 只需换工作流 | ✅ 只需换工作流（两份 JSON 各自写死了自己的 unet/clip/lora） |
@@ -155,6 +206,25 @@ print([k for k in d if 'MiniMaxH3' in k])
 > ⚠️ **判断"某个节点有几个口"的正确姿势**：查 `comfy_extras/*.py` 里的 schema，
 > 或实例上的 `GET /object_info/<节点名>`。**别拿 UI 导出文件里连了几条当上限** ——
 > 那只是作者当时连了几条。3 张 vs 9 张这个错就是这么来的。
+
+### ⚠️ 节点 schema 会变 —— 出片前先跑一遍自检
+
+**2026-09-29 踩到的坑**：官方给 `MiniMaxH3ReferenceToVideo` 加了一个**必填**输入
+`ref_image_size`，而工作流是更早导出的、没有这个字段 → 出片直接 400
+`Required input is missing: ref_image_size`；偏偏那时的 `_submit` 把响应体丢了，
+界面上只显示一句 `400 Client Error: Bad Request`，查了半天才定位。
+
+现在两头都堵上了：
+
+- `_submit` 会把 ComfyUI 的 `node_errors` 翻成人话报出来（哪个节点、缺哪个输入）；
+- **出片前跑一条命令就能提前发现**（对着实例的 `/object_info` 逐项比，只读、不提交）：
+
+```bash
+python dev/tools/check_comfyui_models.py
+```
+
+它会一次告诉你三件事：节点缺不缺、模型文件缺不缺、**输入 schema 对不对得上**。
+换 ComfyUI 版本、改过工作流之后，建议都先跑一遍再出片。
 
 ## 与现有链路的关系
 

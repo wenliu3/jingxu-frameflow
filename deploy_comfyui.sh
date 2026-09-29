@@ -56,7 +56,7 @@ for IDX in https://mirrors.cloud.tencent.com/pypi/simple https://mirrors.aliyun.
 done
 [ -n "$ok" ] || { echo "❌ 依赖安装失败，看 /tmp/pip_avm.log 定位"; exit 1; }
 
-step "3/6 下载 MiniMax H3 模型（约 98GB，断点续传，已存在的自动跳过）"
+step "3/6 下载 MiniMax H3 模型（fl2va 约 72GB + Ref2VA 约 36GB，断点续传，已存在的自动跳过）"
 M=models
 FILES=(
   # fl2va：文生视频 / 首帧 / 首尾帧（T2VA / I2VA / FL2VA / L2VA）
@@ -70,10 +70,21 @@ FILES=(
 # ref2va：全能参考模式（Ref2VA）——用角色参考图锁定身份，构图交给提示词，
 # 这才是「人物图 + 提示词、不出分镜图」那条路线需要的权重。
 # 它与 fl2va 是**两个独立 checkpoint，同一时刻只能挂一个**，所以要手动切换。
-# 不需要就 WANT_REF2VA=0 bash deploy_comfyui.sh 跳过，省约 20GB。
+#
+# ⚠️ **三个文件缺一不可（2026-09-29 修）**：从前这里只加了 unet 那一个，于是"照脚本
+#    部署完"仍然出不了片 —— `comfyui/h3_r2v_api.json` 还要求：
+#      ① 换一个 text_encoder：nvfp4_awq 那份，**与 fl2va 用的 int8_convrot 不是同一个文件**；
+#      ② 换一个 ref2v 专用 LoRA（fl2v 那两个用不了）。
+#    实测现象：出片直接失败，报「ComfyUI 上找不到这些模型文件：unet_name = …；clip_name = …；
+#    lora_name = …」—— 那句话由 `video_provider._preflight_models` 在提交前点名。
+# 不需要就 WANT_REF2VA=0 bash deploy_comfyui.sh 跳过，省约 36GB。
 # 注：ref2va 只有 pruned INT8 量化版（比标准 INT8 小约 40%），没有 bf16 版。
 if [ "${WANT_REF2VA:-1}" = "1" ]; then
-  FILES+=("diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors")
+  FILES+=(
+    "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+    "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+    "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+  )
 fi
 for f in "${FILES[@]}"; do
   if [ -f "$M/$f" ]; then

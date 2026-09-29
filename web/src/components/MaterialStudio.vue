@@ -82,13 +82,19 @@ const items = computed(() => {
     // 上传素材不参与"AI 生成"，所以它的空态文案是"待上传"而不是"待生成"。
     const bucket = ['prop', 'scene', 'image', 'audio'].includes(a.kind) ? a.kind : 'prop'
     const target = bucket === 'image' ? 'otherImage' : bucket === 'audio' ? 'otherAudio' : bucket
-    const ready = !!a.images?.length
+    // ⚠️ 道具的 ready **不能只看 images**（2026-09-29 修）：道具走「AI 生成」产出的是
+    //    **三视图设定图**，只落 `sheet`、`images` 恒为空 —— 只看 images 会让已经生成好的
+    //    道具显示"素材图待上传"、并混进「一键生成全部」的缺件名单重新烧一遍额度。
+    //    与 CreateWorkbench.vue / 后端 `Asset.primary_image` 保持同一口径。
+    const ready = bucket === 'prop' ? !!(a.sheet || a.images?.length) : !!a.images?.length
+    // 道具的「三视图设定图」（sheet）优先显示 —— 它信息量最大；没有才退回单张。
+    const sheetUrl = a.sheet ? api.assetImageUrl(props.taskId, a.sheet) : ''
     out[target].push({
       key: `${bucket}:${i}`, kind: bucket, index: i, name: a.name,
       desc: a.kind === 'audio'
         ? (ready ? '音频已就绪' : '音频待上传')
         : (ready ? '素材图已就绪' : '素材图待上传'),
-      url: ready ? api.assetImageUrl(props.taskId, a.images[0]) : '',
+      url: bucket === 'audio' ? '' : (sheetUrl || (ready ? api.assetImageUrl(props.taskId, a.images[0]) : '')),
       ready,
       ref: a,
     })

@@ -24,6 +24,7 @@
 import base64
 import json
 import os
+import shutil
 import sys
 import time
 import urllib.error
@@ -118,7 +119,9 @@ try:
 
     # ---------- 1) 进程内跑一次出片（假 provider，零外部调用） ----------
     sys.path.insert(0, os.path.join(ROOT, "server"))
+    sys.path.insert(0, ROOT)            # schemas.py 在项目根，不在 server/
     import app as server_app                                    # noqa: E402
+    from schemas import Project                                 # noqa: E402
 
     # 前置：LoRA 与工作流配套吗？不配套的话 start_segment_video 会直接 409，
     # 表现出来是"脚本挂了"而不是"配置错了" —— 这里先说清楚，省得查半天。
@@ -255,6 +258,124 @@ try:
     check("没带上的素材不会混进 materials",
           [m.get("name") for m in rec4.get("materials") or []] == ["林晚"],
           str([m.get("name") for m in rec4.get("materials") or []]))
+
+    # ---------- 1e) 道具只有「三视图设定图」时也吃得到（2026-09-29 修的坑） ----------
+    # 现象：道具走「AI 生成」产出的是**三视图设定图**，只落 `sheet`、`images` 恒为空。
+    # 而后端从前对非角色素材只读 `a.images[0]` → 恒空 → 判成"没带上"，
+    # 前端卡片也一直显示"还没有素材图"。斌哥实测：六个道具做了全用不上，
+    # 出片 toast 报"这些素材这次没带上（还没有图）：旧铁剑"。
+    # 修法：道具与角色同规则 —— Ref2VA（prefer_sheet=True）下优先吃 sheet。
+    # ⚠️ 这里**只写 sheet 文件、不写单件图**，才能复现原缺陷。
+    sheet_prop = os.path.join(ROOT, "dev", "e2e", "_e2e_prop_sheet.png")
+    if os.path.isfile(FACE):
+        os.makedirs(os.path.dirname(sheet_prop), exist_ok=True)
+        shutil.copyfile(FACE, sheet_prop)
+    with open(sheet_prop, "rb") as fh:
+        sheet_b64 = base64.b64encode(fh.read()).decode()
+    http("POST", f"/api/tasks/{task_id}/assets", {"kind": "prop", "name": "三视剑", "design": False})
+    server_app.TASKS[task_id] = server_app._load_task_from_disk(task_id)
+    tmp_proj = server_app.TASKS[task_id]["project"]["assets"]
+    prop_idx = next(i for i, a in enumerate(tmp_proj) if a.get("name") == "三视剑")
+    # 把设定图直接摆到约定位置 `assets/prop_三视剑_sheet.png`，再让后端重认一次盘
+    adir = os.path.join(ROOT, "outputs", task_id, "assets")
+    os.makedirs(adir, exist_ok=True)
+    shutil.copyfile(sheet_prop, os.path.join(adir, "prop_三视剑_sheet.png"))
+    server_app.TASKS[task_id] = server_app._load_task_from_disk(task_id)
+    proj3 = server_app.TASKS[task_id]["project"]
+    a3 = proj3["assets"][prop_idx]
+    check("道具的设定图被认到 sheet 上（约定文件名 prop_<名>_sheet.png）",
+          os.path.basename(str(a3.get("sheet") or "")) == "prop_三视剑_sheet.png",
+          f"sheet={a3.get('sheet')!r} images={a3.get('images')!r}")
+    check("道具的 images 仍然是空的（设定图不进 images，拼图会被读成三件道具）",
+          not a3.get("images"), str(a3.get("images")))
+
+    wf_mode = str(server_app._load_service_config().get("video_workflow") or "i2v")
+    # ⚠️ TASKS 里存的是**原始 dict**（`task["project"]`），`_resolve_material_ref` 要的是
+    #    `Project` 对象（读 .assets / .characters 属性）。必须先 Project.from_dict 转一次，
+    #    否则报 `'dict' object has no attribute 'assets'`。
+    _proj_obj = Project.from_dict(server_app.TASKS[task_id]["project"])
+    _m = server_app._resolve_material_ref(
+        _proj_obj, f"prop:{prop_idx}",
+        prefer_sheet=(wf_mode == "ref2va"),
+    )
+    if wf_mode == "ref2va":
+        check("Ref2VA 下：只有设定图的道具也解析得出来（不再被判成没带上）",
+              _m is not None and os.path.basename(_m["path"]) == "prop_三视剑_sheet.png",
+              "None（← 原缺陷：只读 images[0]）" if _m is None else _m["path"])
+        started5 = server_app.start_segment_video(task_id, server_app.SegmentVideoBody(
+            frames=["character:0", f"prop:{prop_idx}"],
+            prompt="The person holds the sword.",
+            duration=7,
+        ))
+        for _ in range(60):
+            if server_app.SEGMENT_JOBS[started5["job_id"]]["status"] != "running":
+                break
+            time.sleep(0.2)
+        check("出片时道具进了参考图列表（ref_image_paths 含那张设定图）",
+              any("prop_三视剑" in os.path.basename(str(p))
+                  for p in (FakeProvider.seen.get("ref_image_paths") or [])),
+              str([os.path.basename(str(p)) for p in FakeProvider.seen.get("ref_image_paths") or []]))
+        check("这一次道具没被报成没带上", started5.get("missing") == [], str(started5.get("missing")))
+    else:
+        check(f"当前是 I2V 工作流（{wf_mode}）：只有设定图的道具本就不该当首帧，跳过该组断言", True)
+
+    # ---------- 1f) 提示词那一侧也要吃得到道具的三视图（2026-09-29 修，斌哥报的那个） ----------
+    # 现象（他的截图）：出片面板底下挂黄字「道具「旧铁剑」还没有素材图 → 无法作为参考图」，
+    # 而卡片上那张三视图明明早就生成好了；提示词里也一个道具都引用不到。
+    # 根因：**"用素材的哪张图"有两份独立实现** —— 上面那个 `_resolve_material_ref`（出片时
+    # 上传哪张）改了，`ref_plan.build_ref_plan`（写提示词时 `<Picture N>` 是哪张）没改，
+    # 而道具的图只在 `sheet` 上、`images` 恒为空。
+    # 这道题的正解是"这条规则只有一处"（`schemas.Asset.primary_image`），下面两条断言就是钉子：
+    # 把两份实现钉在同一个答案上，谁再分叉谁挂。
+    import ref_plan as ref_plan_mod
+
+    proj_now = Project.from_dict(server_app.TASKS[task_id]["project"])
+    plan = ref_plan_mod.build_ref_plan(
+        proj_now, characters=["林晚"], props=["三视剑"], scene="雨夜街道",
+    )
+    prop_slot = next((s for s in plan.slots if s.label == "三视剑"), None)
+    check("ref_plan：只有三视图设定图的道具也进得了参考槽位（不再报「还没有素材图」）",
+          prop_slot is not None and os.path.basename(prop_slot.path) == "prop_三视剑_sheet.png",
+          f"slots={[os.path.basename(s.path) for s in plan.slots]} warnings={plan.warnings}")
+    check("ref_plan 与出片解析给道具选的是**同一个文件**（两处口径不许分叉）",
+          prop_slot is not None and _m is not None and prop_slot.path == _m["path"],
+          f"plan={getattr(prop_slot, 'path', '')!r} "
+          f"resolve={(_m or {}).get('path')!r}")
+
+    # 编号顺序：角色 → 道具 → 场景（= `ref_plan.REF_KIND_ORDER`），`<Picture N>` 连续
+    order_labels = [s.label for s in plan.images]
+    check("ref_plan：编号顺序是「角色 → 道具 → 场景」",
+          order_labels == ["林晚", "三视剑", "雨夜街道"], str(order_labels))
+    check("ref_plan：<Picture N> 从 1 连续编到底",
+          [s.tag for s in plan.images] == [f"<Picture {i + 1}>" for i in range(len(plan.images))],
+          str([s.tag for s in plan.images]))
+
+    if wf_mode == "ref2va":
+        # ⚠️ 这道题的关键：前端发来的 frames 是**它自己列表的顺序**（角色 → 场景 → 道具），
+        #    而提示词按「角色 → 道具 → 场景」编号。出片时必须按**提示词的顺序**重排 ——
+        #    否则 ref_image_1 是场景图，提示词却说 `<Picture 2>` 是那把剑：
+        #    模型照着一张山村背景去"锁住这把剑的形状材质"，画面里当然不会有剑。
+        #    所以这里**故意**按前端那个顺序发，验的是后端有没有把它摆正。
+        started6 = server_app.start_segment_video(task_id, server_app.SegmentVideoBody(
+            frames=["character:0", "scene:0", f"prop:{prop_idx}"],   # ← 前端顺序，与编号顺序不同
+            prompt="The person holds the sword in the rainy street.",
+            duration=7,
+        ))
+        for _ in range(60):
+            if server_app.SEGMENT_JOBS[started6["job_id"]]["status"] != "running":
+                break
+            time.sleep(0.2)
+        sent = [os.path.basename(str(p)) for p in (FakeProvider.seen.get("ref_image_paths") or [])]
+        check("出片时参考图按提示词的编号顺序上传（角色 → 道具 → 场景）",
+              sent == ["林晚_sheet.png", "prop_三视剑_sheet.png", "scene_雨夜街道.png"], str(sent))
+        # ⚠️ 这条是本题真正的钉子：**上传的第 N 张必须就是提示词 <Picture N> 说的那个文件**。
+        #    两个方向都要对得上 —— 顺序（上面那条）与"取哪张图"（ref_plan 与
+        #    _resolve_material_ref 各算一次）。哪边再分叉，这条就挂。
+        check("参考图逐张对得上 <Picture N>（顺序 + 取哪张图，两处口径完全一致）",
+              len(sent) == len(plan.images)
+              and sent == [os.path.basename(s.path) for s in plan.images],
+              f"上传={sent} 提示词={[os.path.basename(s.path) for s in plan.images]}")
+
 
     # ---------- 2) 边车文件真的落到了磁盘 ----------
     mp4 = os.path.join(seg_dir, f"seg_{job_id}.mp4")
