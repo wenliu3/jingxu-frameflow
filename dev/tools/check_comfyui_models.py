@@ -62,6 +62,14 @@ _REPO = "Comfy-Org/MiniMax-H3"
 # 实例上的 ComfyUI 目录（deploy_comfyui_ms.sh / deploy_comfyui.sh 都装在这里）
 _INSTANCE_DIR = "/mnt/workspace/ComfyUI"
 
+# ⚠️ **必须绕开本机代理**（2026-10-01 加）。Windows 上 `requests` 会从**注册表**读系统代理
+#    （`getproxies()` → 常见是 Clash 那类 127.0.0.1:7897），于是去 ComfyUI 隧道的请求
+#    也绕道代理转一圈。代理够不着目标时回的是 **HTTP 502 空响应**，看起来像"隧道挂了/服务 502"，
+#    真实原因（比如"端口没人监听"）被盖掉了 —— 实测就被这个误导过一次。
+#    这里发的都是**去你自己隧道**的请求，没有任何理由过代理。
+_S = requests.Session()
+_S.trust_env = False            # 不读环境变量 / 注册表里的代理，也不读 .netrc
+
 
 def _wanted(workflow: dict) -> list[tuple[str, str, str, str]]:
     """这份工作流要用到的模型文件 → [(节点类型, 字段名, 目录, 文件名)]，去重后排序。"""
@@ -82,7 +90,7 @@ def _wanted(workflow: dict) -> list[tuple[str, str, str, str]]:
 def _available(base: str, cls: str, field: str) -> list[str] | None:
     """实例上这个节点当前能选的文件名。查不动返回 None（网络/版本问题，不假装知道）。"""
     try:
-        resp = requests.get(f"{base}/object_info/{cls}", timeout=30)
+        resp = _S.get(f"{base}/object_info/{cls}", timeout=30)
         resp.raise_for_status()
         req = ((resp.json().get(cls) or {}).get("input") or {}).get("required") or {}
         opts = req.get(field) or []
@@ -152,7 +160,7 @@ def check(base: str, label: str, path: str) -> int:
 
     # ---- 节点齐不齐（缺节点的话，下多少模型都没用） ----
     try:
-        all_nodes = requests.get(f"{base}/object_info", timeout=180).json()
+        all_nodes = _S.get(f"{base}/object_info", timeout=180).json()
     except Exception as exc:  # noqa: BLE001
         print(f"  ❌ 连不上实例（{base}）：{type(exc).__name__}: {exc}")
         return 1
@@ -204,14 +212,28 @@ def check(base: str, label: str, path: str) -> int:
 
 def main(argv: list[str]) -> int:
     cfg = server_app._load_service_config()
-    base = str(cfg.get("comfyui_url") or "").strip().rstrip("/")
+    args = [a for a in argv[1:] if a.strip()]
+
+    # --url 可以查**别人的实例**（兄弟那台挂在同一个跳板机的另一个端口上）：
+    #     python dev/tools/check_comfyui_models.py --url http://1.2.3.4:18189
+    base = ""
+    if "--url" in args:
+        i = args.index("--url")
+        base = args[i + 1].strip().rstrip("/") if i + 1 < len(args) else ""
+        del args[i:i + 2]
+        if not base:
+            print("❌ --url 后面要跟地址，例如 --url http://1.2.3.4:18189")
+            return 1
+        print(f"（用命令行给的地址，不看服务配置）")
+    else:
+        base = str(cfg.get("comfyui_url") or "").strip().rstrip("/")
     if not base:
         print("❌ 服务配置里 ComfyUI 地址是空的（去「服务配置」填，或看 docs/comfyui-tunnel-guide.md）")
         return 1
 
     print(f"ComfyUI 实例：{base}")
     try:
-        stats = requests.get(f"{base}/system_stats", timeout=20).json()
+        stats = _S.get(f"{base}/system_stats", timeout=20).json()
         dev = (stats.get("devices") or [{}])[0]
         print(f"在线 ✅  {dev.get('name')} | VRAM {(dev.get('vram_total') or 0) / 2 ** 30:.1f} GB")
     except Exception as exc:  # noqa: BLE001
@@ -219,7 +241,7 @@ def main(argv: list[str]) -> int:
         print("   隧道地址 60 分钟一换，先看 docs/comfyui-tunnel-guide.md 换一个再试。")
         return 1
 
-    arg = (argv[1] if len(argv) > 1 else "").strip()
+    arg = (args[0] if args else "").strip()
     if arg == "--all":
         picks = list(WORKFLOWS.items())
     else:

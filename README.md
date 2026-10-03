@@ -275,9 +275,9 @@ ai_video_multiagent/
 ├─ ref_plan.py              # H3 提示词编排与审计（分段时长、[Shot N] 标记）
 ├─ deploy_comfyui.sh        # 租卡环境一键部署（AutoDL / 有公网 IP 的服务器）
 ├─ deploy_comfyui_ms.sh     # ModelScope DSW 一键部署 + pinggy 隧道
-├─ tunnel_aliyun.sh         # 用自己的阿里云服务器做跳板（替代 pinggy，地址固定不过期）
+├─ tunnel_aliyun.sh         # 实例重启后一键恢复：ComfyUI + 阿里云跳板隧道（替代 pinggy，地址固定）
 ├─ comfyui/                 # ComfyUI 工作流模板（h3_i2v_api.json 等，API 格式）
-├─ docs/                    # 文档：H3 提示词规则、隧道指南、REF2VA 接入指引
+├─ docs/                    # 文档：新实例安装教程、隧道指南、Ref2VA 接入指引、H3 提示词规则
 ├─ dev/                     # 开发期验证脚本（接口 / 界面 / E2E，非产品代码，见 dev/README.md）
 ├─ web/                     # Vue 3 + Vite 前端
 └─ outputs/                 # 作品产物（本地数据，不入库）

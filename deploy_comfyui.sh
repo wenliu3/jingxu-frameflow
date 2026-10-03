@@ -56,20 +56,44 @@ for IDX in https://mirrors.cloud.tencent.com/pypi/simple https://mirrors.aliyun.
 done
 [ -n "$ok" ] || { echo "❌ 依赖安装失败，看 /tmp/pip_avm.log 定位"; exit 1; }
 
-step "3/6 下载 MiniMax H3 模型（fl2va 约 72GB + Ref2VA 约 36GB，断点续传，已存在的自动跳过）"
+step "3/6 下载 MiniMax H3 模型（fl2va 约 66GB / Ref2VA 约 36GB，断点续传，已存在的自动跳过）"
 M=models
+
+# 每个文件的**大致体积（GB，向上取整）** —— 只用来算"盘够不够"，不参与下载。
+# 数字来自魔搭 Comfy-Org/MiniMax-H3 的文件列表（2026-09-29 核对）。
+size_gb() {
+  case "$1" in
+    diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors)  echo 38 ;;
+    text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors) echo 26 ;;
+    diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) echo 20 ;;
+    text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors) echo 15 ;;
+    vae/minimax_h3_video_vae_fp16.safetensors)  echo 5 ;;
+    vae/minimax_h3_audio_vae_fp32.safetensors)  echo 1 ;;
+    loras/*) echo 2 ;;
+    *) echo 0 ;;
+  esac
+}
+
 FILES=(
-  # fl2va：文生视频 / 首帧 / 首尾帧（T2VA / I2VA / FL2VA / L2VA）
-  "diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors"
-  "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+  # ⚠️ 两个 VAE 是**两条路共用**的（I2V 和 Ref2VA 都要），无论选哪一套都不能省。
   "vae/minimax_h3_video_vae_fp16.safetensors"
   "vae/minimax_h3_audio_vae_fp32.safetensors"
-  "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
-  "loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
 )
+
+# fl2va：文生视频 / 首帧 / 首尾帧（T2VA / I2VA / FL2VA / L2VA），约 66GB（不含共用 VAE）。
+# 它与 ref2va 是**两个独立 checkpoint，同一时刻只能挂一个**，所以要手动切换。
+# 不需要就 WANT_FL2VA=0 bash deploy_comfyui.sh 跳过。
+if [ "${WANT_FL2VA:-1}" = "1" ]; then
+  FILES+=(
+    "diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors"
+    "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+    "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
+    "loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
+  )
+fi
+
 # ref2va：全能参考模式（Ref2VA）——用角色参考图锁定身份，构图交给提示词，
-# 这才是「人物图 + 提示词、不出分镜图」那条路线需要的权重。
-# 它与 fl2va 是**两个独立 checkpoint，同一时刻只能挂一个**，所以要手动切换。
+# 这才是「人物图 + 提示词、不出分镜图」那条路线需要的权重。约 36GB。
 #
 # ⚠️ **三个文件缺一不可（2026-09-29 修）**：从前这里只加了 unet 那一个，于是"照脚本
 #    部署完"仍然出不了片 —— `comfyui/h3_r2v_api.json` 还要求：
@@ -77,7 +101,6 @@ FILES=(
 #      ② 换一个 ref2v 专用 LoRA（fl2v 那两个用不了）。
 #    实测现象：出片直接失败，报「ComfyUI 上找不到这些模型文件：unet_name = …；clip_name = …；
 #    lora_name = …」—— 那句话由 `video_provider._preflight_models` 在提交前点名。
-# 不需要就 WANT_REF2VA=0 bash deploy_comfyui.sh 跳过，省约 36GB。
 # 注：ref2va 只有 pruned INT8 量化版（比标准 INT8 小约 40%），没有 bf16 版。
 if [ "${WANT_REF2VA:-1}" = "1" ]; then
   FILES+=(
@@ -86,6 +109,26 @@ if [ "${WANT_REF2VA:-1}" = "1" ]; then
     "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
   )
 fi
+
+# ⚠️ **盘够不够先算一遍**（2026-10-01 加）：两套权重加起来约 108GB，
+#    小盘机器上默认全下会写到一半炸掉。先算"还缺几个 GB"，不够就早退。
+need=0
+for f in "${FILES[@]}"; do
+  [ -f "$M/$f" ] && continue
+  need=$(( need + $(size_gb "$f") ))
+done
+avail=$(df -P -BG "$DIR" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+echo "[disk] 本次需要新下载约 ${need}GB；$DIR 可用 ${avail:-?}GB"
+if [ "${avail:-0}" -gt 0 ] && [ "$need" -gt "$avail" ]; then
+  echo
+  echo "❌ 盘不够：还要 ${need}GB，只剩 ${avail}GB。两套权重加起来约 108GB。"
+  echo "   挑一套下（推荐 Ref2VA —— 镜序的提示词体系就是围绕它做的）："
+  echo "     WANT_FL2VA=0 bash deploy_comfyui.sh     # 只下 Ref2VA，约 41GB"
+  echo "     WANT_REF2VA=0 bash deploy_comfyui.sh    # 只下 I2V(fl2va)，约 72GB"
+  echo "   或者把模型下到大盘（数据盘）：bash deploy_comfyui.sh /data/comfyui"
+  exit 1
+fi
+
 for f in "${FILES[@]}"; do
   if [ -f "$M/$f" ]; then
     echo "已有 $f，跳过"
