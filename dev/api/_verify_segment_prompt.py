@@ -124,12 +124,10 @@ check("负面约束在正文**末尾**（不是插在镜头中间）",
     plan.prompt.index(ref_plan.DETAILED_CONSTRAINTS) > plan.prompt.index("At 00:05.000"))
 check("约束里点名了字幕/水印/UI", "subtitles" in ref_plan.DETAILED_CONSTRAINTS
       and "watermark" in ref_plan.DETAILED_CONSTRAINTS)
-check("约束里点名了物理与轴线", "physics" in ref_plan.DETAILED_CONSTRAINTS
-      and "axis" in ref_plan.DETAILED_CONSTRAINTS)
-# 2026-09-19 按一份公认写得好范本补的：只许参考里的人物出镜（背景凭空多人是高频翻车点），
-# 顺带把"照片/海报里的脸不许变成活人"也写死。
-check("约束里点名了「不许新增人物」", "additional people" in ref_plan.DETAILED_CONSTRAINTS
-      and "printed faces" in ref_plan.DETAILED_CONSTRAINTS)
+check("约束保持连贯运动，并允许明确的幻想效果", "coherent motion" in ref_plan.DETAILED_CONSTRAINTS
+      and "fantastical effect" in ref_plan.DETAILED_CONSTRAINTS)
+check("只禁止未请求的人物，允许明确换衣与环境变化", "unrequested people" in ref_plan.DETAILED_CONSTRAINTS
+      and "requested changes" in ref_plan.DETAILED_CONSTRAINTS)
 check("音轨段用的是传进来的 soundscape，不是兜底句",
     "Steady rain on glass" in plan.prompt, plan.prompt.split("overall_soundscape:")[1][:70])
 check("手写模式（soundscape 为空）会填兜底句",
@@ -139,7 +137,7 @@ check("拼装是幂等的（重复调用不会叠加两份约束）",
     ref_plan.compose_ref2va_prompt(
         project, video_prompt=body + "\n\n" + ref_plan.DETAILED_CONSTRAINTS,
         duration=10.0, characters=["林晚"], use_voice=False,
-    ).prompt.count("Constraints: no added text") == 1)
+    ).prompt.count(ref_plan.DETAILED_CONSTRAINTS) == 1)
 
 # ---------- 3b) 写正文的 agent：运行时规则源 + 两套格式分模式（2026-09-19） ----------
 # 规则精要（docs/h3-guides/h3-prompt-rules.md）是**运行时读**的：官方更新只改文件、不改代码。
@@ -252,14 +250,13 @@ if LIVE:
               bool(ss) and ss.split(".")[0][:20] in res.get("prompt", ""),
               res.get("prompt", "").split("overall_soundscape:")[-1][:90])
         check("六段式里带上了负面约束", ref_plan.DETAILED_CONSTRAINTS in res.get("prompt", ""))
-        check("篇幅落在 200-280 词这一档附近", 150 <= words <= 360, f"{words} 词")
+        check("Ref2VA 正文篇幅接近官方建议", 300 <= words <= 550, f"{words} 词")
         check("正文用 <Subject N> 引用了素材", "<Subject" in vp)
         check("时间轴照抄了代码给的那张表",
-              "At 00:03.333" in vp or "At 00:06.667" in vp,
+              "[Shot 2]" not in vp,
               "正文里的时间戳：" + str(sorted(set(
                   w for w in vp.replace(",", " ").split() if ":" in w and "." in w))[:6]))
-        check("正文以 [Shot 1] 开头（模型容易漏这个标记）",
-              vp.lstrip().startswith("[Shot 1]"), vp[:60])
+        check("正文包含首镜标记，风格可位于标记前", "[Shot 1]" in vp, vp[:60])
         check("写了表演细节（眉/眼/嘴角/呼吸/手 至少一个）",
               any(k in vp.lower() for k in ("eyebrow", "brow", "eye", "lip", "mouth",
                                             "breath", "hand", "shoulder", "jaw")), "")

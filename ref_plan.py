@@ -45,29 +45,24 @@ H3-Base（生成）+ H3-Regenerate-2K。**Context-IR 是官方托管服务，没
 「不要复用它的内容当台词」，这就是防样本内容泄漏的那道闸（旧的 `voice only` 语法，
 在六段式里的正确落点就是这里）。
 
-## 时长与镜头颗粒度（官方经验值，写错会明显掉质）
+## 时长与镜头意图
 
-- 最后一切要离结尾**至少 2 秒**（10 秒片，最后一刀不晚于 00:08.000）
-- 5 秒片 1-2 颗镜头｜10 秒 2-3 颗｜15 秒 3-4 颗
-- **切得越碎，人物越容易在镜头间跑掉** —— 参考模式尤其明显，因为每一刀模型都要
-  重新对一次参考图。所以宁可少切。
+默认保持一个连续镜头；只有用户明确要求切镜时才分配多镜头时间轴。
+短片切镜过密和结尾余量不足是质量提醒，不冒充模型硬限制。
+镜头编号、毫秒时间戳和素材编号由 h3_prompt_policy 统一校验。
 
-`audit_detailed_description()` 就是照这三条做体检的。
-而**时间轴本身由 `plan_shot_timeline()` 算好喂给文本 Agent**（2026-09-18 起），
-不让模型自己排 —— 它排出来的十有八九会把最后一镜贴到片尾。
+## 意图优先的收尾约束
 
-## 负面约束（2026-09-18 加）
-
-`DETAILED_CONSTRAINTS` 会追加在 `detailed_description` 末尾，由代码固定拼上：
-不出现字幕/水印/UI、动作遵守真实物理（禁止漂浮滑行穿模瞬移）、
-单镜内不切第三人外部视角、多镜之间人物左右位置与视线轴线不许翻转。
-来源是一份公认写得好的提示词范本 —— 这几条不写就会偶发。
+不添加未请求的人物、对白或画面覆盖层；保留原文对白和可见文字。
+参考外观是基线，用户明确要求的换衣、环境变化与幻想效果优先。
+角色不必在每个镜头全部出现，保留标记按实际参考关系设置。
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from h3_prompt_policy import audit_body, check_ref_prompt, retention_errors, split_ref_prompt
 
 # 官方上限（与 ComfyUI 的 MiniMaxH3ReferenceToVideo 输入口一一对应）
 MAX_IMAGES = 9
@@ -78,9 +73,7 @@ MAX_SECONDS = 15.0
 
 
 # --------------------------------------------------------------- 镜头时间轴
-# 一段时长切几颗镜头。官方经验值是 5 秒 1-2 颗｜10 秒 2-3 颗｜15 秒 3-4 颗，
-# 这里取每档的**上限**：一颗镜头里能交代的信息有限，太少会显得"什么都没发生"；
-# 但**不越过上限** —— 切得越碎，参考模式下人物越容易在镜头之间跑掉。
+# 旧调用的分档上限；当前编排用 shot_intent 决定数量并显式传入 count。
 def shot_count_for(duration: float) -> int:
     if duration <= 5:
         return 2
@@ -89,7 +82,7 @@ def shot_count_for(duration: float) -> int:
     return 4
 
 
-def plan_shot_timeline(duration: float) -> list[tuple[int, float, float]]:
+def plan_shot_timeline(duration: float, count: int | None = None) -> list[tuple[int, float, float]]:
     """把一段时长均分成镜头时间轴 → [(镜头号, 起始秒, 该镜时长秒), ...]
 
     ⚠️ **时间轴由代码算，不交给模型**。让模型自己排时间轴有两个老毛病：
@@ -101,7 +94,7 @@ def plan_shot_timeline(duration: float) -> list[tuple[int, float, float]]:
     只要 N ≤ 总长/2 就成立 —— 而上面每档的镜头数都满足这一条（15 秒 4 颗时
     最后一切在 11.25s，离结尾 3.75s）。
     """
-    n = shot_count_for(duration)
+    n = shot_count_for(duration) if count is None else count
     step = duration / n
     return [(i + 1, i * step, step) for i in range(n)]
 
@@ -113,31 +106,16 @@ def format_timestamp(sec: float) -> str:
 
 
 # ------------------------------------------------------- detailed_description 收尾
-# 负面约束，追加在 detailed_description 末尾。
-#
-# 来源：一份公认写得好的提示词范本，它的收尾段专治视频模型最常见的几类翻车 ——
-# 自己"脑补"出字幕/水印/UI、动作违反物理（漂浮、滑行、穿模、瞬移、无人机跳切）、
-# 以及多镜之间把人物左右位置/视线/轴线翻掉（正反打最容易翻）。
-# 这几条**不写就会偶发**，写上去能明显压住。
-#
-# 由**代码**追加而不是交给文本 Agent 写：它是固定套路，模型偶尔会漏，
-# 而漏了从提示词表面看不出来 —— 等出片才发现代价太大。
-# ⚠️ 2026-09-19 补了**人数**那条（"only the cast … no additional people"）：
-#    斌哥拿了一份公认写得好的范本来问"我们有负面提示词吗"，对照下来就缺这一条 ——
-#    而"背景里凭空多出一个人"正是视频模型最高频的翻车点之一，范本里专门写了
-#    "全段只有 XX 两位现场人物 / 禁止背景突然出现父母、路人"。
+# 默认收尾约束不覆盖用户明确要求的内容变化。
 DETAILED_CONSTRAINTS = (
-    "Constraints: no added text, subtitles, captions, watermarks, logos, icons or UI "
-    "overlays anywhere in frame. Only the referenced cast appears in frame: do not "
-    "introduce additional people, extras, crowds or background characters at any time, "
-    "and do not turn printed faces in photos or posters into living people. "
-    "All motion obeys real-world physics with believable "
-    "weight and inertia - no floating, sliding, morphing, clipping, teleporting or "
-    "impossible camera jumps. Each shot is a single continuous take; no cutaway to an "
-    "outside third-person view within a shot. Character left/right positions, gaze "
-    "direction, body orientation and screen direction stay consistent across cuts - "
-    "never flip the axis. The referenced appearance, wardrobe, props and environment "
-    "stay identical throughout."
+    "Constraints: follow the requested subjects, actions and camera movement; do not "
+    "add unrequested people, dialogue, subtitles, watermarks or UI overlays. Preserve "
+    "explicitly requested visible scene text. Each [Shot N] is a continuous take. "
+    "Maintain coherent motion and screen direction unless the target description "
+    "explicitly requests a change, a transition or a fantastical effect. Reference "
+    "appearance is the baseline; requested changes to clothing, props, environment "
+    "or lighting take precedence. Subjects appear only where the target description "
+    "places them; they need not all be visible in every shot."
 )
 
 
@@ -145,7 +123,7 @@ DETAILED_CONSTRAINTS = (
 class RefSlot:
     """一个参考槽位。kind + index 决定它在 ComfyUI 里连到哪个输入口。"""
 
-    kind: str                 # "image" | "audio"
+    kind: str                 # "image" | "video" | "audio"
     index: int               # 0-based，连到 ref_image_N / ref_audio_N
     tag: str                  # "<Picture 1>" / "<Audio 1>" / "<Video 1>"
     path: str
@@ -158,11 +136,11 @@ class RefSlot:
     @property
     def input_slot(self) -> str:
         """ComfyUI 节点上的输入口名（0-based，与官方工作流一致）。"""
-        return f"ref_{self.kind}s.ref_{'image' if self.kind == 'image' else 'audio'}_{self.index}"
+        return f"ref_{self.kind}s.ref_{self.kind}_{self.index}"
 
     @property
     def cn(self) -> str:
-        return "图片" if self.kind == "image" else "音频"
+        return {"image": "图片", "video": "视频", "audio": "音频"}[self.kind]
 
     @property
     def human(self) -> str:
@@ -201,13 +179,18 @@ class RefPlan:
         两类的编号各自从 1 数，混着列会让人以为是一个连续序列。"""
         lines = [
             f"  参考槽位共 {len(self.slots)} 个"
-            f"（图 {len(self.images)}/{MAX_IMAGES} · 音频 {len(self.audios)}/{MAX_AUDIO}，合计上限 {MAX_FILES}）"
+            f"（图 {len(self.images)}/{MAX_IMAGES} · 视频 {sum(s.kind == 'video' for s in self.slots)}/{MAX_VIDEOS} · 音频 {len(self.audios)}/{MAX_AUDIO}，合计上限 {MAX_FILES}）"
         ]
         if self.images:
             lines.append("  ── 图片 ──")
             for s in self.images:
                 lines.append(f"    {s.tag:<12} {s.human}")
                 lines.append(f"      └ {s.input_slot}  ←  {s.path}")
+        videos = [s for s in self.slots if s.kind == "video"]
+        if videos:
+            lines.append("  ── 视频 ──")
+            for slot in videos:
+                lines.append(f"    {slot.tag} {slot.human} → {slot.input_slot}")
         if self.audios:
             lines.append("  ── 音频 ──")
             for s in self.audios:
@@ -253,6 +236,7 @@ def build_ref_plan(
     scene: str = "",
     images=(),
     audios=(),
+    videos=(),
     use_voice: bool = True,
     extra_views: int = 0,
 ) -> RefPlan:
@@ -276,6 +260,12 @@ def build_ref_plan(
     会多占槽位，9 张上限下别开太大。
     """
     plan = RefPlan()
+    for index, video in enumerate(videos):
+        if video.get("clip_path"):
+            plan.slots.append(RefSlot("video", len([s for s in plan.slots if s.kind == "video"]),
+                f"<Video {len([s for s in plan.slots if s.kind == 'video']) + 1}>", video["clip_path"],
+                video["usage"], video["label"], "partially_preserved", note="the selected completed source video segment"))
+
     img_i = 0
     aud_i = 0
     subject_i = 0
@@ -468,6 +458,8 @@ def _subject_definitions(plan: RefPlan) -> str:
                 continue
             noun = {"character": "person", "prop": "object", "scene": "environment"}.get(s.role, "subject")
             parts.append(f"{s.subject} is the {noun} shown in {s.tag}: {s.note}.")
+        elif s.kind == "video":
+            parts.append(f"{s.tag} is {s.note}; use its visual motion and appearance as a baseline, without copying its audio or repeating its events.")
         elif s.role == "voice":
             ref = subjects.get(s.label) or f"the character {s.label}"
             parts.append(
@@ -478,7 +470,7 @@ def _subject_definitions(plan: RefPlan) -> str:
             parts.append(
                 f"{s.tag} is a standalone audio reference for the target video."
             )
-    return " ".join(parts)
+    return "\n".join(parts) or "N/A"
 
 
 # retention 那一段要锁哪些特征：按角色类型给固定短语。
@@ -492,14 +484,14 @@ _LOCK_TRAITS = {
     "image": "composition, colour palette and lighting",
 }
 _SHOT_HINT = {
-    "character": "appears in every shot",
+    "character": "in shots where this subject is visible",
     "prop": "present in the scene",
-    "scene": "the whole scene",
+    "scene": "where the referenced environment is used",
     "image": "visual reference",
 }
 
 
-def _retention_analysis(plan: RefPlan) -> str:
+def _retention_analysis(plan: RefPlan, overrides: dict | None = None) -> str:
     """第三段：每个素材保留到什么程度。**两套标记词不能混**。
 
     三种情况要分开写，混了就会写出不存在的 Subject：
@@ -512,17 +504,23 @@ def _retention_analysis(plan: RefPlan) -> str:
     subjects = _subject_map(plan)
     for s in plan.slots:
         if s.kind == "image":
+            marker = (overrides or {}).get(s.subject or s.tag, s.retention if s.subject else "weak_reference")
             traits = _LOCK_TRAITS.get(s.role, "key visual traits")
             if s.subject:
                 parts.append(
                     f"{s.subject} ({_SHOT_HINT.get(s.role, 'appears in the scene')}): "
-                    f"{s.retention} - {traits} stay identical to {s.tag} throughout."
+                    f"{marker} - use {traits} from {s.tag} as the reference baseline; "
+                    "apply changes explicitly specified in the target description. Appearance "
+                    "is preserved within this reference role, not a requirement to appear in every shot."
                 )
             else:
                 parts.append(
-                    f"{s.tag}: attribute_transfer - borrow its {traits}; "
+                    f"{s.tag}: {marker} - borrow its {traits}; "
                     "the target shot may differ in content."
                 )
+        elif s.kind == "video":
+            marker = (overrides or {}).get(s.tag, s.retention)
+            parts.append(f"{s.tag}: {marker} - preserve coherent appearance and motion direction where requested; follow the new target action rather than replay the source.")
         elif s.role == "voice":
             ref = subjects.get(s.label) or f"the character {s.label}"
             # 音频只能用 fully_copy / partially_copy / reference / weak_reference。
@@ -537,7 +535,7 @@ def _retention_analysis(plan: RefPlan) -> str:
                 f"{s.tag}: reference - borrow only its atmosphere and style; "
                 "do not reuse it as the final audio track."
             )
-    return " ".join(parts)
+    return "\n".join(parts) or "N/A"
 
 
 def compose_ref2va_prompt(
@@ -551,10 +549,12 @@ def compose_ref2va_prompt(
     scene: str = "",
     images=(),
     audios=(),
+    videos=(),
     duration: float = 0.0,
     task_tags: tuple[str, ...] = ("reference generation",),
     use_voice: bool = True,
     extra_views: int = 0,
+    retention: dict | None = None,
 ) -> RefPlan:
     """组装一份完整的 Ref2VA 六段式提示词。
 
@@ -571,45 +571,65 @@ def compose_ref2va_prompt(
     """
     plan = build_ref_plan(
         project, characters=characters, props=props, scene=scene,
-        images=images, audios=audios, use_voice=use_voice, extra_views=extra_views,
+        images=images, audios=audios, videos=videos, use_voice=use_voice, extra_views=extra_views,
     )
+
+    allowed = {s.tag for s in plan.slots} | {s.subject for s in plan.slots if s.subject}
+    errors = retention_errors({} if retention is None else retention, {s.subject or s.tag for s in plan.slots if s.kind in {"image", "video"}})
+    if errors:
+        raise ValueError("；".join(errors))
+    continuation = any(v.get("usage") == "continue" for v in videos)
+    guide_instruction = ("Opening frame is guided by the last valid frame of the selected completed source video. "
+                         "Start from that ending state, maintain coherent pose and screen direction, and perform only the new target action; do not replay the source. ") if continuation else ""
+    complete = split_ref_prompt(video_prompt)
+    if continuation and complete is not None and guide_instruction not in complete["detailed_description"]:
+        video_prompt = video_prompt.replace("detailed_description:", "detailed_description: " + guide_instruction, 1)
+
+    if complete is not None:
+        plan.warnings.extend(check_ref_prompt(video_prompt, duration, allowed))
+        plan.prompt = video_prompt.strip()
+        return plan
+    # Free-form English remains a supported input; make its single-shot structure explicit.
+    if not re.search(r"\[Shot\s+\d+\]", video_prompt):
+        video_prompt = "[Shot 1] " + video_prompt.strip()
+    audit = audit_body(video_prompt, duration, allowed=allowed)
+    if audit.errors:
+        raise ValueError("；".join(audit.errors))
 
     # ---- 第二段 summary：任务类型标记 + 一句话交代
     # ⚠️ 拼句子时注意两点（都是实测踩出来的）：
     #   ① `A {dur} clip` 中间必须有名词，写成 "A 10-second in the style of ..." 直接破句
     #   ② style_en 里通常已经含 "live-action, cinematic"，别在 clip 前再补一次 live-action
-    style = _clean(getattr(project, "style_en", "") or getattr(project, "style", ""))
+    style = _clean(getattr(project, "style_en", ""))
     subject_names = ", ".join(
         s.subject for s in plan.slots if s.kind == "image" and s.role == "character"
     ) or "the referenced subjects"
-    dur = f"{duration:.0f}-second " if duration else ""
+    dur = f"{duration:g}-second " if duration else ""
     summary = (
-        f"[{' + '.join(task_tags)}] A {dur}{style + ' ' if style else ''}clip "
-        f"featuring {subject_names}, keeping the referenced appearance, props and "
-        "environment consistent while the specified action unfolds."
+        f"[{' + '.join((*task_tags, 'video continuation') if continuation else task_tags)}] A {dur}{style + ' ' if style else ''}clip "
+        f"using {subject_names} as reference baselines while following the target "
+        "actions and any explicitly requested appearance or environment changes."
     )
 
     # 正文末尾追加固定的负面约束。**体检用的仍是模型原文**（video_prompt），
     # 不然这段样板会把 audit 的镜头计数带偏。
-    body = video_prompt.strip()
+    body = guide_instruction + video_prompt.strip()
     if body and DETAILED_CONSTRAINTS not in body:
         body = f"{body}\n\n{DETAILED_CONSTRAINTS}"
 
     blocks = [
         f"subject_definitions: {_subject_definitions(plan)}",
         f"summary: {summary}",
-        f"retention_analysis: {_retention_analysis(plan)}",
+        f"retention_analysis: {_retention_analysis(plan, retention)}",
         f"detailed_description: {body}",
         f"overall_soundscape: {soundscape.strip() or 'Natural ambience and physical sounds matching the on-screen action.'}",
         f"non_diegetic_music: {music}",
     ]
     plan.prompt = "\n\n".join(b for b in blocks if b.strip())
-    plan.warnings.extend(audit_detailed_description(video_prompt, duration))
+    plan.warnings.extend(check_ref_prompt(plan.prompt, duration, allowed))
 
     # 正文里应当引用 <Subject N> —— 不引用的话模型只能靠 subject_definitions 自己猜
     # "哪张图演谁"，参考模式最核心的一致性优势就打折了。
-    # （注意：当前分镜 Agent 产出的 video_prompt 是按 I2VA 写的，不会带 Subject 引用，
-    #   Ref2VA 接上后要让提示词 Agent 在正文里用上编号 —— 这条警告就是提醒这件事。）
     if any(s.subject for s in plan.slots) and "<Subject" not in (video_prompt or ""):
         plan.warnings.append(
             "detailed_description 里没有任何 <Subject N> 引用 → 模型只能靠 "
@@ -620,50 +640,6 @@ def compose_ref2va_prompt(
 
 
 def audit_detailed_description(text: str, duration: float = 0.0) -> list[str]:
-    """按官方经验值给 detailed_description 做三项体检。
-
-    这三条不满足不会报错，但会明显掉质 —— 所以宁可提前吵一句，别等出片才发现。
-    """
-    warns: list[str] = []
-    t = text or ""
-    if not t.strip():
-        return ["detailed_description 是空的 → Ref2VA 至少要写清目标镜头在做什么"]
-
-    shots = re.findall(r"\[Shot\s+(\d+)\]", t)
-    n = len(shots)
-    if n == 0:
-        # ⚠️ 这条是补的：原来 n=0 会让下面两条检查**全部静默跳过**，
-        # 于是一份"一颗镜头标记都没有"的正文会被判为合格。
-        # 实测踩过 —— 强调"第一句先写影像质感"之后，模型很容易把 [Shot 1] 整个省掉。
-        warns.append(
-            "正文里一个 [Shot N] 标记都没有 → 官方格式要求每颗镜头以 [Shot N] 开头"
-            "（[Shot 1] 不写时间戳，[Shot 2] 起接 'At MM:SS.mmm,'）"
-        )
-    elif shots[0] != "1":
-        warns.append(f"第一个镜头编号是 [Shot {shots[0]}]，应当从 [Shot 1] 开始")
-
-    # ① 镜头颗粒度：切得越碎，参考模式下人物越容易跑
-    if duration:
-        if duration <= 5 and n > 2:
-            warns.append(f"{duration:.0f} 秒片有 {n} 颗镜头，偏碎（官方经验 5 秒 1-2 颗）")
-        elif 5 < duration <= 10 and n > 3:
-            warns.append(f"{duration:.0f} 秒片有 {n} 颗镜头，偏碎（官方经验 10 秒 2-3 颗）")
-        elif duration > 10 and n > 4:
-            warns.append(f"{duration:.0f} 秒片有 {n} 颗镜头，偏碎（官方经验 15 秒 3-4 颗）")
-
-    # ② 后续镜头必须以 At MM:SS.mmm, 开头（[Shot 1] 不带时间戳）
-    for m in re.finditer(r"\[Shot\s+(\d+)\]\s*([^[]*)", t):
-        idx, body = int(m.group(1)), m.group(2).strip()
-        if idx > 1 and not re.match(r"At\s+\d{2}:\d{2}\.\d{3}\s*,", body):
-            warns.append(f"[Shot {idx}] 后面缺 'At MM:SS.mmm,' 时间戳（只有 [Shot 1] 不写）")
-            break
-
-    # ③ 最后一切要离结尾至少 2 秒
-    stamps = [float(s) * 60 + float(ms) for s, ms in
-              re.findall(r"At\s+(\d{2}):(\d{2})\.\d{3}", t)]
-    if duration and stamps and max(stamps) > duration - 2 + 1e-6:
-        warns.append(
-            f"最后一个切点在 {max(stamps):.2f}s，距结尾（{duration:.0f}s）不足 2 秒 —— "
-            "那一镜还没演完片子就结束了"
-        )
-    return warns
+    """Compatibility wrapper: timing errors and quality reminders for legacy callers."""
+    audit = audit_body(text, duration)
+    return audit.errors + audit.warnings

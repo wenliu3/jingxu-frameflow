@@ -11,7 +11,7 @@
 > Community License**（厂商自定义协议，不是 MIT/Apache），把原文整份拷进本仓库不合适。
 > 所以这里是**要点转述 + 我们的工程结论**。
 >
-> 官方来源（2026-09-19 核对）：
+> 官方来源（2026-10-04 核对；按 Ref2VA 与基础模式分别加载）：
 > - Skill 入口：https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/SKILL.md
 > - 基础模式指南（T2VA/I2VA/FL2VA/L2VA）：`.../skills/h3-prompt-writing/references/base-en.txt`
 > - 全参考模式指南（Ref2VA）：`.../skills/h3-prompt-writing/references/ref-en.txt`
@@ -26,7 +26,7 @@
 
 1. **镜头结构**：`[Shot 1]` **不带时间戳**（后面直接接风格与初始构图）；第 2 颗起写成
    `[Shot N] At MM:SS.mmm, ...`，切点时间必须**严格递增**且落在视频时长内。
-2. **风格开场**：`[Shot 1]` 开头先钉死影像质感（介质/胶片感、画幅、光源与方向、色调、材质、氛围）。
+2. **风格开场**：Ref2VA 在 `[Shot 1]` 前用 1–2 句建立影像质感；基础模式在 `[Shot 1]` 后建立影像质感（介质/胶片感、画幅、光源与方向、色调、材质、氛围）。
    可以点名风格（live-action / 3D CG / claymation…），但**必须紧跟具体细节**；
    只写 cinematic / beautiful / epic 这种空词等于没写。
 3. **每颗镜头都要写全这七样**：① 当前构图 ② 主体外观与位置 ③ 环境与光照 ④ 动作与状态变化
@@ -53,15 +53,19 @@
 10. **`non_diegetic_music`**：1–3 句，写角色听不到、只有观众能听的配乐，聚焦配器/速度/节奏/动态；
     **禁止抽象情绪词、禁止解释情感功能**；没有就写 `N/A`。
     角色能听到的音乐属于画内事件，写进正文，不写这里。
-11. **篇幅**：正文 350–500 英文词（对白密集时优先把口播时间线写全，别灌水）。
+11. **篇幅**：Ref2VA 生成正文通常 350–500 英文词（对白密集时优先把口播时间线写全，别灌水）。
 
 ## B. Ref2VA（全参考模式）专属
+
+工程约束：用户未要求切镜时保持单镜头；明确提出切镜时才分镜。角色只在当前描述要求的镜头出现。
+引用图是身份/外观基线，不覆盖用户明确要求的换衣、光线、背景或幻想效果。不得虚构未提供的视频或音频参考。
+
 
 1. **六段式，顺序不能换、字段名照抄**：
    `subject_definitions` → `summary` → `retention_analysis` → `detailed_description`
    → `overall_soundscape` → `non_diegetic_music`。
    **六段式本身就是完整提示词** —— 不要再套基础模式的三段壳，也**没有**关键帧对齐那一行
-   （Ref2VA 没有关键帧）。
+   （语义参考本身不占时间轴；本项目续拍另外用 AddGuide 引导第0帧）。
 2. **标签**（一旦分配，全部段落里含义一致；不得出现没被定义的标签）：
    - `<Subject N>`：从素材里抽象出的**可复用可见内容**（人物/物体/场景/服装/风格/动作）。
    - `<Picture N>`：作为**具体帧**（首帧/关键帧/尾帧/构图锚点）的参考图才单独成条；
@@ -73,13 +77,15 @@
    `audio reference`（只借音色/风格）/ `audio reuse`（原音频被复用）/ `video editing` /
    `video continuation`。**summary 里不得引入新标签。**
 4. **`retention_analysis`**：每个标签一行 + 标记词，**两套标记词不能混**：
-   - 视觉（`<Subject>`/`<Picture>`）：`fully_preserved` / `partially_preserved` /
+   - 视觉（`<Subject>`/`<Picture>`/`<Video>`）：`fully_preserved` / `partially_preserved` /
      `attribute_transfer` / `weak_reference`
    - 音频（`<Audio>`）：`fully_copy` / `partially_copy` / `reference` / `weak_reference`
    - 本项目只借音色 → 用 `reference`，并写死 `do not reuse its spoken content as dialogue`
      （这是防音色样本内容泄漏成台词的那道闸）。这一段**不写 (Sx)**。
 5. **`detailed_description`**：逐镜写，并在素材首次出现/生效处插入标签；
    说话人同时保留视觉标签与说话人 ID：`<Subject 2> (S1) says, <d>...</d>`。
+
+本项目的真实视频输入：清单提供 `<Video N>` 时，H3 会接收成功成片的选定帧批次，可引用其动作、构图和外观；文本编排器没有看过视频，不能编造视频分析结果。引用主体必须以用户描述和已提供锚点为依据。续拍的尾帧通过 AddGuide 固定为第0帧，不因它存在就虚构 `<Picture N>`；只写新片动作，不重播前情。来源音频不作为参考输入。
 
 ## C. 基础模式（T2VA / I2VA / FL2VA / L2VA）专属
 

@@ -4,7 +4,7 @@
 1. **生成是长任务**（6 镜约 90 秒），POST 必须立即返回 task_id，后台线程执行，
    前端轮询取进度。同步等待必然超时。
 2. **逐镜回传**：每张图出来就更新任务状态，前端能逐张渲染，不是等全部出完才显示。
-3. **任务状态放内存**：单机工具，进程重启丢失可接受，不引入数据库。
+3. **任务独立保存**：作品、画布和候选记录落盘，进行中的远端生成不自动重复提交。
 4. **每个任务独立输出目录**：outputs/{task_id}/，多任务互不覆盖。
 
 静态产物由同一个进程挂载（/files），最终只跑一个服务，不是前后端两个进程。
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,6 +33,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from server.video_sources import resolve_video_sources, public_sources
+from server.prompt_mentions import resolve_mentions
+from server.video_contracts import ComposeBody, OptimizePromptBody, SegmentVideoBody
+from server.video_policy import effective_workflow, resolve_resolution
+from video_controls import h3_frames, output_size
+from server.segment_job_store import restore_job, save_candidate, save_job
+from server.segment_generation import make_candidates, run_candidates
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -64,7 +72,7 @@ SERVICE_DEFAULTS = {
     "video_lora": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
     # 用哪份 ComfyUI 工作流（2026-09-19 加）。**默认 i2v，不自动切**：
     #   i2v    = comfyui/h3_i2v_api.json —— 单张首帧（最多再加一张尾帧）
-    #   ref2va = comfyui/h3_r2v_api.json —— 最多 9 张参考图 + 音频参考（见 REF2VA_MAX_REFS）
+    #   ref2va = comfyui/h3_r2v_api.json —— 最多 9 张参考图 + 3 个视频参考（画布暂未接入音频参考）
     # ⚠️ Ref2VA 那份要**额外下 3 个模型文件**（见那份文件里的 _必须的模型文件）。
     # 所以这里绝不能"检测到文件就自动切"—— 文件我早就放进去了，模型没下的话
     # 一自动切就变成"每次出片都失败"。必须由人显式打开。
@@ -116,44 +124,30 @@ _ENV_OF = {
 }
 
 
+from server.config_store import ConfigStore
+
+SERVICE_STORE = ConfigStore(
+    CONF_PATH, SERVICE_DEFAULTS, _ENV_OF,
+    legacy_path=os.path.join(ROOT, "comfyui_config.json"),
+)
+
+
 def _load_service_config() -> dict:
-    """读盘，缺的字段依次回退：.env 同名变量 → 内置默认值。
-    兼容一次旧版 comfyui_config.json（只存过隧道地址）。"""
-    try:
-        with open(CONF_PATH, encoding="utf-8") as fh:
-            saved = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        saved = {}
-    if not str(saved.get("comfyui_url") or "").strip():
-        try:
-            with open(os.path.join(ROOT, "comfyui_config.json"), encoding="utf-8") as fh:
-                legacy = json.load(fh)
-            saved["comfyui_url"] = legacy.get("url") or saved.get("comfyui_url")
-        except (OSError, json.JSONDecodeError):
-            pass
-    cfg = {}
-    for key, default in SERVICE_DEFAULTS.items():
-        cfg[key] = str(saved.get(key) or "").strip() or os.getenv(_ENV_OF[key], "").strip() or default
-    # 值域在配置层就卡住：历史配置里存过已废弃的 auto / t2v，这里归一化，
-    # 接口返回值就和实际生效值永远一致——否则前端下拉会匹配不到任何 option，
-    # 显示成一个和实际行为不符的选项。
-    if cfg["video_mode"] not in VIDEO_MODES:
-        cfg["video_mode"] = "i2v"
-    if cfg["video_workflow"] not in VIDEO_WORKFLOWS:
-        cfg["video_workflow"] = "i2v"
-    if cfg["audio_provider"] not in AUDIO_PROVIDERS:
-        cfg["audio_provider"] = "edge"
-    return cfg
+    """Return a settings snapshot; reload only when its file changes."""
+    return SERVICE_STORE.get()
 
 
 def _apply_service_config(cfg: dict) -> None:
     for key, env in _ENV_OF.items():
-        value = str(cfg.get(key) or "").strip()
-        if value:
-            os.environ[env] = value
+        os.environ[env] = str(cfg.get(key) or "").strip()
 
 
-_apply_service_config(_load_service_config())
+try:
+    _apply_service_config(_load_service_config())
+except (ValueError, OSError):
+    # Keep the app available for recovery, without overwriting a damaged file.
+    _apply_service_config(SERVICE_STORE.fallback)
+    logging.getLogger(__name__).warning("服务配置读取失败，暂时使用环境变量与默认值；原文件已保留")
 
 import agents  # noqa: E402
 import llm  # noqa: E402
@@ -184,9 +178,9 @@ def _video_mode() -> str:
     return _load_service_config()["video_mode"]
 
 
-def _make_video_provider():
+def _make_video_provider(cfg: dict | None = None):
     """按「服务配置」里的视频后端选择实例化 provider。"""
-    cfg = _load_service_config()
+    cfg = dict(cfg if cfg is not None else _load_service_config())
     if cfg.get("video_backend") == "api":
         from video_provider import ApiVideoProvider
 
@@ -211,6 +205,8 @@ def _make_video_provider():
     return ComfyUIVideoProvider(
         base_url=cfg["comfyui_url"], workflow_path=workflow_path or None,
         timeout_per_shot=timeout_s,
+        megapixels=resolve_resolution(None, cfg), steps=int(cfg["video_steps"]),
+        lora=str(cfg.get("video_lora") or ""),
     )
 
 
@@ -259,6 +255,10 @@ def _lora_workflow_error(cfg: dict) -> str | None:
 
 def _video_config_error(cfg: dict) -> str | None:
     """生成视频前的配置自检：返回给用户的报错文案，None 表示配置就绪。"""
+    if cfg.get("video_backend", "comfyui") == "api":
+        if not (cfg.get("video_api_url") and cfg.get("video_api_key") and cfg.get("video_api_model")):
+            return "外接视频 API 未配置完整：需要 API 地址、Key 和模型名称（服务配置面板）"
+        return None
     lora_error = _lora_workflow_error(cfg)
     if lora_error:
         return lora_error
@@ -269,11 +269,6 @@ def _video_config_error(cfg: dict) -> str | None:
             "不能直接把图摘掉。请按 docs/REF2VA.md 里的导出步骤，从 ComfyUI 模板库导出 "
             "MiniMax H3 T2V 的 API 工作流，存为 comfyui/h3_t2v_api.json"
         )
-    backend = cfg.get("video_backend", "comfyui")
-    if backend == "api":
-        if not (cfg.get("video_api_url") and cfg.get("video_api_key") and cfg.get("video_api_model")):
-            return "外接视频 API 未配置完整：需要 API 地址、Key 和模型名称（服务配置面板）"
-        return None
     if not cfg.get("comfyui_url"):
         return "未配置 ComfyUI 地址：点右上角「服务配置」，把实例隧道地址填进去"
     return None
@@ -370,6 +365,7 @@ class ShotPatch(BaseModel):
 
 
 class ServiceConfigPatch(BaseModel):
+    model_config = {"extra": "forbid"}
     video_backend: str = "comfyui"
     video_mode: str = ""
     comfyui_url: str = ""
@@ -1038,13 +1034,15 @@ def generate(req: GenerateRequest) -> dict:
 def list_tasks() -> list[dict]:
     """任务列表。以磁盘为准，服务重启、换浏览器、清缓存都不会丢。"""
     with LOCK:
+        generating = {job.get("task_id") for jobs in (VIDEO_JOBS, BATCH_JOBS, SEGMENT_JOBS)
+                      for job in list(jobs.values()) if job.get("status") == "running"}
         items = [
             {
                 "task_id": t["task_id"],
                 "idea": t.get("idea", ""),
                 "title": (t.get("project") or {}).get("title", ""),
-                "shots": len(t.get("shots") or []),
-                "status": t["status"],
+                **project_summary(t, _out_dir(t["task_id"])),
+                "status": "running" if t["task_id"] in generating else t["status"],
                 "created_at": t.get("created_at", ""),
             }
             for t in TASKS.values()
@@ -2343,22 +2341,6 @@ def list_tts_voices() -> list[dict]:
     return tts.list_voices()
 
 
-class ComposeBody(BaseModel):
-    """单段生成的编排输入：选中的素材 + 一段描述。
-
-    `video_prompt` 非空时**完全不碰任何模型接口** —— 这就是「只有 ComfyUI 地址、
-    自己上传素材、自己写提示词」的用户能走通的那条路。
-    """
-
-    characters: list[str] = Field(default_factory=list)
-    props: list[str] = Field(default_factory=list)
-    scene: str = ""
-    images: list[str] = Field(default_factory=list)   # 「其他图片」类素材名
-    audios: list[str] = Field(default_factory=list)   # 「其他音频」类素材名
-    description: str = Field("", max_length=2000)   # 中文口语描述（走 LLM 时才用）
-    video_prompt: str = Field("", max_length=8000)  # 已是英文正文时直接给，跳过 LLM
-    duration: float = 10.0
-    use_voice: bool = True
 
 
 # 素材类型的中文说法，写进给 LLM 的素材清单
@@ -2375,6 +2357,7 @@ def _material_lines_for(plan, *, with_tags: bool = True) -> list[str]:
     """
     lines: list[str] = []
     for s in plan.slots:
+        start = len(lines)
         if s.kind == "image":
             if s.subject:
                 kind_cn = _MATERIAL_CN.get(s.role, "素材")
@@ -2383,6 +2366,8 @@ def _material_lines_for(plan, *, with_tags: bool = True) -> list[str]:
             else:
                 lines.append(f"{s.tag} = 用户上传的图片「{s.label}」（画面参考）" if with_tags
                              else f"用户上传的图片「{s.label}」")
+        elif s.kind == "video":
+            lines.append(f"{s.tag} = 成功视频「{s.label}」的选定片段（真实视觉输入；不复用来源音频，不重播前情）")
         elif s.role == "voice":
             note = "只供音色参考，不要在正文里描述它"
             lines.append(f"{s.tag} = 角色「{s.label}」的音色样本（{note}）" if with_tags
@@ -2391,6 +2376,8 @@ def _material_lines_for(plan, *, with_tags: bool = True) -> list[str]:
             note = "只借氛围，不要在正文里描述它"
             lines.append(f"{s.tag} = 用户上传的音频「{s.label}」（{note}）" if with_tags
                          else f"用户上传的音频「{s.label}」（{note}）")
+        if s.kind == "image" and s.note and len(lines) > start:
+            lines[-1] += f"；外观锚点（文字设定，未分析图片）：{s.note[:1200]}"
     return lines
 
 
@@ -2413,22 +2400,44 @@ def compose_segment(task_id: str, body: ComposeBody) -> dict:
     # 走哪套格式由**服务配置里的工作流**决定（2026-09-19）：
     #   ref2va → 六段式（标签体系 + 参考关系），出片时直接进节点
     #   i2v    → 基础模式：只出正文，三段壳与关键帧对齐指令由出片时拼
-    wf_ref2va = str(_load_service_config().get("video_workflow") or "i2v") == "ref2va"
+    cfg_snapshot = _load_service_config()
+    workflow = effective_workflow(cfg_snapshot)
+    wf_ref2va = workflow == "ref2va"
+    sources = resolve_video_sources(_out_dir(task_id), body.video_sources, body.duration, workflow)
+    if body.audios:
+        raise HTTPException(422, "当前视频服务不接收参考音频，请只选择图片素材")
 
     # 先算一次槽位拿到编号表。build_ref_plan 是确定性的（按固定顺序编号），
     # 所以这里算出来的编号与下面 compose 内部再算一次的结果必然一致。
     seed_plan = ref_plan.build_ref_plan(
         project, characters=body.characters, props=body.props,
-        scene=body.scene, images=body.images, audios=body.audios,
-        use_voice=body.use_voice,
+        scene=body.scene, images=body.images, audios=body.audios, videos=sources,
+        use_voice=False,
     )
 
-    video_prompt = body.video_prompt.strip()
+    requested = len(set(body.characters)) + len(set(body.props)) + len(set(body.images)) + bool(body.scene)
+    actual = len([slot for slot in seed_plan.slots if slot.kind == "image"])
+    # 按实际工作流取图，不能用 Ref2VA 的设定图检查 I2V 的首帧是否就绪。
+    selected_refs = [f"character:{i}" for i, c in enumerate(project.characters) if c.name in body.characters]
+    selected_names = {"prop": set(body.props), "scene": {body.scene} if body.scene else set(), "image": set(body.images)}
+    selected_refs.extend(f"{a.kind}:{i}" for i, a in enumerate(project.assets) if a.name in selected_names.get(a.kind, set()))
+    resolved_inputs = [_resolve_material_ref(project, ref, prefer_sheet=wf_ref2va) for ref in selected_refs]
+    if requested != actual or requested != len(resolved_inputs) or (not actual and not sources) or any(not m or not os.path.isfile(m["path"]) for m in resolved_inputs):
+        raise HTTPException(422, "所选图片素材缺失、尚未就绪或超出参考图上限：" + " ".join(seed_plan.warnings))
+    if not wf_ref2va and actual > 1:
+        raise HTTPException(422, "当前视频服务只接受一张首帧图，请只选择一张图片")
+    try:
+        description = resolve_mentions(body.description, seed_plan, ref_mode=wf_ref2va)
+        video_prompt = resolve_mentions(body.video_prompt.strip(), seed_plan, manual=True, ref_mode=wf_ref2va)
+    except (ValueError, UnicodeError) as exc:
+        raise HTTPException(422, f"素材引用无效：{exc}") from exc
     # 音轨段：只有「让 AI 帮写」那条路才有（它和画面是同一件事的两面，交给同一个 Agent 写）。
     # 手写模式用户只给正文，这里留空 → compose_ref2va_prompt 会填一句通用兜底。
     soundscape = ""
+    compose_warnings = [f"来源「{v['label']}」的参考范围长于新片，已使用该范围结尾 {v['frames'] / 24:.2f} 秒作为画面参考。" for v in sources if v.get("range_trimmed")]
+    retention = {}
     if not video_prompt:
-        if not body.description.strip():
+        if not description.strip():
             raise HTTPException(
                 status_code=422,
                 detail="需要 description（中文描述）或 video_prompt（英文正文）其中之一",
@@ -2437,6 +2446,8 @@ def compose_segment(task_id: str, body: ComposeBody) -> dict:
         #   Ref2VA → 带 `<Picture N>`/`<Subject N>`（正文必须引用编号）
         #   基础模式 → 只给名字（那套标签体系在这里不存在）
         material_lines = _material_lines_for(seed_plan, with_tags=wf_ref2va)
+        if any(v["usage"] == "continue" for v in sources):
+            material_lines.append("上一段末尾画面将作为新片第0帧引导。从结束状态开始新的动作，不重播来源、不复制来源音频。引导帧不对应 Picture 标签。")
         if not material_lines:
             raise HTTPException(
                 status_code=422,
@@ -2444,9 +2455,10 @@ def compose_segment(task_id: str, body: ComposeBody) -> dict:
             )
         try:
             composed = agents.compose_segment_prompt(
-                project, description=body.description,
+                project, description=description,
                 material_lines=material_lines, duration=body.duration,
                 ref_mode=wf_ref2va,
+                context=body.context,
             )
         except Exception as exc:
             raise HTTPException(
@@ -2454,6 +2466,8 @@ def compose_segment(task_id: str, body: ComposeBody) -> dict:
             ) from exc
         video_prompt = composed["video_prompt"]
         soundscape = composed["soundscape"]
+        compose_warnings.extend(composed.get("warnings", []))
+        retention = composed.get("retention", {})
         if not video_prompt:
             raise HTTPException(status_code=502, detail="分镜 Agent 没有返回正文，请重试")
 
@@ -2465,11 +2479,12 @@ def compose_segment(task_id: str, body: ComposeBody) -> dict:
         # ⚠️ soundscape 要一起回传：前端会把它带给 /segment/video，
         #    否则基础模式没有 overall_soundscape（模型就会自己编配乐/环境音）。
         return {
+            "video_backend": cfg_snapshot.get("video_backend", "comfyui"), "video_workflow": workflow,
             "video_prompt": video_prompt,
             "soundscape": soundscape,
             "prompt": video_prompt,
             "manifest": "",
-            "warnings": [],
+            "warnings": compose_warnings,
             "slots": [],
         }
 
@@ -2477,18 +2492,24 @@ def compose_segment(task_id: str, body: ComposeBody) -> dict:
     # 有音频参考就补上对应的任务类型标记（官方六段式的 summary 要用方括号声明任务类型）
     if any(s.kind == "audio" for s in seed_plan.slots):
         tags.append("audio reference")
-    plan = ref_plan.compose_ref2va_prompt(
-        project, video_prompt=video_prompt, soundscape=soundscape, duration=body.duration,
-        characters=body.characters, props=body.props, scene=body.scene,
-        images=body.images, audios=body.audios,
-        use_voice=body.use_voice, task_tags=tuple(tags),
-    )
+    try:
+        plan = ref_plan.compose_ref2va_prompt(
+            project, video_prompt=video_prompt, soundscape=soundscape, duration=body.duration,
+            characters=body.characters, props=body.props, scene=body.scene,
+            images=body.images, audios=body.audios, videos=sources,
+            use_voice=False, task_tags=tuple(tags),
+            retention=retention,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, f"提示词不合规：{exc}") from exc
     return {
+        "video_backend": cfg_snapshot.get("video_backend", "comfyui"), "video_workflow": workflow,
         "video_prompt": video_prompt,
         "soundscape": soundscape,
         "prompt": plan.prompt,
+        "video_sources": public_sources(sources),
         "manifest": plan.manifest(),
-        "warnings": plan.warnings,
+        "warnings": list(dict.fromkeys(compose_warnings + plan.warnings)),
         "slots": [
             {
                 "tag": s.tag, "kind": s.kind, "path": s.path, "role": s.role,
@@ -2499,21 +2520,6 @@ def compose_segment(task_id: str, body: ComposeBody) -> dict:
     }
 
 
-class OptimizePromptBody(BaseModel):
-    """「让 AI 帮写」的输入：选中的素材 + 一段中文口语描述。
-
-    与 ComposeBody 的区别：这里**只产出中文**，不注入素材编号、不写英文正文。
-    素材是**可选**的 —— 用户还没选素材也能先把想法写具体。
-    """
-
-    characters: list[str] = Field(default_factory=list)
-    props: list[str] = Field(default_factory=list)
-    scene: str = ""
-    images: list[str] = Field(default_factory=list)
-    audios: list[str] = Field(default_factory=list)
-    description: str = Field("", max_length=2000)
-    duration: float = 10.0
-    use_voice: bool = True
 
 
 @app.post("/api/tasks/{task_id}/prompt/optimize")
@@ -2563,39 +2569,6 @@ def optimize_prompt(task_id: str, body: OptimizePromptBody) -> dict:
     return {"description": optimized, "materials": material_names}
 
 
-class SegmentVideoBody(BaseModel):
-    """单段生成的提交体。
-
-    `frames` 是**选中的素材引用**（如 "character:0"、"scene:1"、"image:0"），
-    按用户点选的顺序排 —— 第 1 个能出图的默认当首帧。
-    让后端解析成路径而不是前端传路径：前端伪造不了服务器文件位置。
-
-    `first_frame` / `last_frame`（2026-09-19 加）是**用户在「首尾帧」选择器里显式挑的**
-    两个引用，各自可空：
-      只给 first_frame → 以它开头｜只给 last_frame → 以它收尾｜两个都给 → 一头一尾
-      两个都不给 → 没有首尾帧，首帧退回 frames 里第一个能出图的素材
-    ⚠️ 替代了原来的 `use_last_frame`（那个是"勾一下就拿选中的第 2 张当尾帧"，
-    尾帧是哪张完全由点选顺序决定，用户控制不了）。
-    """
-
-    frames: list[str] = Field(default_factory=list)
-    first_frame: str = ""   # 素材引用；空 = 用 frames 里第一个能出图的
-    last_frame: str = ""    # 素材引用；空 = 不设尾帧
-    prompt: str = Field("", max_length=20000)
-    duration: float = 10.0
-    # 像素预算（前端「清晰度」档位）。None = 用服务配置里的全局值。
-    # H3 输出上限是 768p（megapixels 0.98 → 1344x768），所以"1080P"这一档
-    # 实际是"按模型上限出片"，不是真 1080p。
-    megapixels: float | None = Field(None, ge=0.1, le=1.5)
-    # 「AI 帮我写」模式下用户输入的那段中文描述。**不参与出片**，只为「生成记录」
-    # 留个底 —— 过几天回看时，一段英文正文（prompt）是看不懂自己当初想要什么的。
-    # 手写模式没有这一层，留空即可。
-    note: str = Field("", max_length=2000)
-    # 编排出来的**音轨段**（环境底声 + 动作音），2026-09-19 加。
-    # 只有基础模式（I2V / 首尾帧）才用得上：那边提示词是三段式，`overall_soundscape`
-    # 由出片时拼（`video_provider.compose_h3_prompt` 的 audio 参数）。
-    # Ref2VA 的六段式里已经自带 overall_soundscape 一段，这里传了也会被忽略。
-    soundscape: str = Field("", max_length=2000)
 
 
 def _resolve_material_ref(
@@ -2745,6 +2718,15 @@ def _seg_sidecar(task_id: str, name: str) -> dict[str, Any] | None:
 REF2VA_MAX_REFS = 9
 
 
+@app.get("/api/video-capabilities")
+def video_capabilities() -> dict:
+    api = effective_workflow(_load_service_config()) == "api"
+    return {"controls_version": 1, "candidate_counts": [1, 2, 4], "duration_min": 4, "duration_max": 15,
+            "ratios": ["auto"] if api else ["auto", "16:9", "4:3", "1:1", "3:4", "9:16", "21:9"],
+            "resolutions": ["custom"] if api else ["custom", "480p", "720p"], "exact_duration": not api, "seed": not api, "video_sources_version": 1,
+            "video_references": effective_workflow(_load_service_config()) == "ref2va", "remote_verified": False}
+
+
 @app.post("/api/tasks/{task_id}/segment/video")
 def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
     """按「选中的素材 + 已编排的提示词」生成一段视频。
@@ -2761,7 +2743,8 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
         raise HTTPException(status_code=422, detail="缺提示词 —— 先点「生成视频」完成编排，或自己在手写模式里填")
     # 配置自检（2026-09-19 补）：这条流程以前**没走**这一步，配置不对只能等出片线程里失败。
     # 现在包括"LoRA 和工作流不配套"这种一眼能看出的错（混用会糊，白等半小时）。
-    cfg_error = _video_config_error(_load_service_config())
+    cfg_now = _load_service_config()
+    cfg_error = _video_config_error(cfg_now)
     if cfg_error:
         raise HTTPException(status_code=409, detail=cfg_error)
 
@@ -2772,14 +2755,29 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
     #   ① 角色拿哪张图：I2V 拿正面定妆照（那张要当**首帧**，四格拼图当首帧＝第一秒四个人并排）；
     #      Ref2VA 拿**四视图设定图**（参考图不是帧，信息越多越好 —— 这张图就是为此做的）。
     #   ② 素材在记录里算什么身份：I2V 有首帧/尾帧；Ref2VA 没有首尾帧，全是参考图。
-    cfg_now = _load_service_config()
-    wf_ref2va = str(cfg_now.get("video_workflow") or "i2v") == "ref2va"
+    workflow = effective_workflow(cfg_now)
+    wf_ref2va = workflow == "ref2va"
+    sources = resolve_video_sources(_out_dir(task_id), body.video_sources, body.duration, workflow)
+    if (body.expected_backend and body.expected_backend != cfg_now.get("video_backend")) or (body.expected_workflow and body.expected_workflow != workflow):
+        raise HTTPException(409, "视频服务或工作流已改变，请重新编排提示词后再生成")
+    try:
+        effective_mp = resolve_resolution(body.megapixels, cfg_now)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if len(set(body.frames)) != len(body.frames):
+        raise HTTPException(422, "同一张素材不能重复作为参考图")
+    if wf_ref2va and (body.first_frame or body.last_frame):
+        raise HTTPException(422, "Ref2VA 不支持锁定首尾帧，请使用参考图片")
+    if workflow == "api" and body.last_frame:
+        raise HTTPException(422, "当前视频 API 不支持尾帧")
 
     resolved: list[dict[str, str]] = []
     missing: list[str] = []      # 解析不出来 / 图还不存在的，说得出名字（前端要弹提示）
     for ref in body.frames:
         m = _resolve_material_ref(project, ref, prefer_sheet=wf_ref2va)
         if m and os.path.isfile(m["path"]):
+            if body.frame_names.get(ref) and body.frame_names[ref] != m["name"]:
+                raise HTTPException(409, "素材列表已改变，请重新选择并编排提示词")
             resolved.append(m)
         elif str(ref or "").strip():
             # ⚠️ **绝不能默默丢掉**。2026-09-19 的坑：索引口径不一致让第二个场景
@@ -2800,19 +2798,30 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
     resolved.sort(key=lambda m: ref_plan.kind_rank(m["kind"]))
     paths = [m["path"] for m in resolved]
     if missing:
-        print(f"[出片] 这些素材没带上（没有图 / 引用对不上）：{'、'.join(missing)}")
+        raise HTTPException(422, "这些图片素材缺失或尚未就绪：" + "、".join(missing))
+    if sum(m["kind"] == "scene" for m in resolved) > 1:
+        raise HTTPException(422, "一镜只能使用一个场景")
 
     notes: list[str] = []
     # Ref2VA 的参考图口是 `ref_image_0 … ref_image_8` 共 9 个（见 REF2VA_MAX_REFS）。
     # 第 10 张会被拼成 `ref_image_9` —— 那才是工作流里不存在的输入，ComfyUI 会直接拒单。
-    # 所以在这里就截断，并说清楚少了谁。
+    # 在提交前拒绝超量图片，不能截断后仍使用原来的参考编号。
     if wf_ref2va and len(paths) > REF2VA_MAX_REFS:
-        notes.append(
-            f"Ref2VA 最多吃 {REF2VA_MAX_REFS} 张参考图，多的这次没带上："
-            f"{'、'.join(m['name'] for m in resolved[REF2VA_MAX_REFS:])}。"
-        )
-        resolved = resolved[:REF2VA_MAX_REFS]
-        paths = [m["path"] for m in resolved]
+        raise HTTPException(422, "Ref2VA 最多接受 9 张参考图片")
+    if wf_ref2va:
+        # Recheck the exact materials going to the node, including direct API submissions.
+        try:
+            plan = ref_plan.compose_ref2va_prompt(
+                project, video_prompt=prompt, soundscape=body.soundscape, duration=body.duration,
+                characters=[m["name"] for m in resolved if m["kind"] == "character"],
+                props=[m["name"] for m in resolved if m["kind"] == "prop"],
+                scene=next((m["name"] for m in resolved if m["kind"] == "scene"), ""),
+                images=[m["name"] for m in resolved if m["kind"] == "image"], videos=sources, use_voice=False,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, f"提示词不合规，尚未提交视频生成：{exc}") from exc
+        prompt = plan.prompt
+        notes.extend(plan.warnings)
 
     # 用户在选择器里显式挑的首/尾帧优先（2026-09-19）。挑的那张通常也在 frames 里，
     # 但也允许单独挑一张没勾选的图 —— 两种都吃。
@@ -2821,17 +2830,30 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
         return m if m and os.path.isfile(m["path"]) else None
 
     first_pick, last_pick = _pick(body.first_frame), _pick(body.last_frame)
+    if (body.first_frame and not first_pick) or (body.last_frame and not last_pick):
+        raise HTTPException(422, "所选首帧或尾帧图片缺失，请重新选择")
     first = first_pick["path"] if first_pick else (paths[0] if paths else "")
     last = last_pick["path"] if last_pick else ""
+    if not first and sources:
+        first = next((v["tail_path"] for v in sources if v["usage"] == "continue"), sources[0]["tail_path"])
     if not first:
-        # 一张图都没有：这是 T2VA（自定义 / 没选素材）的路径
         raise HTTPException(
             status_code=422,
-            detail="当前是纯文生视频（没选任何图片素材）：需要先把 H3 的 T2VA 工作流导成 "
-                   "comfyui/h3_t2v_api.json（在 ComfyUI 里加载官方 t2v 模板后「导出（API）」）。"
-                   "不想导的话，选一张图当首帧即可",
+            detail="当前视频服务需要图片输入，请先选择至少一张已就绪的图片素材",
         )
-    duration = min(max(body.duration, 4.0), 15.0)   # 官方区间 4-15s
+    if not wf_ref2va and any(path not in {first, last} for path in paths):
+        raise HTTPException(422, "当前工作流只接收首帧和显式尾帧，多余图片不会进入模型")
+    duration = body.duration
+    if workflow == "api" and (body.ratio != "auto" or body.resolution != "custom" or body.exact_duration or body.seed is not None):
+        raise HTTPException(422, "当前视频 API 不支持画幅、清晰度、精确时长或随机种子，请切换 ComfyUI")
+    try:
+        size_reference = next((v["tail_path"] for v in sources if v["usage"] == "continue"), first)
+        dimensions = output_size(body.ratio, body.resolution, size_reference, effective_mp or 0.5, force=bool(sources))
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(422, "无法读取参考图尺寸或解析视频参数") from exc
+    if dimensions:
+        effective_mp = min(0.98, max(0.1, dimensions[0] * dimensions[1] / 1_000_000))
+
 
     # 这一段实际用了哪些图、各自什么身份。三个来源合并去重：
     #   ① 显式挑的首帧 / 尾帧（可能不在 frames 里）
@@ -2863,6 +2885,10 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
     for m in resolved:
         _add(m, "selected")
 
+    try:
+        provider = _make_video_provider(cfg_now)
+    except (RuntimeError, ValueError, OSError) as exc:
+        raise HTTPException(409, str(exc)) from exc
     job_id = uuid.uuid4().hex[:12]
     out_dir = os.path.join(_out_dir(task_id), "segments")
     os.makedirs(out_dir, exist_ok=True)
@@ -2879,17 +2905,6 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
     #    却没连上"。而这边的提示词是按 Ref2VA 六段式写的（正文里还会引用 <Picture 2>），
     #    更容易让人以为场景已经喂进去了。
     # ② Ref2VA 反过来没有尾帧概念，用户挑的尾帧会**被无声忽略**。
-    if wf_ref2va and last_pick:
-        notes.append(
-            f"Ref2VA 工作流没有尾帧概念：你挑的尾帧「{last_pick['name']}」"
-            "这次只当参考图用、不会锁结尾。"
-        )
-    if len(paths) > 1 and not wf_ref2va:
-        notes.append(
-            f"当前是 I2V 工作流：只有第一张参考图会当首帧进模型，"
-            f"另外 {len(paths) - 1} 张（{('、'.join(m['name'] for m in resolved[1:]))}）"
-            "只参与写提示词、不会进画面。要真的多图参考，去「服务配置」把「视频工作流」切成 Ref2VA。"
-        )
     # 步数与所选 LoRA 的蒸散步数不配套也要说（不拦）：蒸馏件照 4/8 步的轨迹调的，
     # 填 12 步不会报错，但通常更糊、还要多花约 3 倍时间。想要更多步请「不加载 LoRA」。
     # ⚠️ 这一段是**独立**的一条，别塞进上面那两个 if 的链子里（曾经把 I2V 那条挤成 elif，
@@ -2899,7 +2914,7 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
         steps_now = int(str(cfg_now.get("video_steps") or "").strip() or 0)
     except ValueError:
         steps_now = 0
-    if lora_steps and steps_now and steps_now != lora_steps:
+    if workflow != "api" and lora_steps and steps_now and steps_now != lora_steps:
         notes.append(
             f"采样步数填的是 {steps_now}，但所选 LoRA 是 {lora_steps} 步蒸馏的 —— "
             "不报错，但通常更糊也更慢（采样时间大致与步数成正比）。"
@@ -2913,84 +2928,100 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
         "job_id": job_id,
         "file": os.path.basename(out_path),
         "created": time.time(),
-        "mode": "flf" if last else "i2v",
-        "duration": duration,
-        # 真正下发给 provider 的像素预算。None 时 ComfyUI 那条会落到
-        # H3_MEGAPIXELS 环境变量（video_provider 里），这里按同一套规则算出来，
-        # 免得记录里写个 null 让人以为没生效。
-        "megapixels": float(body.megapixels) if body.megapixels else float(os.getenv("H3_MEGAPIXELS", "0.9")),
+        "mode": workflow if workflow in ("ref2va", "api") else "flf" if last else "i2v",
+        "duration": None if workflow == "api" else duration,
+        "planned_duration": duration,
+        # 提交时解析并固定的像素预算；API 不消费此参数，明确记录为 None。
+        "megapixels": effective_mp,
+        "resolution_source": "api" if workflow == "api" else "preset" if body.resolution != "custom" else "default" if body.megapixels is None else "override",
+        "ratio": body.ratio, "resolution": body.resolution,
+        "width": dimensions[0] if dimensions else None, "height": dimensions[1] if dimensions else None,
+        "generate_audio": body.generate_audio, "exact_duration": body.exact_duration,
+        "model_duration": None if workflow == "api" else h3_frames(duration) / 24,
+        "candidate_count": body.candidate_count,
+        "video_steps": None if workflow == "api" else int(cfg_now["video_steps"]),
+        "video_lora": "" if workflow == "api" else str(cfg_now.get("video_lora") or ""),
         "video_backend": str(cfg_now.get("video_backend") or ""),
         "video_mode": str(cfg_now.get("video_mode") or ""),
         # 用哪份工作流（i2v / ref2va）。「生成记录」里要能说清"这段是单图首帧还是多图参考"——
         # mode 那个字段（i2v/flf）说的是"有没有尾帧"，跟工作流不是一回事。
-        "video_workflow": "ref2va" if wf_ref2va else "i2v",
+        "video_workflow": workflow,
         "note": body.note.strip(),
         "prompt": prompt,
         "materials": materials,
+        "video_sources": public_sources(sources),
         # 选了但没能带上的素材（没有图 / 引用对不上）。记在边车里，回看这一段时
         # 能对上"为什么画面里没有它"。
         "missing": missing,
         # 工作流能力与所选素材不匹配时的那句提醒（见上面 warning 的计算）
         "warning": warning,
     }
-    try:
-        with open(_seg_sidecar_path(task_id, record["file"]), "w", encoding="utf-8") as f:
-            json.dump(record, f, ensure_ascii=False, indent=2)
-    except Exception as exc:      # 写不下记录不该挡住出片
-        print(f"[生成记录] 边车写入失败 {record['file']}：{exc}")
+    candidates = make_candidates(record, out_dir, body.seed)
+    for candidate in candidates:
+        try:
+            save_candidate(_out_dir(task_id), candidate)
+        except OSError as exc:
+            raise HTTPException(500, "生成参数记录保存失败，尚未提交视频生成") from exc
 
     SEGMENT_JOBS[job_id] = {
-        "job_id": job_id, "task_id": task_id, "status": "running",
-        "mode": record["mode"],
-        "first_frame": first, "last_frame": last,
-        "out_path": out_path, "error": "", "created": record["created"],
-        "record": record,
+        "job_id": job_id, "task_id": task_id, "status": "running", "mode": record["mode"],
+        "first_frame": first, "last_frame": last, "out_path": out_path,
+        "error": "", "created": record["created"], "record": record,
+        "results": candidates, "done": 0, "total": body.candidate_count,
+    }
+    try:
+        save_job(_out_dir(task_id), SEGMENT_JOBS[job_id])
+    except OSError as exc:
+        SEGMENT_JOBS.pop(job_id, None)
+        raise HTTPException(500, "任务记录保存失败，尚未提交生成") from exc
+
+    generation = {
+        "image_path": first, "video_prompt": prompt, "duration": duration,
+        "last_frame_path": last, "megapixels": effective_mp,
+        "audio": body.soundscape.strip() if body.generate_audio else "",
+        "ref_image_paths": paths,
+        "width": dimensions[0] if dimensions else None,
+        "height": dimensions[1] if dimensions else None,
+        "generate_audio": body.generate_audio, "exact_duration": body.exact_duration,
     }
 
+    if sources:
+        generation["ref_video_paths"] = [v["clip_path"] for v in sources if v["clip_path"]]
+        generation["guide_frame_path"] = next((v["tail_path"] for v in sources if v["usage"] == "continue"), "")
+
     def runner() -> None:
-        job = SEGMENT_JOBS[job_id]
-        try:
-            cfg = _load_service_config()
-            if cfg.get("video_backend") != "api" and not str(cfg.get("comfyui_url") or "").strip():
-                raise RuntimeError("ComfyUI 地址为空：请在「服务配置」里填")
-            provider = _make_video_provider()
-            provider.generate(
-                image_path=first, video_prompt=prompt, duration=duration,
-                out_path=out_path, last_frame_path=last, megapixels=body.megapixels,
-                # 基础模式下这句会进 overall_soundscape（三段式的一段）；
-                # Ref2VA 的六段式自带那一段，传进去被忽略。
-                audio=body.soundscape.strip(),
-                # 多张参考图（2026-09-19）：只有走 Ref2VA 工作流时才真的接得进去，
-                # I2V 那份只有一个 first_frame 口、会忽略这个参数。见 video_provider
-                # 的 _build_workflow —— 那里按 class_type 判断走哪条。
-                ref_image_paths=paths,
-            )
-            with LOCK:
-                job["status"] = "succeeded"
-        except Exception as exc:
-            with LOCK:
-                job["status"] = "failed"
-                job["error"] = _video_error_text(exc)
+        run_candidates(SEGMENT_JOBS[job_id], provider, generation, _out_dir(task_id), _video_error_text, LOCK)
 
     threading.Thread(target=runner, daemon=True).start()
     return {
-        "job_id": job_id, "mode": SEGMENT_JOBS[job_id]["mode"],
-        "first_frame": first, "last_frame": last,
-        # 选了却没带上的素材（名字）。前端据此弹一句提示 —— 静默丢素材是这个功能
-        # 2026-09-19 最难查的一个 bug，别再让它无声无息。
-        "missing": missing,
-        # 工作流吃不下的那些参考图（I2V 只吃首帧）。同上，前端弹一句提醒。
-        "warning": warning,
+        "job_id": job_id, "mode": record["mode"], "first_frame": first, "last_frame": last,
+        "missing": missing, "warning": warning, "total": body.candidate_count,
+        "settings": {k: record[k] for k in ("ratio", "resolution", "width", "height", "duration", "model_duration", "generate_audio", "megapixels")},
+        "candidates": [{"index": c["index"], "seed": c["seed"], "file": c["file"]} for c in candidates],
     }
 
 
 @app.get("/api/segment-jobs/{job_id}")
-def segment_video_job(job_id: str) -> dict:
+def segment_video_job(job_id: str, task_id: str = "") -> dict:
     """单段生成的状态轮询。产物 mp4 由 /files 挂载直接播。"""
     job = SEGMENT_JOBS.get(job_id)
+    if task_id:
+        _task(task_id)
+        if job and job["task_id"] != task_id:
+            raise HTTPException(404, "任务不属于当前作品")
+        if job is None:
+            try:
+                job = restore_job(_out_dir(task_id), task_id, job_id)
+            except (OSError, ValueError):
+                raise HTTPException(500, "任务记录读取失败，请保留本地文件")
+            if job:
+                SEGMENT_JOBS[job_id] = job
     if job is None:
         raise HTTPException(status_code=404, detail=f"任务不存在：{job_id}")
     out = dict(job)
+    out["results"] = [{**{k: v for k, v in candidate.items() if k != "record"},
+                       "video_url": f"/files/{job['task_id']}/segments/{candidate['file']}" if candidate["status"] == "succeeded" and os.path.isfile(candidate["out_path"]) else ""}
+                      for candidate in job.get("results", [])]
     if job["status"] == "succeeded" and os.path.isfile(job["out_path"]):
         out["video_url"] = f"/files/{job['task_id']}/segments/{os.path.basename(job['out_path'])}"
     return out
@@ -3042,7 +3073,8 @@ def list_segments(task_id: str) -> dict:
             # 服务重启后内存里没有 job 了，模式从边车文件里补回来
             side = _seg_sidecar(task_id, it["name"])
             if side:
-                it["mode"] = str(side.get("mode") or "")
+                # 旧记录曾将 Ref2VA 写成 i2v；以真实后端和工作流优先，保留原文件。
+                it["mode"] = "api" if side.get("video_backend") == "api" else "ref2va" if side.get("video_workflow") == "ref2va" else str(side.get("mode") or "")
     return {"items": items, "count": len(items)}
 
 
@@ -4312,6 +4344,11 @@ def _ffmpeg_exe() -> str:
         return "ffmpeg"
 
 
+from server.canvas_export import register_canvas_export_routes
+
+register_canvas_export_routes(app, _task, _out_dir, _ffmpeg_exe)
+
+
 @app.post("/api/tasks/{task_id}/export")
 def export_video(task_id: str) -> dict:
     with LOCK:
@@ -5274,24 +5311,79 @@ def assistant_plan(task_id: str, body: AssistantPlanBody) -> dict:
 @app.get("/api/config")
 def get_config() -> dict:
     """前端「服务配置」弹窗读当前值（含已保存的密钥，本机单用户工具）。"""
-    return _load_service_config()
+    try:
+        return _load_service_config()
+    except (ValueError, OSError) as exc:
+        raise HTTPException(500, "服务配置读取失败，请保留 service_config.json 并检查文件") from exc
 
 
+def _validate_service_config(cfg: dict) -> None:
+    for key, allowed in (
+        ("video_backend", ("comfyui", "api")), ("video_mode", VIDEO_MODES),
+        ("video_workflow", VIDEO_WORKFLOWS), ("audio_provider", AUDIO_PROVIDERS),
+    ):
+        if cfg.get(key) not in allowed:
+            raise ValueError(f"{key} 的选项无效")
+    for key, lower, upper in (("video_megapixels", 0.1, 0.98), ("video_steps", 1, 100), ("video_timeout_s", 30, 86400)):
+        try:
+            value = float(cfg[key])
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} 必须是数字") from None
+        if not lower <= value <= upper:
+            raise ValueError(f"{key} 必须在 {lower} 到 {upper} 之间")
+        if key != "video_megapixels" and not value.is_integer():
+            raise ValueError(f"{key} 必须是整数")
+    if cfg["video_backend"] == "comfyui":
+        error = _lora_workflow_error(cfg)
+        if error:
+            raise ValueError(error)
+
+
+@app.patch("/api/config")
 @app.post("/api/config")
 def set_config(body: ServiceConfigPatch) -> dict:
-    """保存全部服务配置并实时生效；顺手探活 ComfyUI 给面板一个红绿状态。"""
-    cfg = body.model_dump()
-    with open(CONF_PATH, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, ensure_ascii=False, indent=2)
-    _apply_service_config(_load_service_config())
-    reachable = None
-    if cfg.get("video_backend", "comfyui") != "api" and cfg.get("comfyui_url"):
-        try:
-            reachable = requests.get(f"{cfg['comfyui_url'].rstrip('/')}/system_stats", timeout=8).ok
-        except requests.RequestException:
-            reachable = False
-    return {"ok": True, "comfyui_reachable": reachable}
+    """Merge only submitted fields, save atomically, and apply without network I/O."""
+    try:
+        cfg = SERVICE_STORE.patch(body.model_dump(exclude_unset=True),
+                                  validate=_validate_service_config, apply=_apply_service_config)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(500, "服务配置保存失败，请检查项目目录是否可写") from exc
+    return {"ok": True, "config": cfg, "comfyui_reachable": None}
 
+
+class ServiceConnectionTest(BaseModel):
+    comfyui_url: str = Field(..., min_length=1, max_length=2048)
+
+
+@app.post("/api/config/test")
+def test_service_connection(body: ServiceConnectionTest) -> dict:
+    """Test the draft address without saving or invoking generation."""
+    from urllib.parse import urlparse
+    url = body.comfyui_url.strip().rstrip("/")
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("Invalid service URL")
+        parsed.port  # Validate malformed/out-of-range ports before requesting.
+    except ValueError:
+        raise HTTPException(422, "请输入完整的 http:// 或 https:// 服务地址") from None
+    try:
+        response = requests.get(f"{url}/system_stats", timeout=(3, 5))
+        response.raise_for_status()
+        payload = response.json()
+        reachable = isinstance(payload, dict) and isinstance(payload.get("system"), dict)
+        return {"reachable": reachable, "message": "ComfyUI 连接正常" if reachable else "地址有响应，但不是 ComfyUI 服务"}
+    except (requests.RequestException, ValueError):
+        return {"reachable": False, "message": "暂时无法连接，请确认 ComfyUI 已启动并检查地址"}
+
+
+# 节点画布只读写本地作品，不依赖任何模型服务。
+from server.workflow_store import register_workflow_routes
+from server.project_summary import project_summary
+
+register_workflow_routes(app, _task, _out_dir)
 
 # 启动时把磁盘上的历史任务认回来，这样任务列表不再依赖浏览器
 _scan_tasks()

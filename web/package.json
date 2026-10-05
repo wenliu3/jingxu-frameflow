@@ -6,13 +6,21 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "check": "node ../dev/tools/check_frontend.mjs",
+    "test": "node --test ../dev/ui/test_workflow_graph.mjs ../dev/ui/test_workflow_studio.mjs ../dev/ui/test_workflow_video.mjs ../dev/ui/test_video_settings.mjs ../dev/ui/test_service_settings.mjs ../dev/ui/test_project_library.mjs ../dev/ui/test_video_sources.mjs ../dev/ui/test_prompt_mentions.mjs ../dev/ui/test_theme.mjs",
+    "format": "prettier --write \"src/**/*.{vue,js,css}\" index.html vite.config.js",
+    "format:check": "prettier --check \"src/**/*.{vue,js,css}\" index.html vite.config.js",
+    "browser:install": "playwright install chromium",
+    "test:browser": "node ../dev/ui/test_studio_browser.mjs"
   },
   "dependencies": {
     "vue": "^3.5.42"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.8",
+    "playwright": "^1.63.0",
+    "prettier": "^3.9.9",
     "vite": "^8.3.0"
   }
 }

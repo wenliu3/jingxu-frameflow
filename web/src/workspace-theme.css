@@ -1,0 +1,94 @@
+/* Shared by the whole project workspace and its teleported material dialogs. */
+.workspace-theme {
+  color-scheme: var(--app-color-scheme, dark);
+  --bg: var(--day-canvas, #16171d);
+  --surface: var(--day-panel, #21222a);
+  --surface-2: var(--day-inset, #292a35);
+  --surface-3: var(--day-hover, #191a22);
+  --line: var(--day-line, #353743);
+  --line-soft: var(--day-line-soft, #2e303b);
+  --fg: var(--day-text, #e3e4ed);
+  --fg-2: var(--day-muted, #a6a9bc);
+  --fg-3: var(--day-faint, #9298ad);
+  --accent: var(--day-accent, #baa2f5);
+  --accent-hover: var(--day-accent, #d0bcff);
+  --accent-ink: var(--day-on-accent, #211a30);
+  --accent-dim: var(--day-accent-soft, #342a44);
+  --mint: var(--day-mint, #99bea9);
+  --mint-dim: var(--day-mint-soft, #243b33);
+  --danger: var(--day-danger, #e5a094);
+  --danger-dim: var(--day-danger-soft, #402b2a);
+  --warn: var(--day-warn, #dfbf89);
+  --warn-dim: var(--day-warn-soft, #3a3225);
+  color: var(--fg);
+}
+.workspace-theme button:hover:not(:disabled),
+.workspace-theme input:hover,
+.workspace-theme select:hover,
+.workspace-theme textarea:hover {
+  border-color: var(--day-line, #56616c);
+}
+.workspace-theme button.primary:hover:not(:disabled) {
+  border-color: var(--accent-hover);
+}
+.workspace-theme ::selection {
+  background: var(--day-accent-soft, #695183);
+  color: var(--day-text, #f5ecff);
+}
+.workspace-theme ::-webkit-scrollbar-thumb {
+  background: var(--day-line, #46515c);
+}
+.workspace-theme .tag {
+  border-color: var(--line);
+}
+.workspace-theme .tag.mint {
+  border-color: var(--day-mint-line, #3d5b4e);
+}
+.workspace-theme .tag.accent {
+  border-color: var(--day-accent-line, #71513d);
+}
+.workspace-theme .tag.warn {
+  border-color: var(--day-warn-line, #66563b);
+}
+.workspace-theme .tag.danger {
+  border-color: var(--day-danger-line, #75504b);
+}
+.workspace-theme.workspace-shell .main .topbar {
+  background: var(--day-panel, #1b1c23);
+  border-bottom-color: var(--day-line, #343541);
+}
+.workspace-theme.workspace-shell .main .settings-button {
+  color: var(--day-muted, #b8afc9);
+  border-color: var(--day-accent-line, #45404f);
+}
+.workspace-theme.workspace-shell .rail.dark {
+  --rail-bg: var(--day-inset, #1b1b22);
+  --rail-surface: var(--day-panel, #2a2936);
+  --rail-muted: var(--day-muted, #a3a3b6);
+  --rail-line: var(--day-line, #343440);
+  --rail-accent: var(--day-accent, #b99af5);
+}
+.workspace-theme .rail.compact .new-project {
+  background: var(--day-accent, #b99af5);
+  border-color: var(--day-accent-line, #b99af5);
+  color: var(--day-on-accent, #211a30);
+}
+.workspace-theme.workspace-shell .main .workspace-tabs.dark button.on {
+  color: var(--day-accent, #d3bcff);
+  border-color: var(--day-accent-line, #5a496e);
+  background: var(--day-accent-soft, #b99af516);
+}
+.workspace-theme.workspace-shell .main .workspace-tabs.dark button {
+  color: var(--day-muted, #a2a4b7);
+}
+.workspace-theme .canvas-content {
+  padding: 0 !important;
+}
+.workspace-theme .canvas-content .workflow-editor {
+  border: 0;
+  border-radius: 0;
+}
+.workspace-theme .collection-cover,
+.workspace-theme .collection-search input {
+  background: var(--day-inset, #1b1c25);
+}

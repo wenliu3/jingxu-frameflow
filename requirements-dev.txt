@@ -1,0 +1,3 @@
+-r requirements.txt
+# FastAPI TestClient used by offline API regression tests.
+httpx>=0.27

@@ -1,5 +1,9 @@
-import { createApp } from 'vue'
-import './style.css'
-import App from './App.vue'
+import { createApp } from 'vue';
+import './style.css';
+import './workspace-theme.css';
+import './theme.css';
+import { applyTheme, readTheme } from './theme.js';
+import App from './App.vue';
 
-createApp(App).mount('#app')
+applyTheme(readTheme());
+createApp(App).mount('#app');

@@ -1,0 +1,75 @@
+/* Components keep their original night colors as variable fallbacks. These
+   shared day tokens also reach dialogs and previews teleported to body. */
+html[data-theme='light'] {
+  --app-color-scheme: light;
+  --day-canvas: #f6f5fa;
+  --day-panel: #ffffff;
+  --day-inset: #f0eef5;
+  --day-hover: #ece8f3;
+  --day-line: #d7d1e2;
+  --day-line-soft: #e8e3ef;
+  --day-grid: #d9d2e6;
+  --day-hero: #f6f5fae8;
+  --day-hero-fade: #f6f5fa33;
+  --day-text: #302a3b;
+  --day-muted: #645d70;
+  --day-faint: #70677d;
+  --day-accent: #7450b0;
+  --day-accent-line: #b79ddc;
+  --day-accent-soft: #efe8fa;
+  --day-on-accent: #ffffff;
+  --day-mint: #2d745d;
+  --day-mint-line: #86b5a2;
+  --day-mint-soft: #e8f4ee;
+  --day-danger: #a64139;
+  --day-danger-line: #cf928b;
+  --day-danger-soft: #fff0ed;
+  --day-warn: #805819;
+  --day-warn-line: #c4a56b;
+  --day-warn-soft: #faf1dd;
+  --day-shadow: #2c18471a;
+  --day-backdrop: #24173559;
+  --bg: var(--day-canvas);
+  --surface: var(--day-panel);
+  --surface-2: var(--day-inset);
+  --surface-3: var(--day-hover);
+  --line: var(--day-line);
+  --line-soft: var(--day-line-soft);
+  --fg: var(--day-text);
+  --fg-2: var(--day-muted);
+  --fg-3: var(--day-faint);
+  --accent: var(--day-accent);
+  --accent-hover: #644098;
+  --accent-ink: var(--day-on-accent);
+  --accent-dim: var(--day-accent-soft);
+  --mint: var(--day-mint);
+  --mint-dim: var(--day-mint-soft);
+  --danger: var(--day-danger);
+  --danger-dim: var(--day-danger-soft);
+  --warn: var(--day-warn);
+  --warn-dim: var(--day-warn-soft);
+  color-scheme: light;
+}
+html[data-theme='dark'] {
+  --app-color-scheme: dark;
+  --bg: #16171d;
+  --surface: #21222a;
+  --surface-2: #292a35;
+  --surface-3: #191a22;
+  --line: #353743;
+  --line-soft: #2e303b;
+  --fg: #e3e4ed;
+  --fg-2: #a6a9bc;
+  --fg-3: #9298ad;
+  --accent: #baa2f5;
+  --accent-hover: #d0bcff;
+  --accent-ink: #211a30;
+  --accent-dim: #342a44;
+  --mint: #99bea9;
+  --mint-dim: #243b33;
+  --danger: #e5a094;
+  --danger-dim: #402b2a;
+  --warn: #dfbf89;
+  --warn-dim: #3a3225;
+  color-scheme: dark;
+}

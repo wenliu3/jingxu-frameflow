@@ -25,9 +25,30 @@ import os
 import random
 import time
 import uuid
+import tempfile
 from base64 import b64encode
 
 import requests
+from video_controls import h3_frames, publish_video
+from h3_prompt_policy import prompt_for_reference_images
+
+
+def _save_video_stream(response, out_path):
+    """Publish only a complete download; failed/empty streams stay out of records."""
+    parent = os.path.dirname(out_path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".video-", suffix=".part", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            for chunk in response.iter_content(chunk_size=1 << 16):
+                if chunk:
+                    fh.write(chunk)
+        if os.path.getsize(temporary) == 0:
+            raise RuntimeError("视频服务返回了空文件，请检查远端生成结果")
+        os.replace(temporary, out_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 class ApiVideoProvider:
@@ -68,6 +89,9 @@ class ApiVideoProvider:
         last_frame_path: str = "",
         megapixels: float | None = None,
         ref_image_paths: list[str] | None = None,
+        *, width: int | None = None, height: int | None = None,
+        seed: int | None = None, generate_audio: bool = True, exact_duration: bool = False,
+        ref_video_paths: list[str] | None = None, guide_frame_path: str = "",
     ) -> str:
         """签名必须与 ComfyUIVideoProvider 对齐——server 侧（_run_video_job / _run_batch）
         统一按 generate(..., audio=..., last_frame_path=...) 调用，少一个参数就是 TypeError，
@@ -81,6 +105,9 @@ class ApiVideoProvider:
         audio 用自然语言拼进去，不套 H3 的三段式字段名——面板里填的模型可能是
         Hailuo-02 之类非 H3 模型，字段名是 H3 专有的，硬套反而干扰。
         """
+        self.last_output_info = {}
+        if ref_video_paths or guide_frame_path:
+            raise ValueError("当前视频 API 不支持视频参考或续拍")
         with open(image_path, "rb") as fh:
             data_uri = "data:image/png;base64," + b64encode(fh.read()).decode()
         headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
@@ -123,10 +150,13 @@ class ApiVideoProvider:
                 os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
                 with requests.get(url, stream=True, timeout=300) as dl:
                     dl.raise_for_status()
-                    with open(out_path, "wb") as fh:
-                        for chunk in dl.iter_content(chunk_size=1 << 16):
-                            if chunk:
-                                fh.write(chunk)
+                    if generate_audio:
+                        _save_video_stream(dl, out_path)
+                    else:
+                        with tempfile.TemporaryDirectory(prefix=".api-video-", dir=os.path.dirname(out_path) or ".") as folder:
+                            raw_path = os.path.join(folder, "raw.mp4")
+                            _save_video_stream(dl, raw_path)
+                            self.last_output_info = publish_video(raw_path, out_path, generate_audio=False)
                 return out_path
         raise TimeoutError(f"外接 API 视频生成超时（{self.timeout:.0f}s），requestId={request_id}")
 
@@ -203,6 +233,8 @@ class ComfyUIVideoProvider:
         workflow_path: str | None = None,
         poll_interval: float = 10.0,
         timeout_per_shot: float = 3600.0,
+        *, megapixels: float | None = None, steps: int | None = None,
+        lora: str | None = None,
     ) -> None:
         # ⚠️ 超时别按"看起来够用"给。2026-09-19 实测：H3 跑一条 **10 秒**的片，
         #    从 execution_start 到 execution_success 是 **1868 秒（31 分钟）**，
@@ -232,6 +264,11 @@ class ComfyUIVideoProvider:
         self.client_id = "avm_" + uuid.uuid4().hex[:8]
         self.poll_interval = poll_interval
         self.timeout = timeout_per_shot
+        # Capture settings once. Editing service defaults while a job uploads
+        # images must not change that job's workflow or recorded parameters.
+        self.megapixels = float(megapixels if megapixels is not None else os.getenv("H3_MEGAPIXELS", "0.9"))
+        self.steps = int(steps if steps is not None else os.getenv("H3_STEPS", "8"))
+        self.lora = str(lora if lora is not None else os.getenv("H3_LORA", "")).strip()
 
     # 轮询时能容忍的**连续**失败次数（poll_interval 默认 10 秒 → 约 5 分钟）。
     # 覆盖隧道断线重连、ComfyUI 短暂卡住；真断了就如实报错，不无限等。
@@ -248,6 +285,9 @@ class ComfyUIVideoProvider:
         last_frame_path: str = "",
         megapixels: float | None = None,
         ref_image_paths: list[str] | None = None,
+        *, width: int | None = None, height: int | None = None,
+        seed: int | None = None, generate_audio: bool = True, exact_duration: bool = False,
+        ref_video_paths: list[str] | None = None, guide_frame_path: str = "",
     ) -> str:
         """生成一条视频并落盘，返回 out_path。阻塞直到完成或超时。
 
@@ -260,18 +300,34 @@ class ComfyUIVideoProvider:
         ref_image_paths（2026-09-19 加）是**多张参考图**，只有走 Ref2VA 工作流时才有意义：
         I2V 那份只有一个 `first_frame` 口，传了也只能用上第一张。见 _build_workflow。
         """
-        image_name = self._upload(image_path)
+        self.last_output_info = {}
+        if ref_video_paths or guide_frame_path:
+            self._preflight_video_inputs(bool(ref_video_paths), bool(guide_frame_path))
+        images = ref_image_paths if ref_image_paths is not None else [image_path]
+        image_name = self._upload(images[0]) if images else ""
         last_frame_name = self._upload(last_frame_path) if last_frame_path else ""
-        # 第 1 张参考图就是 image_path 本身，别再传一遍；这里只补第 2 张起
-        extra_refs = [self._upload(p) for p in (ref_image_paths or [])[1:] if p]
+        extra_refs = [self._upload(p) for p in images[1:] if p]
+        video_names = [self._upload(p) for p in (ref_video_paths or [])]
+        guide_name = self._upload(guide_frame_path) if guide_frame_path else ""
+        dimension_image_name = (guide_name if guide_frame_path == image_path else self._upload(image_path)) if not images else ""
         workflow = self._build_workflow(
-            video_prompt, duration, image_name, audio, last_frame_name, megapixels, extra_refs
+            video_prompt, duration, image_name, audio, last_frame_name, megapixels, extra_refs,
+            width=width, height=height, seed=seed, generate_audio=generate_audio,
+            video_names=video_names, guide_name=guide_name, dimension_image_name=dimension_image_name,
         )
         # 缺模型文件要**在提交前**就说清楚（哪条工作流都一样 —— 见 _preflight_models 的注释）
         self._preflight_models(workflow)
         prompt_id = self._submit(workflow)
         filename, subfolder = self._wait(prompt_id)
-        self._download(filename, subfolder, out_path)
+        if width or height or exact_duration or not generate_audio:
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".comfy-video-", dir=os.path.dirname(out_path) or ".") as folder:
+                raw_path = os.path.join(folder, "raw.mp4")
+                self._download(filename, subfolder, raw_path)
+                self.last_output_info = publish_video(raw_path, out_path, width=width, height=height,
+                                                     duration=duration if exact_duration else None, generate_audio=generate_audio)
+        else:
+            self._download(filename, subfolder, out_path)
         return out_path
 
     # ---- 四步协议 ----
@@ -350,6 +406,24 @@ class ComfyUIVideoProvider:
               "在本机项目根跑 python dev/tools/check_comfyui_models.py。"
         )
 
+    def _preflight_video_inputs(self, videos: bool, guide: bool) -> None:
+        required = {"MiniMaxH3ReferenceToVideo": {"ref_videos"} if videos else set()}
+        if videos:
+            required.update(LoadVideo={"file"}, GetVideoComponents={"video"})
+        if guide:
+            required["MiniMaxH3AddGuide"] = {"positive", "latent", "image", "frame_idx", "vae"}
+        for name, fields in required.items():
+            try:
+                response = requests.get(f"{self.base}/object_info/{name}", timeout=20)
+                response.raise_for_status()
+                schema = response.json().get(name)
+            except (requests.RequestException, ValueError) as exc:
+                raise RuntimeError("无法确认 ComfyUI 的视频参考能力，请启动实例并检查连接") from exc
+            inputs = (schema or {}).get("input", {})
+            present = {key for group in inputs.values() if isinstance(group, dict) for key in group}
+            if not schema or any(not any(key == field or key.startswith(field + ".") for key in present) for field in fields):
+                raise RuntimeError(f"ComfyUI 缺少视频参考所需节点或输入：{name}，请更新 ComfyUI 后重试")
+
     def _upload(self, image_path: str) -> str:
         with open(image_path, "rb") as fh:
             resp = requests.post(
@@ -374,6 +448,9 @@ class ComfyUIVideoProvider:
         last_frame_name: str = "",
         megapixels: float | None = None,
         extra_refs: list[str] | None = None,
+        *, width: int | None = None, height: int | None = None,
+        seed: int | None = None, generate_audio: bool = True,
+        video_names: list[str] | None = None, guide_name: str = "", dimension_image_name: str = "",
     ) -> dict:
         wf = json.loads(json.dumps(self.template))  # 深拷贝
 
@@ -401,13 +478,34 @@ class ComfyUIVideoProvider:
         first_id = str(link[0]) if isinstance(link, list) and len(link) == 2 else "100"
         if first_id not in wf:
             first_id = "100"
-        wf[first_id]["inputs"]["image"] = image_name
-        h3["inputs"][first_slot] = [first_id, 0]
+        if (video_names or guide_name) and not is_ref2va:
+            raise ValueError("视频参考和续拍只支持 Ref2VA")
+        if len(video_names or []) > 3 or int(bool(image_name)) + len(extra_refs or []) > 9:
+            raise ValueError("Ref2VA 最多接受九张图片和三个视频")
+        def allocate(prefix):
+            number = 0
+            while f"avm_{prefix}_{number}" in wf:
+                number += 1
+            return f"avm_{prefix}_{number}"
+        if is_ref2va:
+            for key in list(h3["inputs"]):
+                if key.startswith(("ref_images.", "ref_videos.", "ref_video_audios.", "ref_audios.")):
+                    del h3["inputs"][key]
+        if image_name:
+            if first_id not in wf or wf[first_id].get("class_type") != "LoadImage":
+                first_id = allocate("image")
+                wf[first_id] = {"class_type": "LoadImage", "inputs": {}}
+            wf[first_id]["inputs"]["image"] = image_name
+            h3["inputs"][first_slot] = [first_id, 0]
+        elif not is_ref2va:
+            raise ValueError("当前工作流需要首帧图片")
+        elif dimension_image_name and first_id in wf:
+            # The size branch may still read LoadImage; it is not a semantic reference.
+            wf[first_id]["inputs"]["image"] = dimension_image_name
 
         # 帧数：时长 ×24fps，就近吸附到 ≡5 (mod 17) 的网格（H3 的帧数约束）。
         # 就近而不是向上：向上吸附会把 4.5s 的请求吞成 5.17s，时长设定失真。
-        frames = max(5, round(duration * 24))
-        frames = max(5, 17 * round((frames - 5) / 17) + 5)
+        frames = h3_frames(duration)
         h3["inputs"]["length"] = frames
         # ⚠️ 2026-09-19 修：**Ref2VA 的提示词不能再套基础模式的壳**。
         # 官方两套格式是并列的（见 skills/h3-prompt-writing/references/）：
@@ -420,12 +518,13 @@ class ComfyUIVideoProvider:
         # 一个字段里，前面还多了一行只对关键帧模式成立的对齐指令 —— 模型收到的是一份"畸形"
         # 提示词：六个章节降级成一个字段、<Subject N> 标签在没有声明的地方被引用。
         prompt_text = video_prompt.strip()
-        if is_ref2va and "subject_definitions:" in prompt_text:
-            h3["inputs"]["prompt"] = prompt_text
+        if is_ref2va:
+            h3["inputs"]["prompt"] = prompt_for_reference_images(
+                prompt_text, duration, int(bool(image_name)) + len(extra_refs or []), audio,
+                video_count=len(video_names or []), has_guide=bool(guide_name),
+            )
         else:
-            # 基础模式（含"Ref2VA 工作流但提示词还是基础格式"的兜底）：拼三段 + 对齐指令。
-            # Ref2VA 没有尾帧概念，所以那里的对齐指令按"只有首帧"写。
-            # 传进来的是六段式时只取正文（见 _base_body 的注释）。
+            # 基础模式：拼三段与关键帧对齐指令。
             h3["inputs"]["prompt"] = compose_h3_prompt(
                 _base_body(video_prompt), audio, frames,
                 bool(last_frame_name) and not is_ref2va,
@@ -438,6 +537,8 @@ class ComfyUIVideoProvider:
             # ComfyUI 的输入校验（老代码里 last_frame 也是这个套路）。
             for i, name in enumerate(extra_refs or [], start=1):
                 nid = str(900 + i)
+                if nid in wf:
+                    nid = allocate("image")
                 wf[nid] = {"class_type": "LoadImage", "inputs": {"image": name}}
                 h3["inputs"][f"ref_images.ref_image_{i}"] = [nid, 0]
         elif last_frame_name:
@@ -448,15 +549,53 @@ class ComfyUIVideoProvider:
             }
             h3["inputs"]["last_frame"] = ["101", 0]
 
-        wf["15"]["inputs"]["noise_seed"] = random.randint(0, 2**31)
-        # 画质/速度旋钮。megapixels 由调用方（前端「清晰度」档位）优先，
-        # 没给才落回环境变量——档位是按条选的，不该改一次就影响全局。
+        if is_ref2va:
+            for index, name in enumerate(video_names or []):
+                loader = allocate("video")
+                wf[loader] = {"class_type": "LoadVideo", "inputs": {"file": name}}
+                components = allocate("components")
+                wf[components] = {"class_type": "GetVideoComponents", "inputs": {"video": [loader, 0]}}
+                h3["inputs"][f"ref_videos.ref_video_{index}"] = [components, 0]
+            if guide_name:
+                if not h3["inputs"].get("vae"):
+                    raise ValueError("续拍工作流需要给 Ref2VA 和引导节点连接视觉 VAE")
+                loader = allocate("tail")
+                wf[loader] = {"class_type": "LoadImage", "inputs": {"image": guide_name}}
+                guide = allocate("guide")
+                consumers = [(node, key) for node in wf.values() for key, value in node.get("inputs", {}).items() if value == [h3_id, 0]]
+                if not consumers:
+                    raise ValueError("Ref2VA 的正向条件未连接，无法添加续拍引导")
+                wf[guide] = {"class_type": "MiniMaxH3AddGuide", "inputs": {"positive": [h3_id, 0], "latent": [h3_id, 1],
+                    "vae": h3["inputs"]["vae"], "image": [loader, 0], "frame_idx": 0}}
+                for node, key in consumers:
+                    node["inputs"][key] = [guide, 0]
+
+        wf["15"]["inputs"]["noise_seed"] = seed if seed is not None else random.randint(0, 2**31)
+        if width and height:
+            # H3 latent dimensions follow the workflow's 32-pixel grid. Final publishing
+            # restores the requested even dimensions (e.g. 1280x720).
+            model_width, model_height = max(64, round(width / 32) * 32), max(64, round(height / 32) * 32)
+            h3["inputs"]["width"] = model_width
+            h3["inputs"]["height"] = model_height
+            # Crop the actual first/tail frame to the same framing, rather than distort it.
+            if not is_ref2va:
+                for slot in ("first_frame", "last_frame"):
+                    if slot not in h3["inputs"]:
+                        continue
+                    nid = f"avm_scale_{slot}"
+                    wf[nid] = {"class_type": "ImageScale", "inputs": {"image": h3["inputs"][slot], "width": model_width, "height": model_height, "upscale_method": "lanczos", "crop": "center"}}
+                    h3["inputs"][slot] = [nid, 0]
+        if not generate_audio:
+            for value in wf.values():
+                if value.get("class_type") == "CreateVideo":
+                    value["inputs"].pop("audio", None)
+        # 单镜像素预算优先，否则使用构造时固定的服务默认值。
         wf["119"]["inputs"]["megapixels"] = (
-            float(megapixels) if megapixels else float(os.getenv("H3_MEGAPIXELS", "0.9"))
+            float(megapixels) if megapixels is not None else self.megapixels
         )
-        steps = int(os.getenv("H3_STEPS", "8"))
+        steps = self.steps
         wf["9"]["inputs"]["steps"] = steps
-        lora_name = os.getenv("H3_LORA", "").strip()
+        lora_name = self.lora
         if lora_name:
             # turbo LoRA 蒸馏档：8 步左右出片
             wf["121"]["inputs"]["lora_name"] = lora_name
@@ -577,14 +716,11 @@ class ComfyUIVideoProvider:
         parent = os.path.dirname(out_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        resp = requests.get(
+        with requests.get(
             f"{self.base}/view",
             params={"filename": filename, "subfolder": subfolder, "type": "output"},
             stream=True,
             timeout=300,
-        )
-        resp.raise_for_status()
-        with open(out_path, "wb") as fh:
-            for chunk in resp.iter_content(chunk_size=1 << 16):
-                if chunk:
-                    fh.write(chunk)
+        ) as resp:
+            resp.raise_for_status()
+            _save_video_stream(resp, out_path)

@@ -199,15 +199,15 @@ check("Ref2VA：不再多套基础模式的壳",
       prompt6[:200])
 check("Ref2VA：不再插「关键帧对齐指令」（它没有关键帧）",
       "fully referenced" not in prompt6 and "aligns with the" not in prompt6)
-# 兜底：r2v 上来了个**基础格式**（旧分镜链路，正文没有 subject_definitions）→ 仍按三段拼
+# 旧调用只给正文时，Ref2VA 也必须组装六段式，不再套基础模式外壳。
 BASE = "[Shot 1] Live-action, a medium shot frames a woman opening a door."
 pbase = provider(R2V)._build_workflow(BASE, 10.0, "a.png")
 check("六段式误用在基础模式时只取 detailed_description 正文",
       "subject_definitions" not in vp._base_body(SIX)
       and vp._base_body(SIX).startswith("[Shot 1]"), vp._base_body(SIX)[:60])
-check("基础格式的提示词仍走三段 + 对齐指令",
-      "fully referenced" in pbase["104"]["inputs"]["prompt"]
-      and "integrated_multimodal_description" in pbase["104"]["inputs"]["prompt"],
+check("Ref2VA 的旧正文自动组装六段式且无关键帧对齐指令",
+      "subject_definitions:" in pbase["104"]["inputs"]["prompt"]
+      and "integrated_multimodal_description" not in pbase["104"]["inputs"]["prompt"],
       pbase["104"]["inputs"]["prompt"][:70])
 
 # ---------- 5) 模型文件与签名 ----------

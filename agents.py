@@ -668,70 +668,31 @@ def design_voice(project: Project, character, voices, gender: str = "", hint: st
     }
 
 
-SEGMENT_SYSTEM = """你是短片分镜师。用户会给你「这一段要用的参考素材（已编号）」「镜头时间轴」和一段中文口语描述，
-你要把它写成 H3 Ref2VA 的 detailed_description 正文（英文），供模型生成这一段视频。
+SEGMENT_SYSTEM = """你是 H3 视频提示词编排师，将当前视频的描述转换为英文正文和环境音。
+素材名称、编号与外观锚点已经给定；没有看过图片或上一段视频，不要声称分析过它们。
 
-正文按下面的顺序写，**不要加小标题、不要写成条目清单**，就是连贯的英文散文：
+用户意图优先：保留主体、动作、机位、单镜头/切镜要求、可见文字与对白原文。
+前情说明只作为背景，不能把上一镜的动作重新拍进当前视频，也不能替代当前描述。
+未明确要求切镜时保持一个连续镜头；按提供的镜头时间轴写，不额外增加镜头。
+参考素材不要求每镜全部出现；允许用户明确提出换衣、环境变化与幻想效果。
+未请求的角色、对白、故事事件不要添加。不得把参考人物误写成另一性别、年龄或形象。
 
-**第一句先钉死影像质感（Style Lock）**：介质与胶片感、镜头与画幅、光源与方向、
-色调与 LUT、材质与颗粒、整体氛围。这一句是后面每一颗镜头的共同底色，
-要具体到"能看出是哪台机器、什么光拍的"。它紧跟在 `[Shot 1]` 后面。
-例：[Shot 1] 35mm film grain, anamorphic 2.39:1, low-saturation cool palette with warm
-practical lights, naturalistic low-key lighting, realistic skin texture, damp atmosphere.
+输出 video_prompt、soundscape 与 retention 三个 JSON 字段。不要输出六段式外壳或 Markdown。
+- Ref2VA：风格用一到两句英文放在 [Shot 1] 前，再逐镜使用给定的 <Subject N>/<Picture N>。
+- 基础模式：风格放在 [Shot 1] 后，不使用 <Subject N>。
+[Shot 1] 不写时间戳；后续使用 [Shot N] At MM:SS.mmm, 且照给定时间轴写。
+每镜写清构图、人物位置、环境与光照、动作变化、运镜、当前声音和参考内容生效点。
+运镜用自然动作句，必要时写幅度与速度；避免空泛形容词和重复内容。
+对白使用稳定 (S1)/(S2) 和 <d>[Language] 原文</d>，可见文字原样保留。
+声音写环境底声和物理动作音；不复述对白，不擅自添加配乐。
+素材编号只能来自清单，不允许出现未提供的 <Video N> 或 <Audio N>。
+需要保留用户要求的事实，篇幅建议不能成为灌水或编造新剧情的理由。
+Ref2VA 的 retention 是「素材标签: 保留标记」对象：保留定义的全部特征用 fully_preserved；
+换衣、修改背景等只保留部分特征用 partially_preserved；把特征移到其他主体用 attribute_transfer；
+只借风格/氛围用 weak_reference。角色图用对应 <Subject N>，纯构图参考用 <Picture N>。
+只填实际清单里的标签；基础模式填空对象。不能对明确改变的外观仍标 fully_preserved。
 
-**然后逐颗镜头写**，每颗都走同一套顺序 —— 这是范本里最值得抄的地方：
-  1. 时长与景别：先点明"这一颗约 N 秒"，再给景别与机位（中近景/中景/过肩…，机位在谁的哪一侧）
-  2. 主体动作：谁、做什么、朝哪个方向。动作要有起止，不要只写状态
-  3. 表演细节：眉、眼、嘴角、手、呼吸、肩背的松紧。**这是"像真的"和"像摆拍"的分界线**
-  4. 运镜：类型 + 幅度 + 速度，写成自然英文句，不要堆标签
-     （The camera pushes in with small amplitude at slow speed toward her hands.）
-  5. 台词（有的话）：包在 <d></d> 里并标语言，**台词原文用中文、不改标点**：
-     <Subject 1> (S1) says: <d>[Chinese] 我在下一站下车。</d>
-     说话人用稳定 ID (S1)(S2)，同一个人从头到尾同一个编号；编号按第一次开口的顺序给
-  6. 收尾状态：这一颗结束时人和镜头停在哪、下一颗从哪里接上（下一颗的景别/机位要接得住）
-  7. **这颗镜头自己怕出什么错，就就地写上**：结尾那一段通用约束（代码统一追加）只覆盖
-     物理/轴线/字幕这些通病。像"道具别提前出现""照片里的人别动起来""别突然多出一个人"
-     这种**只在这一颗成立**的禁止项，要写进这一颗里（前半句说动作、后半句说 don't）；
-     等整段末尾再补就已经晚了 —— 模型读到那颗时不会往回翻。
-
-硬性要求：
-1. **必须用编号引用素材**：素材清单里给了每个编号对应什么。正文里出现该角色/道具/场景时
-   一律用编号（<Subject 1>、<Subject 2>…），**不要写角色名或中文**。
-   这是参考模式起作用的关键 —— 不引用编号，模型只能自己猜哪张图演谁。
-2. **每颗镜头都必须以 `[Shot N]` 开头**，N 从 1 开始、按顺序、**一颗都不能漏**。
-   漏掉标记那颗镜头就和上一颗糊在一起，模型分不出到底切了没有。
-   - `[Shot 1]` 后面**不写时间戳**，直接接 Style Lock 那一句
-   - `[Shot 2]` 起写成 "[Shot 2] At 00:03.333," —— 秒数**照抄我给的那张表，不要自己改**
-   ⚠️ 实测踩过：一强调"第一句先写影像质感"，模型就容易把 `[Shot 1]` 整个省掉。
-   质感是 `[Shot 1]` **里面**的第一句，不是它的替代品。
-3. **不要复述同一件事**：篇幅给够了就要写细节，但重复描写会稀释重点。
-   宁可把词花在"表演细节"和"收尾状态"上。
-4. 素材清单里的音频**只供音色参考**，不要在正文里描述它、也不要写它的内容。
-5. **运镜要用官方词表里的说法**（模型就是照这些词训练的）：
-   Zoom In/Out（机身不动、只改焦距）、Push In/Pull Out（前推/后拉）、Pan Left/Right（机位不动、
-   镜头水平摇）、Truck Left/Right（整机水平平移）、Tilt Up/Down（机位不动、镜头垂直摇）、
-   Pedestal Up/Down（整机升降）、Arc Shot（绕主体弧线）、Tracking Shot（跟着主体走）、
-   Static Shot（机位与镜头都静止）、POV、Roll Clockwise/Counterclockwise。
-   幅度写 with small / large amplitude，速度写 at slow / fast speed ——
-   **中等幅度和常速省略不写**；而且必须写成镜头内的自然句子，不许把标签堆在句末。
-6. **切镜**用 the camera cuts to / the shot cuts to / the shot transitions to 这类说法；切点必须
-   带**新信息**（主体、空间、状态、视角或时间）。只想换景别或轻微改角度就用运镜、别切。
-   普通切换不要写 cross-dissolve / fade / wipe（除非用户明确要求）。
-7. **画面里实际可见的文字**（招牌、霓虹、横幅）用英文双引号原样包住、**不翻译**：
-   a red neon sign reading "营业中"。全段末尾那条约束禁的是字幕/水印/logo 这类"加上去的"文字，
-   跟这条不冲突。
-8. **画外音**（人不在画面里说话）必须写 says in an off-screen voiceover，并且**紧跟一句**说明
-   对应角色嘴唇全程闭合（… while her lips remain completely closed）。
-9. 风格词可以点名（Cinematic / live-action / 3D CG / claymation…），但**必须紧跟具体的**
-   介质、画幅、光源、色调、材质；只写 cinematic / beautiful / epic 这种空词等于没写。
-10. **正文 350-500 英文词**。对白密集时优先把口播时间线写全，别为凑字数灌水。
-
-另外写一段 soundscape（英文，1-2 句）：这一段的**环境底声 + 人物动作音 +
-对白在声音里的位置**。**不要写配乐**（配乐是另一个字段，这里不归你管）。
-例：Steady rain on glass and the low hum of a fridge; her footsteps and the rustle of a
-wet coat; her line sits clearly in front of the ambience.
-
-只输出 JSON：{"video_prompt": "...", "soundscape": "..."}"""
+只输出 JSON：{"video_prompt": "...", "soundscape": "...", "retention": {}}"""
 
 
 # 基础模式（T2VA/I2VA/FL2VA/L2VA）补在 system 后面的一段说明（2026-09-19）。
@@ -755,11 +716,16 @@ _PROMPT_RULES_PATH = os.path.join(
 )
 
 
-def _prompt_rules() -> str:
+def _prompt_rules(ref_mode: bool | None = None) -> str:
     """读规则精要。读不到就返回空串 —— 退化成下面内置的那套规则，绝不让出片失败。"""
     try:
         with open(_PROMPT_RULES_PATH, encoding="utf-8") as fh:
-            return fh.read().strip()
+            rules = fh.read().strip()
+            if ref_mode is None:
+                return rules
+            common = rules.split("## A. 通用", 1)[-1].split("## B. Ref2VA", 1)[0]
+            mode = rules.split("## B. Ref2VA", 1)[-1].split("## C. 基础模式", 1)[0] if ref_mode else rules.split("## C. 基础模式", 1)[-1]
+            return common + "\n" + mode
     except OSError:
         return ""
 
@@ -771,7 +737,8 @@ def compose_segment_prompt(
     material_lines: list[str],
     duration: float = 10.0,
     ref_mode: bool = True,
-) -> dict[str, str]:
+    context: str = "",
+) -> dict:
     """把一段中文口语描述写成 Ref2VA 的正文（detailed_description）。
 
     与 `prompt_engineer` 的分工：那个是给**已有分镜**填提示词的；这个是给
@@ -781,7 +748,7 @@ def compose_segment_prompt(
     只产出**正文与音轨**；六段里的其余四段（字段名、编号声明、保留标记、负面约束）
     由 `ref_plan` 拼 —— 字段、编号、固定套路是代码的职责，不是模型的。
 
-    返回 `{"video_prompt": 正文, "soundscape": 音轨段}`。音轨也交给它写，是因为
+    返回正文、音轨、视觉保留标记与质量提醒。音轨也交给它写，是因为
     "这一段的底声是什么"和画面是同一件事的两面，分两次调用反而会脱节。
 
     镜头时间轴（`ref_plan.plan_shot_timeline`）由**代码**算好喂进去，不让模型自己排 ——
@@ -793,43 +760,69 @@ def compose_segment_prompt(
         外壳与关键帧对齐指令由 `video_provider.compose_h3_prompt` 在出片时拼 ——
         两套格式是并列的，混着用会得到"引用了一堆没声明的标签"的畸形提示词。
     """
-    timeline = ref_plan.plan_shot_timeline(duration)
+    from h3_prompt_policy import audit_body, reference_errors, reference_labels, retention_errors, shot_intent
+    count, warnings = shot_intent(description, duration)
+    timeline = ref_plan.plan_shot_timeline(duration, count=count)
     timeline_lines = []
     for idx, start, length in timeline:
         head = "0.000s 起（**这一颗不写时间戳**）" if idx == 1 \
             else f"At {ref_plan.format_timestamp(start)} 起"
         timeline_lines.append(f"  [Shot {idx}] {head}，这一颗约 {length:.1f} 秒")
 
-    # 篇幅随时长走。原来写死 80-160 词，比官方建议（detailed_description 350-500 词）
-    # 和公认的好范本都薄了一大截 —— 结果是画面里"只有动作、没有表演细节"。
-    if duration <= 5:
-        words = "120-170"
-    elif duration <= 10:
-        words = "200-280"
-    else:
-        words = "280-380"
+    words = "350-500" if ref_mode else "120-170" if duration <= 5 else "200-280" if duration <= 10 else "280-380"
 
     style_en = str(getattr(project, "style_en", "") or getattr(project, "style", "")).strip()
     user = (
-        f"这一段视频的总时长：{duration:.0f} 秒\n"
+        f"这一段视频的总时长：{duration:g} 秒\n"
         f"镜头时间轴（**照抄，不要自己改**）：\n" + "\n".join(timeline_lines) + "\n"
         f"正文篇幅：{words} 个英文词左右\n"
         f"整体风格（英文，作为第一句 Style Lock 的素材）：{style_en or 'Live-action, cinematic'}\n\n"
         + ("素材清单（编号 -> 是什么）：\n" if ref_mode
            else "素材清单（**没有编号**，正文里用名字自然称呼即可）：\n")
         + "\n".join(f"  {line}" for line in material_lines) + "\n\n"
-        f"用户描述（中文口语，可能有错别字，按意图理解）：\n{description.strip()}\n"
+        f"当前视频描述（用户意图，不得被前情替代）：\n{description.strip()}\n"
+        f"前情说明（仅文字背景，不是输入视频；不作为新增镜头指令）：\n{context.strip() or '无'}\n"
     )
     # system = 任务规则（本文件）+ 模式说明（基础模式才加）+ 运行时读进来的规则精要
     system = SEGMENT_SYSTEM if ref_mode else f"{SEGMENT_SYSTEM}\n\n{_BASE_MODE_NOTE}"
-    rules = _prompt_rules()
+    rules = _prompt_rules(ref_mode)
     if rules:
         system = f"{system}\n\n---\n\n以下是本项目维护的 H3 提示词规则精要（与上面要求一致，冲突时以它为准）：\n\n{rules}"
-    data = chat_json(system, user, temperature=0.6)
-    return {
-        "video_prompt": str(data.get("video_prompt", "")).strip(),
-        "soundscape": str(data.get("soundscape", "")).strip(),
-    }
+    allowed = reference_labels("\n".join(material_lines)) if ref_mode else {"<Picture 1>"}
+    retention_labels = set()
+    if ref_mode:
+        for line in material_lines:
+            labels = reference_labels(line)
+            subjects = {label for label in labels if label.startswith("<Subject ")}
+            retention_labels.update(subjects or {label for label in labels if label.startswith(("<Picture ", "<Video "))})
+    # One bounded repair for invalid model output; never submit a malformed video request.
+    errors = []
+    for attempt in range(2):
+        repair = "" if not errors else "\n上次输出不合规，请修正以下问题并重新输出 JSON：\n" + "\n".join(errors)
+        data = chat_json(system, user + repair, temperature=0.6)
+        if not isinstance(data, dict):
+            errors = ["输出必须是包含 video_prompt 和 soundscape 的 JSON 对象"]
+            continue
+        body = data.get("video_prompt", "")
+        sound = data.get("soundscape", "")
+        retention = data.get("retention", {})
+        if not isinstance(body, str) or not isinstance(sound, str):
+            errors = ["video_prompt 和 soundscape 必须是字符串"]
+            continue
+        audit = audit_body(body, duration, allowed=allowed, expected_shots=count)
+        errors = audit.errors
+        errors.extend(reference_errors(sound, allowed))
+        errors.extend(retention_errors(retention, retention_labels))
+        if not errors:
+            if ref_mode and len(body.split()) < 350:
+                warnings.append("编排正文较简短，建议确认动作、构图和参考关系是否描述完整。")
+            if ref_mode and body.lstrip().startswith("[Shot 1]"):
+                warnings.append("Ref2VA 正文未在首镜前单独说明整体风格，建议确认画面风格是否明确。")
+            return {"video_prompt": body.strip(), "soundscape": sound.strip(),
+                    "retention": retention,
+                    "warnings": list(dict.fromkeys(warnings + audit.warnings))}
+    raise ValueError("提示词校验失败，已停止视频提交：" + "；".join(dict.fromkeys(errors)))
+
 
 
 OPTIMIZE_SYSTEM = """你是短片分镜师。用户会给你一段中文口语描述（可能有错别字、可能只有一句念头），
@@ -839,7 +832,7 @@ OPTIMIZE_SYSTEM = """你是短片分镜师。用户会给你一段中文口语�
 
 1. **输出中文**。不要输出英文，不要做任何翻译。用户只看中文。
 2. 写成连贯的散文（可以按镜头分成几段），**不要加小标题、不要写成"1. 2. 3."式的条目清单**。
-3. 每一颗镜头都要写到这几样，顺序不要乱：
+3. 未明确要求切镜时保持一镜到底，按提供的镜头数量写。每一颗镜头要写到这几样：
    - 画面里是谁 / 在哪 / 什么时间、什么光
    - 他/她在做什么（动作要有起止，不要只写状态）
    - **表演细节**：眉眼、嘴角、手、呼吸、肩背的松紧 —— 这是"像真的"和"像摆拍"的分界线
@@ -883,7 +876,9 @@ def optimize_description(
     `ref_plan.build_ref_plan` 在出片时按当时选中的素材算，而两步之间用户还可能改选素材。
     给模型的是**名字**（角色「林晚」），照着写就行。
     """
-    timeline = ref_plan.plan_shot_timeline(duration)
+    from h3_prompt_policy import shot_intent
+    count, _ = shot_intent(description, duration)
+    timeline = ref_plan.plan_shot_timeline(duration, count=count)
     # 中文字数大约是英文词数的 1.5~1.8 倍，跟 compose_segment_prompt 那三档对齐
     if duration <= 5:
         words = "200-280"
@@ -893,7 +888,7 @@ def optimize_description(
         words = "450-600"
 
     parts = [
-        f"这一段视频的总时长：{duration:.0f} 秒，大约分成 {len(timeline)} 颗镜头。",
+        f"这一段视频的总时长：{duration:g} 秒，大约分成 {len(timeline)} 颗镜头。",
         f"篇幅：{words} 个中文字左右。",
     ]
     style_cn = str(getattr(project, "style", "") or "").strip()
