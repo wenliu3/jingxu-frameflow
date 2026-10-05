@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import WorkflowIcon from './WorkflowIcon.vue';
+import WorkflowExport from './WorkflowExport.vue';
 import { STORY_TEMPLATES, scriptParagraphs } from '../workflowStudio.js';
 const props = defineProps({
   mode: String,
@@ -15,18 +16,19 @@ const text = ref(''),
   dialog = ref(null);
 const paragraphs = computed(() => scriptParagraphs(text.value));
 const eligible = computed(() => (props.reviews || []).filter((r) => !r.error));
-const aspect = ref('16:9');
-const exportChoices = ref(
-  Object.fromEntries(props.exports.map((item) => [item.id, item.currentFile || item.versions.at(-1)?.file]))
-);
 let previousFocus;
 function keys(event) {
-  if (event.key === 'Escape') emit('close');
+  if (event.key === 'Escape') {
+    event.stopPropagation();
+    emit('close');
+  }
   if (event.key !== 'Tab') return;
-  const focusable = [...dialog.value.querySelectorAll('button:not(:disabled), textarea, select')];
+  const focusable = [
+    ...dialog.value.querySelectorAll('button:not(:disabled), textarea, select, video[controls]'),
+  ].filter((element) => element.getClientRects().length);
   const first = focusable[0],
     last = focusable.at(-1);
-  if (event.shiftKey && document.activeElement === first) {
+  if (event.shiftKey && [first, dialog.value].includes(document.activeElement)) {
     event.preventDefault();
     last?.focus();
   } else if (!event.shiftKey && document.activeElement === last) {
@@ -47,6 +49,7 @@ onBeforeUnmount(() => previousFocus?.focus());
       <section
         ref="dialog"
         class="studio-dialog"
+        :class="{ 'export-dialog': mode === 'export' }"
         role="dialog"
         aria-modal="true"
         aria-labelledby="studio-dialog-title"
@@ -155,50 +158,15 @@ onBeforeUnmount(() => previousFocus?.focus());
           </footer>
         </template>
         <template v-else>
-          <p class="dialog-intro">
-            按镜头序列拼接已生成的视频，每镜可选择一个版本。统一画幅、帧率和音频，保留原片，画面按比例适配并补边。
-          </p>
-          <div class="review-list">
-            <article v-for="(item, index) in exports" :key="item.id">
-              <span>{{ String(index + 1).padStart(2, '0') }}</span>
-              <div>
-                <b>{{ item.title }}</b
-                ><select v-model="exportChoices[item.id]" :aria-label="`${item.title}导出版本`">
-                  <option v-for="(version, i) in item.versions" :key="version.id" :value="version.file">
-                    版本 {{ i + 1 }} · {{ version.file }}
-                  </option>
-                </select>
-              </div>
-            </article>
-          </div>
-          <p class="dialog-note">
-            本次包含 {{ exports.length }} 镜。{{
-              shotCount > exports.length
-                ? `还有 ${shotCount - exports.length} 镜没有可用视频，不会进入成片。`
-                : '所有分镜都有可用视频。'
-            }}合并在本地进行，不调用模型服务。
-          </p>
-          <label class="export-aspect"
-            >成片画幅<select v-model="aspect">
-              <option value="16:9">横屏 16:9 · 1280 × 720</option>
-              <option value="9:16">竖屏 9:16 · 720 × 1280</option>
-              <option value="1:1">方形 1:1 · 720 × 720</option>
-            </select></label
-          >
-          <footer>
-            <button @click="emit('close')">取消</button
-            ><button
-              class="confirm"
-              :disabled="!exports.length"
-              @click="emit('export', { files: exports.map((item) => exportChoices[item.id]), aspect })"
-            >
-              <WorkflowIcon name="download" />导出 {{ exports.length }} 镜成片
-            </button>
-          </footer>
+          <WorkflowExport
+            :items="exports"
+            :shot-count="shotCount"
+            @close="emit('close')"
+            @export="emit('export', $event)"
+          />
         </template>
-      </section>
-    </div></Teleport
-  >
+      </section></div
+  ></Teleport>
 </template>
 <style scoped>
 .studio-dialog-mask {
@@ -228,6 +196,20 @@ onBeforeUnmount(() => previousFocus?.focus());
   justify-content: space-between;
   gap: 20px;
   align-items: center;
+}
+.studio-dialog.export-dialog {
+  width: min(1040px, 100%);
+  height: min(780px, calc(100dvh - 44px));
+  max-height: none;
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.export-dialog > header {
+  flex: 0 0 auto;
+  padding: 22px 26px 18px;
+  border-bottom: 1px solid var(--day-line, #393a44);
 }
 .studio-dialog header span {
   font-size: 9px;
@@ -411,14 +393,15 @@ onBeforeUnmount(() => previousFocus?.focus());
   font-size: 11px;
   padding: 7px;
 }
-.export-aspect {
-  font-size: 11px;
-  color: var(--day-muted, #b5b8c9);
-}
-.export-aspect select {
-  margin-top: 8px;
-  background: var(--day-panel, #252630);
-  font-size: 12px;
-  padding: 9px;
+@media (max-width: 620px) {
+  .studio-dialog-mask:has(.export-dialog) {
+    padding: 12px;
+  }
+  .studio-dialog.export-dialog {
+    height: min(860px, calc(100dvh - 24px));
+  }
+  .export-dialog > header {
+    padding: 15px 18px;
+  }
 }
 </style>

@@ -90,13 +90,23 @@ const exportJob = ref(null);
 let exportTimer;
 const exportItems = computed(() =>
   sequence.value
-    .map((shot) => ({
+    .map((shot, index) => ({
       id: shot.id,
       title: shot.data.title,
+      order: index + 1,
+      duration: shot.data.duration,
       currentFile: currentVideo(shot)?.file,
       versions: videoVersions(shot)
         .filter((v) => v.status === 'succeeded' && v.url && v.file)
-        .map((v) => ({ id: v.id, file: v.file })),
+        .map((v) => ({
+          id: v.id,
+          file: v.file,
+          url: v.url,
+          duration: v.duration,
+          actual_duration: v.actual_duration,
+          width: v.width,
+          height: v.height,
+        })),
     }))
     .filter((item) => item.versions.length)
 );
@@ -1497,6 +1507,7 @@ onBeforeUnmount(() => {
         </button>
         <button
           class="export-button"
+          :aria-label="exportJob?.status === 'running' ? '正在导出' : '导出成片'"
           :disabled="!exportItems.length || exportJob?.status === 'running'"
           @click="dialogMode = 'export'"
         >

@@ -12,7 +12,8 @@
     "format": "prettier --write \"src/**/*.{vue,js,css}\" index.html vite.config.js",
     "format:check": "prettier --check \"src/**/*.{vue,js,css}\" index.html vite.config.js",
     "browser:install": "playwright install chromium",
-    "test:browser": "node ../dev/ui/test_studio_browser.mjs"
+    "test:browser": "node ../dev/ui/test_studio_browser.mjs",
+    "test:browser:export": "node ../dev/ui/test_canvas_export_browser.mjs"
   },
   "dependencies": {
     "vue": "^3.5.42"
