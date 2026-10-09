@@ -1,10 +1,25 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { makeShot } from '../../web/src/workflowGraph.js'
+import { canConnect, makeNode, makeShot } from '../../web/src/workflowGraph.js'
 import { sourceContext, sourceSnapshot, sourceVersion, videoInputs, videoSourcesError } from '../../web/src/videoSources.js'
 import { mergeWorkflow, orderedShots } from '../../web/src/workflowStudio.js'
 
 const cfg = { video_workflow: 'ref2va', video_backend: 'comfyui' }
+test('uploaded footage connects as a visual source and stays outside generation and export order', () => {
+  const origin = makeNode('footage', 0, 0, { title: 'Upload', versions: [{ id: 'uploaded', file: 'upload_012345abcdef.mp4', url: '/uploaded.mp4', status: 'succeeded' }] })
+  const target = makeShot(365, 0)
+  const graph = { nodes: [origin, target], edges: [{ id: 'link', source: origin.id, target: target.id, usage: 'reference' }] }
+  assert.equal(canConnect(graph.nodes, [], origin.id, target.id), '')
+  assert.ok(canConnect(graph.nodes, [], target.id, origin.id))
+  assert.deepEqual(orderedShots(graph), [target])
+  const inputs = videoInputs(graph, target.id)
+  assert.equal(videoSourcesError(inputs, cfg), '')
+  assert.equal(sourceSnapshot(inputs)[0].file, 'upload_012345abcdef.mp4')
+  const imported = { nodes: [], edges: [] }
+  mergeWorkflow(imported, { ...graph, version: 1 })
+  assert.equal(imported.nodes[0].data.versions.length, 0)
+  assert.match(videoSourcesError(videoInputs(imported, imported.nodes[1].id), cfg, imported.nodes.map(n => n.id)), /重新上传/)
+})
 function fixture(usage = 'continue') {
   const origin = makeShot(0, 0), target = makeShot(365, 0)
   origin.data.description = 'changed draft'

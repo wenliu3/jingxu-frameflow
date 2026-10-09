@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 class VideoSource(BaseModel):
     source_node: str = Field(min_length=1, max_length=100)
     version_id: str = Field(min_length=1, max_length=100)
-    file: str = Field(pattern=r"^seg_[a-f0-9]{12}(?:_\d{2})?\.mp4$")
+    file: str = Field(pattern=r"^(?:seg_[a-f0-9]{12}(?:_\d{2})?|upload_[a-f0-9]{12})\.mp4$")
     usage: Literal["reference", "continue"] = "reference"
     start: float | None = Field(None, ge=0, le=3600, allow_inf_nan=False)
     end: float | None = Field(None, gt=0, le=3600, allow_inf_nan=False)
@@ -31,7 +31,7 @@ class ComposeBody(BaseModel):
     description: str = Field("", max_length=2000)   # 中文口语描述（走 LLM 时才用）
     context: str = Field("", max_length=4000)       # 前情文字，不能代替当前视频描述
     video_prompt: str = Field("", max_length=8000)  # 已是英文正文时直接给，跳过 LLM
-    duration: float = Field(10.0, ge=4, le=15, allow_inf_nan=False)
+    duration: float = Field(10.0, ge=1, le=15, allow_inf_nan=False)
     video_sources: list[VideoSource] = Field(default_factory=list, max_length=3)
     use_voice: bool = False
 
@@ -69,7 +69,7 @@ class SegmentVideoBody(BaseModel):
     first_frame: str = ""   # 素材引用；空 = 用 frames 里第一个能出图的
     last_frame: str = ""    # 素材引用；空 = 不设尾帧
     prompt: str = Field("", max_length=20000)
-    duration: float = Field(10.0, ge=4, le=15, allow_inf_nan=False)
+    duration: float = Field(10.0, ge=1, le=15, allow_inf_nan=False)
     # 像素预算（前端「清晰度」档位）。None = 用服务配置里的全局值。
     # 与服务设置采用相同范围；不把像素预算伪装成固定 1080p。
     megapixels: float | None = Field(None, ge=0.1, le=0.98, allow_inf_nan=False)

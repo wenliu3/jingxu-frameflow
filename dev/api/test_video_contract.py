@@ -82,6 +82,15 @@ class VideoContractTests(unittest.TestCase):
         self.assertEqual(self.record(response)["resolution_source"], "override")
         self.assertEqual(self.cfg["video_megapixels"], "0.7")
 
+    def test_job_records_and_freezes_reference_precision_at_submission(self):
+        self.cfg.update(video_workflow="ref2va", video_ref_image_size="max")
+        response = self.start()
+        self.assertEqual(response.status_code, 200)
+        self.cfg["video_ref_image_size"] = "match"
+        self.runners[0]()
+        self.assertEqual(self.record(response)["video_ref_image_size"], "max")
+        self.assertEqual(self.factory.call_args.args[0]["video_ref_image_size"], "max")
+
     def test_api_does_not_claim_h3_parameters_or_reference_workflow(self):
         self.cfg.update(video_backend="api", video_workflow="ref2va", video_api_url="http://127.0.0.1:1", video_api_key="fake", video_api_model="fake", video_steps="12", video_lora=next(iter(self.module._LORA_STEPS)))
         response = self.start(megapixels=0.9)
@@ -121,13 +130,30 @@ class VideoContractTests(unittest.TestCase):
         self.assertEqual(self.start(last_frame="image:1").status_code, 422)
 
     def test_invalid_numeric_parameters_are_rejected_instead_of_clamped(self):
-        for extra in ({"duration": 3}, {"duration": 16}, {"megapixels": 1.5}, {"megapixels": 0}):
+        for extra in ({"duration": 0.5}, {"duration": 16}, {"megapixels": 1.5}, {"megapixels": 0}):
             with self.subTest(extra=extra):
                 self.assertEqual(self.start(**extra).status_code, 422)
         for key in ("duration", "megapixels"):
             with self.assertRaises(ValidationError):
                 self.module.SegmentVideoBody.model_validate({key: float("nan")})
         self.factory.assert_not_called()
+
+    def test_one_to_fifteen_seconds_compose_and_reach_generation(self):
+        for workflow in ("i2v", "ref2va"):
+            self.cfg["video_workflow"] = workflow
+            for duration in (1, 1.5, 3, 15):
+                with self.subTest(workflow=workflow, duration=duration):
+                    composed = self.client.post("/api/tasks/abcdef123456/compose", json={
+                        "images": ["First"], "video_prompt": "[Shot 1] A cinematic shot.", "duration": duration})
+                    self.assertEqual(composed.status_code, 200, composed.text)
+                    response = self.start(prompt=composed.json()["prompt"], duration=duration, exact_duration=True)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.runners[-1]()
+                    self.assertEqual(self.calls[-1]["duration"], duration)
+                    self.assertTrue(self.calls[-1]["exact_duration"])
+                    self.assertEqual(self.record(response)["duration"], duration)
+        capabilities = self.client.get("/api/video-capabilities").json()
+        self.assertEqual((capabilities["duration_min"], capabilities["duration_max"]), (1, 15))
 
     def test_composition_rejects_missing_and_audio_inputs_before_model_call(self):
         for payload in ({"images": ["Missing"], "description": "test"},
@@ -348,6 +374,29 @@ class VideoProviderTests(unittest.TestCase):
         self.assertEqual(graph["119"]["inputs"]["megapixels"], 0.7)
         self.assertEqual(graph["9"]["inputs"]["steps"], 20)
         self.assertNotIn("121", graph)
+
+    def test_standard_model_reconnects_every_consumer_in_both_workflows(self):
+        for template in ("h3_i2v_api.json", "h3_r2v_api.json"):
+            provider = ComfyUIVideoProvider(base_url="http://local", workflow_path=str(Path(__file__).parents[2] / "comfyui" / template), steps=20, lora="")
+            graph = provider._build_workflow("English.", 5, "image.png")
+            self.assertEqual(graph["16"]["inputs"]["model"], ["6", 0])
+            self.assertEqual(graph["9"]["inputs"]["model"], ["6", 0])
+            for node in graph.values():
+                for value in node.get("inputs", {}).values():
+                    if isinstance(value, list) and len(value) == 2:
+                        self.assertIn(str(value[0]), graph, "Workflow contains a dangling node link")
+
+    def test_reference_precision_is_frozen_and_continuation_keeps_its_guide(self):
+        provider = ComfyUIVideoProvider(base_url="http://local", workflow_path=str(Path(__file__).parents[2] / "comfyui" / "h3_r2v_api.json"), steps=20, lora="", ref_image_size="max")
+        with patch.dict(os.environ, {"H3_REF_IMAGE_SIZE": "match"}):
+            graph = provider._build_workflow("New action.", 5, "hero.png", guide_name="last.png")
+        self.assertEqual(graph["104"]["inputs"]["ref_image_size"], "max")
+        guide = next(key for key, node in graph.items() if node["class_type"] == "MiniMaxH3AddGuide")
+        self.assertEqual(graph[guide]["inputs"]["frame_idx"], 0)
+        self.assertEqual(graph["16"]["inputs"]["conditioning"], [guide, 0])
+        self.assertEqual(graph["16"]["inputs"]["model"], ["6", 0])
+        with self.assertRaises(ValueError):
+            ComfyUIVideoProvider(base_url="http://local", ref_image_size="unknown")
 
     def test_streams_publish_only_on_success_and_preserve_existing_output(self):
         with tempfile.TemporaryDirectory() as directory:

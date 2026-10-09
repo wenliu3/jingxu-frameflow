@@ -29,6 +29,7 @@ import {
 import {
   NODE_WIDTH,
   NODE_HEIGHT,
+  NODE_PORT_Y,
   KIND_LABELS,
   clone,
   uid,
@@ -61,6 +62,11 @@ const saving = ref(false);
 const dirty = ref(false);
 const conflicted = ref(false);
 const selectedId = ref('');
+const selectedIds = ref([]);
+const marquee = ref(null);
+const spacePressed = ref(false);
+const canvasMode = ref('select');
+const linkingIds = ref([]);
 const selectedEdge = ref('');
 const drawerOpen = ref(false);
 const search = ref('');
@@ -71,6 +77,7 @@ const menuOpen = ref(false);
 const addMenuOpen = ref(false);
 const helpOpen = ref(false);
 const connecting = ref('');
+const linkTargetId = ref('');
 const pointer = ref({ x: 0, y: 0 });
 const dimensions = ref({ width: 1000, height: 650 });
 const composerHeight = ref(300);
@@ -85,9 +92,11 @@ const queuePaused = ref(true);
 const sequenceCollapsed = ref(true);
 const importInput = ref(null);
 const uploadInput = ref(null);
+const videoUploadInput = ref(null);
 const uploading = ref(false);
 const exportJob = ref(null);
 let exportTimer;
+let automaticDownloadJob = '';
 const exportItems = computed(() =>
   sequence.value
     .map((shot, index) => ({
@@ -111,6 +120,7 @@ const exportItems = computed(() =>
     .filter((item) => item.versions.length)
 );
 let dispatching = false;
+const gestureState = ref('');
 let gesture = null;
 let saveTimer, backupTimer, observer;
 let disposed = false;
@@ -129,7 +139,67 @@ const inputsById = computed(() => {
   return index;
 });
 const say = (text, kind = 'info') => props.notify?.(text, kind);
-const selected = computed(() => nodesById.value.get(selectedId.value));
+const selection = computed(() => graph.value.nodes.filter((n) => selectedIds.value.includes(n.id)));
+const selected = computed(() => (selection.value.length > 1 ? null : nodesById.value.get(selectedId.value)));
+function boxFor(nodes, padding = 16) {
+  const x = Math.min(...nodes.map((n) => n.x)),
+    y = Math.min(...nodes.map((n) => n.y));
+  return {
+    x: x - padding,
+    y: y - padding,
+    width: Math.max(...nodes.map((n) => n.x + NODE_WIDTH)) - x + padding * 2,
+    height: Math.max(...nodes.map((n) => n.y + NODE_HEIGHT)) - y + padding * 2,
+  };
+}
+const selectionBox = computed(() => (selection.value.length > 1 ? boxFor(selection.value) : null));
+const canvasGroups = computed(() => {
+  const groups = new Map();
+  for (const node of graph.value.nodes) {
+    if (!node.data.groupId) continue;
+    if (!groups.has(node.data.groupId)) groups.set(node.data.groupId, []);
+    groups.get(node.data.groupId).push(node);
+  }
+  return [...groups].map(([id, nodes]) => ({
+    id,
+    nodes,
+    title: nodes[0].data.groupTitle || '素材组',
+    ...boxFor(nodes, 26),
+  }));
+});
+const commonGroup = computed(() => {
+  const ids = new Set(selection.value.map((n) => n.data.groupId));
+  return ids.size === 1 && !ids.has(undefined) ? [...ids][0] : '';
+});
+const selectionToolbarStyle = computed(() => {
+  const b = selectionBox.value,
+    v = graph.value.viewport;
+  if (!b) return {};
+  const half = Math.min(250, (dimensions.value.width - 24) / 2);
+  return {
+    left: `${Math.max(half + 12, Math.min(dimensions.value.width - half - 12, v.x + (b.x + b.width / 2) * v.zoom))}px`,
+    top: `${Math.max(12, Math.min(dimensions.value.height - 110, v.y + b.y * v.zoom - 52))}px`,
+  };
+});
+const rectStyle = (b) => ({
+  left: `${b.x}px`,
+  top: `${b.y}px`,
+  width: `${b.width}px`,
+  height: `${b.height}px`,
+});
+watch(
+  selectedId,
+  (id) => {
+    if (id && !selectedIds.value.includes(id)) selectedIds.value = [id];
+    else if (!id && selectedIds.value.length < 2) selectedIds.value = [];
+  },
+  { flush: 'sync' }
+);
+watch(connecting, (id) => {
+  if (!id) {
+    linkingIds.value = [];
+    linkTargetId.value = '';
+  }
+});
 const composerWidth = computed(() => Math.min(780, Math.max(0, dimensions.value.width - 24)));
 const composerPosition = computed(() => {
   const node = selected.value,
@@ -233,14 +303,30 @@ const drawnEdges = computed(() =>
     .map((edge) => {
       const source = nodesById.value.get(edge.source);
       const target = nodesById.value.get(edge.target);
-      return source && target ? { ...edge, path: edgePath(source, target) } : null;
+      return source && target
+        ? {
+            ...edge,
+            path: edgePath(source, target),
+            focused:
+              selectedEdge.value === edge.id ||
+              selectedIds.value.includes(edge.source) ||
+              selectedIds.value.includes(edge.target),
+          }
+        : null;
     })
     .filter(Boolean)
 );
-const loosePath = computed(() => {
-  const source = nodesById.value.get(connecting.value);
-  return source ? edgePath(source, { x: pointer.value.x, y: pointer.value.y - 46 }) : '';
-});
+const loosePaths = computed(() =>
+  (linkingIds.value.length ? linkingIds.value : [connecting.value])
+    .map((id) => nodesById.value.get(id))
+    .filter(Boolean)
+    .map((source) =>
+      edgePath(
+        source,
+        nodesById.value.get(linkTargetId.value) || { x: pointer.value.x, y: pointer.value.y - NODE_PORT_Y }
+      )
+    )
+);
 
 function checkpoint() {
   const snapshot = JSON.stringify({ nodes: graph.value.nodes, edges: graph.value.edges });
@@ -251,6 +337,7 @@ function restore(snapshot) {
   const parsed = JSON.parse(snapshot);
   graph.value.nodes = parsed.nodes;
   graph.value.edges = parsed.edges;
+  selectedIds.value = [];
   selectedId.value = '';
   selectedEdge.value = '';
   connecting.value = '';
@@ -388,10 +475,14 @@ async function load() {
     saveError.value = '';
     ready.value = true;
     dirty.value = content() !== savedContent;
-    selectedId.value =
-      document.nodes.find((n) => n.type === 'shot' && !currentVideo(n))?.id ||
-      document.nodes.find((n) => n.type === 'shot')?.id ||
-      '';
+    // A grouped workspace opens at its saved camera position, with the whole canvas visible.
+    selectNode(
+      document.nodes.some((n) => n.data.groupId)
+        ? ''
+        : document.nodes.find((n) => n.type === 'shot' && !currentVideo(n))?.id ||
+            document.nodes.find((n) => n.type === 'shot')?.id ||
+            ''
+    );
     queueOpen.value = document.nodes.some((n) => n.data.status === 'queued');
     for (const node of document.nodes.filter(
       (n) => n.type === 'shot' && n.data.status === 'running' && n.data.jobId
@@ -514,7 +605,8 @@ function positionForNew() {
   };
 }
 function chooseAdd() {
-  if (selected.value?.type === 'shot' && currentVideo(selected.value)) addMenuOpen.value = !addMenuOpen.value;
+  if (['shot', 'footage'].includes(selected.value?.type) && currentVideo(selected.value))
+    addMenuOpen.value = !addMenuOpen.value;
   else addShot();
 }
 function addShot(continuation = false) {
@@ -526,19 +618,24 @@ function addShot(continuation = false) {
       )
     : [];
   if (continuation && !currentVideo(selected.value)) return say('请先选中成功视频再续拍', 'error');
-  if (graph.value.edges.length + inherited.length + (selected.value?.type === 'shot' ? 1 : 0) > 1200)
+  if (
+    graph.value.edges.length +
+      inherited.length +
+      (['shot', 'footage'].includes(selected.value?.type) ? 1 : 0) >
+    1200
+  )
     return say('画布连线已达上限，请先整理', 'error');
   checkpoint();
   const p = positionForNew();
   const n = makeShot(p.x, p.y, shotCount.value + 1);
-  if (selected.value?.type === 'shot') {
+  if (['shot', 'footage'].includes(selected.value?.type)) {
     n.x = selected.value.x + 365;
     n.y = selected.value.y;
     graph.value.edges.push({
       id: uid(),
       source: selected.value.id,
       target: n.id,
-      usage: continuation ? 'continue' : 'text',
+      usage: continuation ? 'continue' : selected.value.type === 'footage' ? 'reference' : 'text',
       sourceVersionId: continuation ? currentVideo(selected.value)?.id || '' : '',
     });
     if (continuation) {
@@ -655,19 +752,55 @@ function addMaterial(material) {
   return true;
 }
 function selectNode(id) {
+  selectedIds.value = id ? [id] : [];
   selectedId.value = id;
   selectedEdge.value = '';
   queueOpen.value = false;
+}
+function selectMany(ids) {
+  selectedIds.value = [...new Set(ids)].filter((id) => nodesById.value.has(id));
+  selectedId.value = selectedIds.value.length === 1 ? selectedIds.value[0] : '';
+  selectedEdge.value = '';
+  queueOpen.value = false;
+}
+function groupSelection() {
+  if (selection.value.length < 2) return;
+  checkpoint();
+  const id = uid();
+  selection.value.forEach((node) => Object.assign(node.data, { groupId: id, groupTitle: '素材组' }));
+}
+function ungroupSelection() {
+  checkpoint();
+  selection.value.forEach((node) => {
+    delete node.data.groupId;
+    delete node.data.groupTitle;
+  });
+}
+function renameGroup(title) {
+  if (!commonGroup.value) return;
+  checkpoint();
+  graph.value.nodes
+    .filter((n) => n.data.groupId === commonGroup.value)
+    .forEach((n) => (n.data.groupTitle = title.trim().slice(0, 80) || '素材组'));
+}
+function beginBatchLink() {
+  const sources = selection.value.filter((n) => ['material', 'note', 'footage', 'shot'].includes(n.type));
+  if (!sources.length) return say('请选择图片、视频或便签作为参考', 'error');
+  linkingIds.value = sources.map((n) => n.id);
+  connecting.value = sources[0].id;
+  const b = boxFor(sources, 0);
+  pointer.value = { x: b.x + b.width + 70, y: b.y + b.height / 2 };
 }
 // Frame the card and its editor together when selecting, never while panning or zooming.
 function frameCreation(node, centered = false) {
   const rect = board.value?.getBoundingClientRect();
   if (!rect || disposed) return;
   const view = graph.value.viewport;
+  const availableHeight = rect.height - 100;
   const maxZoom = Math.max(
     0.15,
     Math.min(
-      (rect.height - composerHeight.value - COMPOSER_GAP - 56) / NODE_HEIGHT,
+      (availableHeight - composerHeight.value - COMPOSER_GAP - 32) / NODE_HEIGHT,
       (rect.width - 24) / NODE_WIDTH
     )
   );
@@ -678,12 +811,12 @@ function frameCreation(node, centered = false) {
     y = view.y;
   if (centered || zoom !== view.zoom) {
     x = rect.width / 2 - (node.x + NODE_WIDTH / 2) * zoom;
-    y = Math.max(16, (rect.height - 32 - height) / 2) - node.y * zoom;
+    y = Math.max(16, (availableHeight - 32 - height) / 2) - node.y * zoom;
   } else {
     const left = x + (node.x + NODE_WIDTH / 2) * zoom - width / 2;
     const top = y + node.y * zoom;
     x += left < 12 ? 12 - left : left + width > rect.width - 12 ? rect.width - 12 - left - width : 0;
-    y += top < 16 ? 16 - top : top + height > rect.height - 32 ? rect.height - 32 - top - height : 0;
+    y += top < 16 ? 16 - top : top + height > availableHeight - 16 ? availableHeight - 16 - top - height : 0;
   }
   graph.value.viewport = { x, y, zoom };
 }
@@ -714,21 +847,71 @@ async function focusNode(id) {
   };
 }
 function beginLink(id) {
+  if (selectedIds.value.length > 1 && selectedIds.value.includes(id)) return beginBatchLink();
+  linkingIds.value = [];
   connecting.value = connecting.value === id ? '' : id;
   const n = graph.value.nodes.find((n) => n.id === id);
-  if (n) pointer.value = { x: n.x + NODE_WIDTH + 70, y: n.y + 46 };
+  if (n) pointer.value = { x: n.x + NODE_WIDTH + 70, y: n.y + NODE_PORT_Y };
+}
+function isLinkTarget(id) {
+  if (!connecting.value || ACTIVE_STATUSES.includes(nodesById.value.get(id)?.data.status)) return false;
+  const sources = linkingIds.value.length ? linkingIds.value : [connecting.value];
+  return sources.every(
+    (source) =>
+      source !== id &&
+      ((linkingIds.value.length && graph.value.edges.some((e) => e.source === source && e.target === id)) ||
+        !canConnect(graph.value.nodes, graph.value.edges, source, id))
+  );
+}
+function hoverLinkTarget(id) {
+  linkTargetId.value = isLinkTarget(id) ? id : '';
 }
 function finishLink(target) {
   if (!connecting.value) return say('先点击来源节点右侧的连接点');
   if (ACTIVE_STATUSES.includes(nodesById.value.get(target)?.data.status))
     return say('请先暂停并移出队列，再修改镜头参考', 'error');
-  if (graph.value.edges.length >= 1200) return say('连线已达上限，请先整理画布', 'error');
-  const error = canConnect(graph.value.nodes, graph.value.edges, connecting.value, target);
-  if (error) return say(error, 'error');
+  const batch = linkingIds.value.length > 0;
+  const sources = batch ? linkingIds.value : [connecting.value];
+  const next = clone(graph.value);
+  let added = 0;
+  for (const source of sources) {
+    if (next.edges.some((e) => e.source === source && e.target === target) && batch) continue;
+    const error = canConnect(next.nodes, next.edges, source, target);
+    if (error) return say(error, 'error');
+    const type = nodesById.value.get(source)?.type;
+    next.edges.push({
+      id: uid(),
+      source,
+      target,
+      ...(type === 'footage' || (batch && type === 'shot') ? { usage: 'reference' } : {}),
+    });
+    added++;
+  }
+  if (!added) return say('这些素材已经连接到这个视频');
+  if (next.edges.length > 1200) return say('连线已达上限，请先整理画布', 'error');
+  const visuals = videoInputs(next, target).filter(({ edge }) => edge.usage && edge.usage !== 'text');
+  if (visuals.length > 3) return say('最多引用三个视频来源，请先移除一项参考', 'error');
+  if (batch) {
+    const refs = next.edges
+      .filter((e) => e.target === target)
+      .map((e) => nodesById.value.get(e.source))
+      .filter((n) => n?.type === 'material')
+      .map((n) => ({ kind: n.data.materialKind }));
+    const error =
+      videoSelectionError(refs, props.cfg, visuals.length > 0) ||
+      videoSourcesError(
+        videoInputs(next, target),
+        props.cfg,
+        next.nodes.filter((n) => n.type === 'shot').map((n) => n.id)
+      );
+    if (error && !error.startsWith('请先选择至少')) return say(error, 'error');
+  }
   checkpoint();
-  graph.value.edges.push({ id: uid(), source: connecting.value, target });
+  graph.value.edges = next.edges;
   connecting.value = '';
-  selectedId.value = target;
+  linkingIds.value = [];
+  selectNode(target);
+  if (batch) say(`已连接 ${added} 项参考素材`, 'ok');
 }
 function editSource(edgeId, patch) {
   if (ACTIVE_STATUSES.includes(selected.value?.data.status)) return;
@@ -763,81 +946,141 @@ function removeSelected() {
     [edge.source, edge.target].some((id) => ACTIVE_STATUSES.includes(nodesById.value.get(id)?.data.status))
   )
     return say('排队或生成中的连线暂时不能断开', 'error');
-  if (selected.value && ACTIVE_STATUSES.includes(selected.value.data.status))
+  if (selection.value.some((n) => ACTIVE_STATUSES.includes(n.data.status)))
     return say('请先等待生成完成或移出队列', 'error');
   if (
-    selected.value &&
     graph.value.edges.some(
       (e) =>
-        e.source === selectedId.value && ACTIVE_STATUSES.includes(nodesById.value.get(e.target)?.data.status)
+        selectedIds.value.includes(e.source) &&
+        ACTIVE_STATUSES.includes(nodesById.value.get(e.target)?.data.status)
     )
   )
     return say('这个节点仍被生成队列引用，请先清空等待队列', 'error');
   checkpoint();
   if (selectedEdge.value) graph.value.edges = graph.value.edges.filter((e) => e.id !== selectedEdge.value);
-  else if (selected.value) {
-    const id = selectedId.value;
-    graph.value.nodes = graph.value.nodes.filter((n) => n.id !== id);
-    graph.value.edges = graph.value.edges.filter((e) => e.source !== id && e.target !== id);
+  else if (selection.value.length) {
+    const ids = new Set(selectedIds.value);
+    graph.value.nodes = graph.value.nodes.filter((n) => !ids.has(n.id));
+    graph.value.edges = graph.value.edges.filter((e) => !ids.has(e.source) && !ids.has(e.target));
   }
-  selectedId.value = '';
+  selectMany([]);
   selectedEdge.value = '';
   connecting.value = '';
 }
 function duplicate() {
-  if (!selected.value || running.value || graph.value.nodes.length >= 300) return;
+  if (!selection.value.length || running.value || graph.value.nodes.length + selection.value.length > 300)
+    return;
   checkpoint();
-  const n = clone(selected.value);
-  n.id = uid();
-  n.x += 35;
-  n.y += 285;
-  n.data.title += ' · 副本';
-  if (n.type === 'shot') {
-    delete n.data.jobId;
-    delete n.data.error;
-    delete n.data.activeVersionId;
-    n.data.versions = [];
-    n.data.status = 'draft';
-    graph.value.edges
-      .filter((e) => e.target === selected.value.id)
-      .forEach((e) => graph.value.edges.push({ ...clone(e), id: uid(), target: n.id }));
-  }
-  graph.value.nodes.push(n);
-  selectedId.value = n.id;
+  const originals = selection.value;
+  const ids = new Map(originals.map((n) => [n.id, uid()]));
+  const groups = new Map();
+  const copies = originals.map((node) => {
+    const n = clone(node);
+    n.id = ids.get(node.id);
+    n.x += 35;
+    n.y += 285;
+    n.data.title += ' · 副本';
+    if (n.data.groupId) {
+      if (!groups.has(n.data.groupId)) groups.set(n.data.groupId, uid());
+      n.data.groupId = groups.get(n.data.groupId);
+    }
+    if (n.type === 'shot') {
+      delete n.data.jobId;
+      delete n.data.error;
+      delete n.data.activeVersionId;
+      n.data.versions = [];
+      n.data.status = 'draft';
+    }
+    return n;
+  });
+  const edges = graph.value.edges
+    .filter((e) => ids.has(e.target))
+    .map((e) => ({
+      ...clone(e),
+      id: uid(),
+      source: ids.get(e.source) || e.source,
+      target: ids.get(e.target),
+      ...(ids.has(e.source) && nodesById.value.get(e.source)?.type === 'shot' ? { sourceVersionId: '' } : {}),
+    }));
+  if (graph.value.edges.length + edges.length > 1200) return say('连线已达上限，请先整理画布', 'error');
+  graph.value.nodes.push(...copies);
+  graph.value.edges.push(...edges);
+  selectMany(copies.map((n) => n.id));
 }
 function editNode(patch) {
   if (!selected.value || ACTIVE_STATUSES.includes(selected.value.data.status)) return;
   Object.assign(selected.value.data, patch);
 }
 function startNodeDrag(event, node) {
+  if (
+    event.button === 1 ||
+    (event.button === 0 && (spacePressed.value || (canvasMode.value === 'hand' && !connecting.value)))
+  )
+    return startPan(event);
   if (event.button !== 0) return;
-  checkpoint();
-  selectNode(node.id);
+  if (connecting.value) {
+    event.preventDefault();
+    if (['shot', 'video'].includes(node.type)) finishLink(node.id);
+    return;
+  }
+  board.value.closest('.workflow-editor').focus({ preventScroll: true });
+  event.preventDefault();
+  if (event.shiftKey || event.ctrlKey || event.metaKey) {
+    selectMany(
+      selectedIds.value.includes(node.id)
+        ? selectedIds.value.filter((id) => id !== node.id)
+        : [...selectedIds.value, node.id]
+    );
+    return;
+  }
+  if (event.altKey || !selectedIds.value.includes(node.id)) {
+    selectMany(
+      node.data.groupId && !event.altKey
+        ? graph.value.nodes.filter((n) => n.data.groupId === node.data.groupId).map((n) => n.id)
+        : [node.id]
+    );
+  }
+  startSelectionDrag(event);
+}
+function startSelectionDrag(event, group) {
+  if (event.button === 1 || (event.button === 0 && (spacePressed.value || canvasMode.value === 'hand')))
+    return startPan(event);
+  if (event.button !== 0) return;
+  board.value.closest('.workflow-editor').focus({ preventScroll: true });
+  event.preventDefault();
+  if (group) selectMany(group.nodes.map((n) => n.id));
   gesture = {
-    kind: 'node',
-    id: node.id,
+    kind: 'nodes',
     clientX: event.clientX,
     clientY: event.clientY,
-    x: node.x,
-    y: node.y,
+    moved: false,
+    positions: selection.value.map((n) => ({ id: n.id, x: n.x, y: n.y })),
   };
+  gestureState.value = 'nodes';
   board.value.setPointerCapture(event.pointerId);
 }
 function startPan(event) {
   if (event.button !== 0 && event.button !== 1) return;
   event.preventDefault();
+  board.value.closest('.workflow-editor').focus({ preventScroll: true });
   menuOpen.value = false;
   addMenuOpen.value = false;
   helpOpen.value = false;
   if (event.button === 0) selectedEdge.value = '';
+  const pan = event.button === 1 || spacePressed.value || canvasMode.value === 'hand';
+  const origin = screenToWorld(event);
   gesture = {
-    kind: 'pan',
+    kind: pan ? 'pan' : 'marquee',
     clientX: event.clientX,
     clientY: event.clientY,
     blank: event.target === board.value,
     moved: false,
+    origin,
+    additive: event.shiftKey || event.ctrlKey || event.metaKey,
+    previous: [...selectedIds.value],
     ...graph.value.viewport,
   };
+  gestureState.value = gesture.kind;
   board.value.setPointerCapture(event.pointerId);
 }
 function movePointer(event) {
@@ -849,11 +1092,37 @@ function movePointer(event) {
     if (Math.hypot(dx, dy) > 5) gesture.moved = true;
     graph.value.viewport.x = gesture.x + dx;
     graph.value.viewport.y = gesture.y + dy;
+  } else if (gesture.kind === 'marquee') {
+    if (Math.hypot(dx, dy) <= 5 && !gesture.moved) return;
+    gesture.moved = true;
+    const p = screenToWorld(event),
+      o = gesture.origin;
+    const b = {
+      x: Math.min(o.x, p.x),
+      y: Math.min(o.y, p.y),
+      width: Math.abs(p.x - o.x),
+      height: Math.abs(p.y - o.y),
+    };
+    marquee.value = b;
+    const hits = graph.value.nodes
+      .filter(
+        (n) =>
+          n.x < b.x + b.width && n.x + NODE_WIDTH > b.x && n.y < b.y + b.height && n.y + NODE_HEIGHT > b.y
+      )
+      .map((n) => n.id);
+    selectMany(gesture.additive ? [...gesture.previous, ...hits] : hits);
   } else {
-    const n = graph.value.nodes.find((n) => n.id === gesture.id);
-    if (n) {
-      n.x = Math.round(gesture.x + dx / graph.value.viewport.zoom);
-      n.y = Math.round(gesture.y + dy / graph.value.viewport.zoom);
+    if (!gesture.moved && Math.hypot(dx, dy) <= 3) return;
+    if (!gesture.moved) {
+      checkpoint();
+      gesture.moved = true;
+    }
+    for (const pos of gesture.positions) {
+      const n = nodesById.value.get(pos.id);
+      if (n) {
+        n.x = Math.round(pos.x + dx / graph.value.viewport.zoom);
+        n.y = Math.round(pos.y + dy / graph.value.viewport.zoom);
+      }
     }
   }
 }
@@ -861,15 +1130,17 @@ function endGesture(event) {
   if (
     event.type === 'pointerup' &&
     event.button === 0 &&
-    gesture?.kind === 'pan' &&
-    gesture.blank &&
+    gesture?.kind === 'marquee' &&
+    !gesture.additive &&
     !gesture.moved
   ) {
-    selectedId.value = '';
+    selectMany([]);
     selectedEdge.value = '';
     connecting.value = '';
   }
   gesture = null;
+  gestureState.value = '';
+  marquee.value = null;
   if (board.value?.hasPointerCapture(event.pointerId)) board.value.releasePointerCapture(event.pointerId);
 }
 function zoomAt(nextZoom, x, y) {
@@ -931,16 +1202,34 @@ function cacheExport(jobId) {
     /* Polling works without local storage. */
   }
 }
-async function startExport({ files, aspect }) {
+async function startExport({ mode = 'merge', files, clips, aspect }) {
   if (exportJob.value?.status === 'running') return;
   dialogMode.value = '';
-  exportJob.value = { status: 'running', done: 0, total: files.length };
+  exportJob.value = {
+    status: 'running',
+    mode,
+    done: 0,
+    total: mode === 'clips' ? clips.length : files.length,
+  };
   try {
-    const job = await api.exportCanvas(props.taskId, files, aspect);
+    const job =
+      mode === 'clips'
+        ? await api.exportClips(props.taskId, clips)
+        : await api.exportCanvas(props.taskId, files, aspect);
+    if (mode === 'clips') automaticDownloadJob = job.job_id;
     cacheExport(job.job_id);
     if (!disposed) pollExport(job.job_id);
   } catch (err) {
-    exportJob.value = { status: 'failed', error: err.message };
+    exportJob.value = {
+      status: 'failed',
+      mode,
+      error:
+        mode === 'clips' &&
+        [404, 405].includes(err.status) &&
+        ['Not Found', 'Method Not Allowed'].includes(err.message)
+          ? '后端尚未支持镜头打包，请更新并重启后端服务。'
+          : err.message,
+    };
   }
 }
 async function pollExport(jobId) {
@@ -949,11 +1238,24 @@ async function pollExport(jobId) {
     const job = await api.canvasExportStatus(props.taskId, jobId);
     if (job.url && !job.url.startsWith(`/files/${props.taskId}/export/`))
       throw new Error('导出返回了无效的文件地址');
-    exportJob.value = job;
+    exportJob.value = { ...job, mode: job.mode || exportJob.value?.mode || 'merge' };
     if (job.status !== 'running') {
       cacheExport('');
+      if (job.status === 'succeeded' && job.url && jobId === automaticDownloadJob) {
+        automaticDownloadJob = '';
+        const link = document.createElement('a');
+        link.href = job.url;
+        link.download = job.download_name || '镜头素材.zip';
+        document.body.append(link);
+        link.click();
+        link.remove();
+      }
       say(
-        job.status === 'succeeded' ? '成片已导出，可以下载了' : job.error,
+        job.status === 'succeeded'
+          ? exportJob.value.mode === 'clips'
+            ? '镜头素材包已就绪，可以下载了'
+            : '成片已导出，可以下载了'
+          : job.error,
         job.status === 'succeeded' ? 'ok' : 'error'
       );
       return;
@@ -969,6 +1271,21 @@ async function pollExport(jobId) {
 }
 function onKey(event) {
   if (event.target.closest('input, textarea, select, [contenteditable="true"]')) return;
+  if (event.code === 'Space') {
+    event.preventDefault();
+    spacePressed.value = true;
+    return;
+  }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+    event.preventDefault();
+    selectMany(graph.value.nodes.map((n) => n.id));
+    return;
+  }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'g') {
+    event.preventDefault();
+    event.shiftKey ? ungroupSelection() : groupSelection();
+    return;
+  }
   if (event.key === 'Escape') {
     connecting.value = '';
     drawerOpen.value = false;
@@ -988,11 +1305,14 @@ function onKey(event) {
   }
   if (event.key.toLowerCase() === 'f') fit();
   if (event.key === 'Delete' || event.key === 'Backspace') {
-    if (selectedId.value || selectedEdge.value) {
+    if (selectedIds.value.length || selectedEdge.value) {
       event.preventDefault();
       removeSelected();
     }
   }
+}
+function releaseSpace(event) {
+  if (!event || event.type === 'blur' || event.code === 'Space') spacePressed.value = false;
 }
 
 function selectVersion(id, versionId) {
@@ -1016,17 +1336,32 @@ function generationError(node, queuedIds = []) {
     )
   );
 }
-async function uploadImages(files) {
+function mediaPosition(target, index, position) {
+  const point = { x: target ? target.x - 365 : position.x + index * 365, y: target ? target.y : position.y };
+  while (
+    graph.value.nodes.some(
+      (n) => Math.abs(n.x - point.x) < NODE_WIDTH + 24 && Math.abs(n.y - point.y) < NODE_HEIGHT + 24
+    )
+  )
+    point.y += NODE_HEIGHT + 42;
+  return point;
+}
+async function uploadMedia(files) {
   if (!ready.value || uploading.value) return;
   const images = [...files];
   if (!images.length) return;
   if (
     images.length > 8 ||
-    images.some(
-      (file) => !['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size > 15_000_000
+    images.some((file) =>
+      /\.(mp4|mov|webm|mkv|m4v)$/i.test(file.name)
+        ? file.size > 100_000_000
+        : !['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size > 15_000_000
     )
   )
-    return say('每次最多上传 8 张 PNG、JPG 或 WebP 图片，每张不超过 15MB', 'error');
+    return say(
+      '每次最多上传 8 个文件。图片支持 PNG、JPG、WebP（15MB）；视频支持 MP4、MOV、WebM、MKV、M4V（100MB、两分钟以内）',
+      'error'
+    );
   if (graph.value.nodes.length + images.length > 300) return say('画布节点已达上限', 'error');
   uploading.value = true;
   const position = positionForNew();
@@ -1037,29 +1372,48 @@ async function uploadImages(files) {
   checkpoint();
   try {
     for (const [index, file] of images.entries()) {
+      if (/\.(mp4|mov|webm|mkv|m4v)$/i.test(file.name)) {
+        const uploaded = await api.uploadVideo(props.taskId, file);
+        if (disposed) break;
+        const location = mediaPosition(target, index, position);
+        const source = makeNode('footage', location.x, location.y, {
+          title: file.name.replace(/\.[^.]+$/, ''),
+          status: 'succeeded',
+          versions: [{ ...uploaded, status: 'succeeded' }],
+          activeVersionId: uploaded.id,
+        });
+        graph.value.nodes.push(source);
+        const liveTarget = target && nodesById.value.get(target.id);
+        if (
+          liveTarget &&
+          graph.value.edges.length < 1200 &&
+          !ACTIVE_STATUSES.includes(liveTarget.data.status) &&
+          videoInputs(graph.value, liveTarget.id).filter(({ edge }) => edge.usage && edge.usage !== 'text')
+            .length < 3
+        )
+          graph.value.edges.push({ id: uid(), source: source.id, target: liveTarget.id, usage: 'reference' });
+        if (!target) selectedId.value = source.id;
+        continue;
+      }
       const uploaded = await api.uploadMaterial(props.taskId, 'image', file);
       if (disposed) break;
-      const source = makeNode(
-        'material',
-        target ? target.x - 365 : position.x + index * 285,
-        target ? target.y + index * 310 : position.y,
-        {
-          title: uploaded.name,
-          materialKind: 'image',
-          materialName: uploaded.name,
-          materialFile: uploaded.entry?.images?.[0]?.split(/[\\/]/).pop() || '',
-        }
-      );
+      const location = mediaPosition(target, index, position);
+      const source = makeNode('material', location.x, location.y, {
+        title: uploaded.name,
+        materialKind: 'image',
+        materialName: uploaded.name,
+        materialFile: uploaded.entry?.images?.[0]?.split(/[\\/]/).pop() || '',
+      });
       graph.value.nodes.push(source);
       const liveTarget = target && nodesById.value.get(target.id);
       if (liveTarget && !ACTIVE_STATUSES.includes(liveTarget.data.status))
         graph.value.edges.push({ id: uid(), source: source.id, target: liveTarget.id });
     }
     emit('refresh');
-    say('图片已上传到素材库并加入画布', 'ok');
+    say('素材已上传并加入画布', 'ok');
   } catch (err) {
     emit('refresh');
-    say(`图片上传失败：${err.message}`, 'error');
+    say(`素材上传失败：${err.message}`, 'error');
   } finally {
     uploading.value = false;
   }
@@ -1355,6 +1709,8 @@ function pollJob(nodeId, jobId) {
 }
 
 onMounted(async () => {
+  window.addEventListener('keyup', releaseSpace);
+  window.addEventListener('blur', releaseSpace);
   await load();
   await nextTick();
   if (disposed) return;
@@ -1391,6 +1747,8 @@ onMounted(async () => {
   }
 });
 onBeforeUnmount(() => {
+  window.removeEventListener('keyup', releaseSpace);
+  window.removeEventListener('blur', releaseSpace);
   disposed = true;
   clearTimeout(saveTimer);
   clearTimeout(backupTimer);
@@ -1413,8 +1771,7 @@ onBeforeUnmount(() => {
   >
     <header class="flow-toolbar">
       <div class="flow-title">
-        <span class="flow-mark"><WorkflowIcon name="shot" /></span>
-        <div><b>创作画布</b><span>VIDEO CANVAS</span></div>
+        <div><b>画布</b></div>
         <span class="flow-divider"></span
         ><span class="save-state" :class="{ error: saveError || loadError }"
           ><i></i
@@ -1427,14 +1784,11 @@ onBeforeUnmount(() => {
                   ? '保存中'
                   : dirty
                     ? '有未保存修改'
-                    : '已保存到作品'
+                    : '已保存'
           }}</span
         >
       </div>
       <div class="flow-actions">
-        <button class="story-builder-button" :disabled="!ready || running" @click="dialogMode = 'story'">
-          <WorkflowIcon name="note" /><span class="toolbar-label">剧本建镜</span>
-        </button>
         <button title="撤销 Ctrl+Z" aria-label="撤销" :disabled="!past.length || running" @click="undo">
           <WorkflowIcon name="undo" /></button
         ><button
@@ -1446,7 +1800,7 @@ onBeforeUnmount(() => {
           <WorkflowIcon name="redo" /></button
         ><span class="flow-divider"></span>
         <button title="自动整理节点位置" aria-label="整理画布" @click="tidy" :disabled="!ready">
-          <WorkflowIcon name="layout" /><span class="toolbar-label">整理</span>
+          <WorkflowIcon name="layout" />
         </button>
         <button
           title="展开或收起画布"
@@ -1460,6 +1814,15 @@ onBeforeUnmount(() => {
             <WorkflowIcon name="more" />
           </button>
           <div v-if="menuOpen" class="flow-menu">
+            <button
+              :disabled="!ready || running"
+              @click="
+                menuOpen = false;
+                dialogMode = 'story';
+              "
+            >
+              <WorkflowIcon name="note" />剧本建镜
+            </button>
             <button
               :disabled="!ready || importing || running"
               @click="
@@ -1507,12 +1870,12 @@ onBeforeUnmount(() => {
         </button>
         <button
           class="export-button"
-          :aria-label="exportJob?.status === 'running' ? '正在导出' : '导出成片'"
+          :aria-label="exportJob?.status === 'running' ? '正在导出' : '导出视频'"
           :disabled="!exportItems.length || exportJob?.status === 'running'"
           @click="dialogMode = 'export'"
         >
           <WorkflowIcon name="download" /><span class="toolbar-label">{{
-            exportJob?.status === 'running' ? '正在导出' : '导出成片'
+            exportJob?.status === 'running' ? '正在导出' : '导出视频'
           }}</span>
         </button>
         <button
@@ -1532,12 +1895,19 @@ onBeforeUnmount(() => {
     <div v-if="exportJob" class="export-status" role="status">
       <WorkflowIcon name="download" /><span>{{
         exportJob.status === 'running'
-          ? `正在整理成片 · ${exportJob.done || 0} / ${exportJob.total} 镜`
+          ? `${exportJob.mode === 'clips' ? '正在打包镜头' : '正在合成成片'} · ${exportJob.done || 0} / ${exportJob.total} 镜`
           : exportJob.status === 'succeeded'
-            ? '成片已就绪'
+            ? exportJob.mode === 'clips'
+              ? '镜头素材包已就绪'
+              : '成片已就绪'
             : exportJob.error
       }}</span
-      ><a v-if="exportJob.status === 'succeeded'" :href="exportJob.url" download>下载成片</a
+      ><a
+        v-if="exportJob.status === 'succeeded'"
+        :href="exportJob.url"
+        :download="exportJob.download_name || ''"
+      >
+        {{ exportJob.mode === 'clips' ? '下载素材包' : '下载成片' }}</a
       ><button v-if="exportJob.status !== 'running'" aria-label="收起导出结果" @click="exportJob = null">
         <WorkflowIcon name="close" />
       </button>
@@ -1546,7 +1916,11 @@ onBeforeUnmount(() => {
       <div
         ref="board"
         class="flow-board"
-        :class="{ panning: gesture?.kind === 'pan', linking: connecting }"
+        :class="{
+          panning: gestureState === 'pan',
+          'hand-mode': spacePressed || canvasMode === 'hand',
+          linking: connecting,
+        }"
         :style="{
           backgroundSize: `${24 * graph.viewport.zoom}px ${24 * graph.viewport.zoom}px`,
           backgroundPosition: `${graph.viewport.x}px ${graph.viewport.y}px`,
@@ -1558,7 +1932,7 @@ onBeforeUnmount(() => {
         @pointercancel="endGesture"
         @wheel.prevent="wheel"
         @dragover.prevent
-        @drop.prevent="uploadImages($event.dataTransfer.files)"
+        @drop.prevent="uploadMedia($event.dataTransfer.files)"
       >
         <div v-if="loading || loadError" class="flow-loading">
           <WorkflowIcon name="shot" />
@@ -1568,13 +1942,30 @@ onBeforeUnmount(() => {
         </div>
         <template v-else>
           <div class="flow-world" :style="worldStyle">
-            <svg class="flow-edges" overflow="visible" aria-label="节点连线">
+            <div
+              v-for="group in canvasGroups"
+              :key="group.id"
+              class="canvas-group"
+              :class="{ selected: group.nodes.every((n) => selectedIds.includes(n.id)) }"
+              :style="rectStyle(group)"
+              @pointerdown.stop="startSelectionDrag($event, group)"
+            >
+              <span class="group-label"
+                ><WorkflowIcon name="group" />{{ group.title }}<small>{{ group.nodes.length }}</small></span
+              >
+            </div>
+            <svg
+              class="flow-edges"
+              :class="{ 'has-focus': selectedIds.length || selectedEdge }"
+              overflow="visible"
+              aria-label="节点连线"
+            >
               <g
                 v-for="edge in drawnEdges"
                 :key="edge.id"
                 :class="{
                   chosen: selectedEdge === edge.id,
-                  highlighted: edge.source === selectedId || edge.target === selectedId,
+                  highlighted: edge.focused,
                 }"
               >
                 <path
@@ -1582,13 +1973,25 @@ onBeforeUnmount(() => {
                   :d="edge.path"
                   @pointerdown.stop
                   @click.stop="
+                    selectMany([]);
                     selectedEdge = edge.id;
-                    selectedId = '';
                   "
                 />
                 <path class="edge-line" :d="edge.path" />
+                <path
+                  v-if="edge.focused"
+                  class="edge-flow"
+                  :d="edge.path"
+                  pathLength="100"
+                  aria-hidden="true"
+                />
               </g>
-              <path v-if="loosePath" class="loose-edge" :d="loosePath" />
+              <path
+                v-for="(path, index) in connecting ? loosePaths : []"
+                :key="index"
+                class="loose-edge"
+                :d="path"
+              />
             </svg>
             <WorkflowNode
               v-for="node in graph.nodes"
@@ -1596,17 +1999,67 @@ onBeforeUnmount(() => {
               :node="node"
               :material="resolveMaterial(node)"
               :dimmed="false"
-              :selected="selectedId === node.id"
+              :selected="selectedIds.includes(node.id)"
               :connecting="!!connecting"
-              :targetable="!!connecting && !canConnect(graph.nodes, graph.edges, connecting, node.id)"
+              :targetable="isLinkTarget(node.id)"
+              :link-hovered="linkTargetId === node.id"
               @select="selectNode"
               @focus="focusNode"
               @drag="startNodeDrag"
               @connect="beginLink"
               @finish-connect="finishLink"
+              @hover="hoverLinkTarget"
               @generate="requestGeneration([$event])"
               @version="selectVersion"
             />
+            <div
+              v-if="selectionBox && !marquee"
+              class="selection-frame"
+              :class="{
+                grouped:
+                  commonGroup &&
+                  canvasGroups.find((g) => g.id === commonGroup)?.nodes.length === selection.length,
+              }"
+              :style="rectStyle(selectionBox)"
+              @pointerdown.stop="startSelectionDrag"
+            >
+              <button
+                class="selection-output"
+                aria-label="一起连接选中素材"
+                title="一起连接到视频"
+                @pointerdown.stop
+                @click="beginBatchLink"
+              >
+                <WorkflowIcon name="plus" />
+              </button>
+            </div>
+            <div v-if="marquee" class="selection-marquee" :style="rectStyle(marquee)"></div>
+          </div>
+          <div
+            v-if="selectionBox && !marquee"
+            class="selection-toolbar"
+            :style="selectionToolbarStyle"
+            @pointerdown.stop
+            @wheel.stop
+            aria-label="多选素材操作"
+          >
+            <input
+              v-if="commonGroup"
+              :value="selection[0]?.data.groupTitle || '素材组'"
+              aria-label="素材组名称"
+              maxlength="80"
+              @change="renameGroup($event.target.value)"
+            />
+            <span v-else class="selection-count">{{ selection.length }} 项已选</span>
+            <button @click="beginBatchLink"><WorkflowIcon name="link" />一起连接</button>
+            <button :disabled="running || graph.nodes.length + selection.length > 300" @click="duplicate">
+              <WorkflowIcon name="copy" />创建副本
+            </button>
+            <button v-if="!commonGroup" @click="groupSelection"><WorkflowIcon name="group" />打组</button>
+            <button v-else @click="ungroupSelection"><WorkflowIcon name="group" />解组</button>
+            <button aria-label="移除选中节点" title="移除选中节点" @click="removeSelected">
+              <WorkflowIcon name="trash" />
+            </button>
           </div>
           <div class="canvas-tools" @pointerdown.stop @wheel.stop>
             <button title="添加视频" aria-label="添加视频" @click="chooseAdd">
@@ -1617,6 +2070,21 @@ onBeforeUnmount(() => {
               ><button @click="addShot(true)">续拍当前视频</button>
             </div>
             <span></span
+            ><button
+              title="选择 / 框选 · Shift 多选"
+              aria-label="选择工具"
+              :class="{ active: canvasMode === 'select' }"
+              @click="canvasMode = 'select'"
+            >
+              <WorkflowIcon name="pointer" /></button
+            ><button
+              title="平移 · 空格加左键 / 中键"
+              aria-label="平移工具"
+              :class="{ active: canvasMode === 'hand' }"
+              @click="canvasMode = 'hand'"
+            >
+              <WorkflowIcon name="hand" /></button
+            ><span></span
             ><button
               title="素材库"
               aria-label="打开素材库"
@@ -1631,6 +2099,13 @@ onBeforeUnmount(() => {
               @click="uploadInput.click()"
             >
               <WorkflowIcon name="upload" /></button
+            ><button
+              :disabled="uploading"
+              title="上传参考视频，也可拖入画布"
+              aria-label="上传参考视频"
+              @click="videoUploadInput.click()"
+            >
+              <WorkflowIcon name="video" /></button
             ><button title="添加便签" aria-label="添加便签" @click="addNote">
               <WorkflowIcon name="note" /></button
             ><span></span
@@ -1706,7 +2181,9 @@ onBeforeUnmount(() => {
             </footer>
           </aside>
           <div v-if="connecting" class="connect-hint" @pointerdown.stop>
-            <WorkflowIcon name="link" />点击目标节点左侧连接点<button @click="connecting = ''">取消</button>
+            <WorkflowIcon name="link" />{{
+              linkingIds.length > 1 ? `${linkingIds.length} 项素材 · ` : ''
+            }}点击目标视频框即可连接<button @click="connecting = ''">取消</button>
           </div>
           <div v-if="selectedEdge" class="edge-toolbar" @pointerdown.stop>
             <WorkflowIcon name="link" /><span>已选中连线</span
@@ -1730,7 +2207,7 @@ onBeforeUnmount(() => {
               <WorkflowIcon name="fit" />
             </button>
           </div>
-          <div class="minimap" @pointerdown.stop @wheel.stop>
+          <div v-if="graph.nodes.length > 3" class="minimap" @pointerdown.stop @wheel.stop>
             <svg :viewBox="mapViewbox" aria-label="画布小地图，点击定位" @click="centerMap">
               <path
                 v-for="edge in drawnEdges"
@@ -1757,7 +2234,7 @@ onBeforeUnmount(() => {
                         ? '#b3a56d'
                         : '#a67c58'
                 "
-                :opacity="selectedId === node.id ? 1 : 0.7"
+                :opacity="selectedIds.includes(node.id) ? 1 : 0.7"
               />
               <rect
                 v-bind="viewportRect"
@@ -1781,12 +2258,14 @@ onBeforeUnmount(() => {
                 <WorkflowIcon name="close" />
               </button>
             </header>
-            <p>点击画布左侧或镜头序列中的加号添加视频。</p>
-            <p>拖动标题栏移动节点，拖动空白平移画布，滚轮缩放。</p>
-            <p>点击输出圆点，再点击目标输入圆点，即可连线。</p>
+            <p>底部加号添加视频，图片与视频也可以直接拖入画布。</p>
+            <p>空白处左键框选；Shift 点击多选。在节点或组框内拖动，选中素材一起移动。</p>
+            <p>中键或空格＋左键平移画布，滚轮缩放。Alt 点击组内节点，可单独编辑。</p>
+            <p>多选后点击「一起连接」或框右侧加号，再点击目标视频框即可连接。</p>
             <div>
               <span>撤销</span><kbd>Ctrl Z</kbd><span>重做</span><kbd>Ctrl Shift Z</kbd
-              ><span>移除节点或连线</span><kbd>Delete</kbd>
+              ><span>移除节点或连线</span><kbd>Delete</kbd> <span>全选</span><kbd>Ctrl A</kbd
+              ><span>打组 / 解组</span><kbd>Ctrl G / Ctrl Shift G</kbd>
             </div>
           </div>
           <VideoComposer
@@ -1808,6 +2287,7 @@ onBeforeUnmount(() => {
             @generate="requestGeneration([$event])"
             @references="drawerOpen = !drawerOpen"
             @upload="uploadInput.click()"
+            @upload-video="videoUploadInput.click()"
             @configure="emit('configure')"
             @duplicate="duplicate"
             @remove="removeSelected"
@@ -1819,6 +2299,9 @@ onBeforeUnmount(() => {
             <h3>给你的故事一个起点</h3>
             <p>添加一个视频，直接写下你想拍的画面。</p>
             <button @click="addShot()"><WorkflowIcon name="plus" />添加第一个视频</button>
+          </div>
+          <div v-if="uploading" class="upload-status" role="status" @pointerdown.stop>
+            正在上传素材，视频将自动处理为可播放格式…
           </div>
         </template>
       </div>
@@ -1995,7 +2478,18 @@ onBeforeUnmount(() => {
       multiple
       hidden
       @change="
-        uploadImages($event.target.files);
+        uploadMedia($event.target.files);
+        $event.target.value = '';
+      "
+    />
+    <input
+      ref="videoUploadInput"
+      type="file"
+      accept=".mp4,.mov,.webm,.mkv,.m4v"
+      multiple
+      hidden
+      @change="
+        uploadMedia($event.target.files);
         $event.target.value = '';
       "
     />

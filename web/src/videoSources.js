@@ -16,7 +16,7 @@ export function sourceVersion(node, edge) {
 export function videoInputs(graph, target) {
   const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
   return graph.edges
-    .filter((e) => e.target === target && nodes.get(e.source)?.type === 'shot')
+    .filter((e) => e.target === target && ['shot', 'footage'].includes(nodes.get(e.source)?.type))
     .map((edge) => ({ edge, node: nodes.get(edge.source) }));
 }
 export function videoSourcesError(inputs, cfg, queuedIds = []) {
@@ -29,8 +29,13 @@ export function videoSourcesError(inputs, cfg, queuedIds = []) {
     return '请只保留一个续拍起点，其他来源可设为视频参考';
   for (const { node, edge } of visual) {
     if (!['reference', 'continue'].includes(edge.usage)) return '请选择有效的视频用途';
-    if (!sourceVersion(node, edge)?.file && !(queuedIds.includes(node.id) && !edge.sourceVersionId))
-      return `等待「${node.data.title}」的成功视频，请先生成来源`;
+    if (
+      !sourceVersion(node, edge)?.file &&
+      !(node.type === 'shot' && queuedIds.includes(node.id) && !edge.sourceVersionId)
+    )
+      return node.type === 'footage'
+        ? `请重新上传「${node.data.title}」的来源视频`
+        : `等待「${node.data.title}」的成功视频，请先生成来源`;
     if (
       !Number.isFinite(Number(edge.tailSeconds ?? 3)) ||
       (edge.tailSeconds ?? 3) < 0.25 ||

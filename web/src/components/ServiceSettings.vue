@@ -332,6 +332,15 @@ onBeforeUnmount(() => {
                       /></label>
                     </div>
                     <p v-if="warning" class="field-warning">{{ warning }}</p>
+                    <label v-if="draft.video_workflow === 'ref2va'" class="settings-field"
+                      >人物参考精度<select v-model="draft.video_ref_image_size">
+                        <option value="match">均衡 · 参考图随画面缩小</option>
+                        <option value="max">高精度 · 保留更多人物参考细节</option>
+                      </select></label
+                    >
+                    <p v-if="draft.video_workflow === 'ref2va'" class="field-note">
+                      高精度增加参考图处理量，生成会明显变慢。人物镜头可搭配标准模型与 20 步采样。
+                    </p>
                     <p class="field-note">切换工作流会同时匹配加速模型与步数。</p>
                   </div>
                 </details>

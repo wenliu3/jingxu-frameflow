@@ -24,7 +24,9 @@ function keys(event) {
   }
   if (event.key !== 'Tab') return;
   const focusable = [
-    ...dialog.value.querySelectorAll('button:not(:disabled), textarea, select, video[controls]'),
+    ...dialog.value.querySelectorAll(
+      'button:not(:disabled), input:not(:disabled), textarea, select, video[controls]'
+    ),
   ].filter((element) => element.getClientRects().length);
   const first = focusable[0],
     last = focusable.at(-1);
@@ -59,12 +61,10 @@ onBeforeUnmount(() => previousFocus?.focus());
         <header>
           <div>
             <span>{{
-              mode === 'review' ? 'GENERATION QUEUE' : mode === 'export' ? 'FINAL CUT' : 'STORY BUILDER'
+              mode === 'review' ? 'GENERATION QUEUE' : mode === 'export' ? 'EXPORT VIDEO' : 'STORY BUILDER'
             }}</span>
             <h2 id="studio-dialog-title">
-              {{
-                mode === 'review' ? '检查并开始生成' : mode === 'export' ? '导出你的成片' : '把故事放进画布'
-              }}
+              {{ mode === 'review' ? '检查并开始生成' : mode === 'export' ? '导出视频' : '把故事放进画布' }}
             </h2>
           </div>
           <button aria-label="关闭对话框" @click="emit('close')"><WorkflowIcon name="close" /></button>
@@ -199,7 +199,7 @@ onBeforeUnmount(() => previousFocus?.focus());
 }
 .studio-dialog.export-dialog {
   width: min(1040px, 100%);
-  height: min(780px, calc(100dvh - 44px));
+  height: min(860px, calc(100dvh - 44px));
   max-height: none;
   padding: 0;
   overflow: hidden;

@@ -31,15 +31,23 @@ def resolve_video_sources(directory, sources, duration, workflow):
         node = nodes.get(source.source_node)
         versions = (node or {}).get("data", {}).get("versions", [])
         version = next((v for v in versions if v.get("id") == source.version_id), None)
-        if not node or node.get("type") != "shot" or not version or version.get("status") != "succeeded" or version.get("file") != source.file:
+        if not node or node.get("type") not in {"shot", "footage"} or not version or version.get("status") != "succeeded" or version.get("file") != source.file:
             raise HTTPException(409, "来源不是当前作品的成功版本，请重新选择来源视频")
-        path = (root / "segments" / source.file).resolve()
-        if not path.is_relative_to(root) or path.parent != (root / "segments").resolve() or not path.is_file():
+        uploaded = node.get("type") == "footage"
+        directory = (root / ("video_uploads" if uploaded else "segments")).resolve()
+        if not source.file.startswith("upload_" if uploaded else "seg_"):
+            raise HTTPException(422, "来源视频类型与文件不匹配")
+        path = (directory / source.file).resolve()
+        if not path.is_relative_to(root) or path.parent != directory or not path.is_file():
             raise HTTPException(422, "来源视频文件缺失或不属于当前作品")
         try:
             sidecar = path.with_suffix(".json")
+            if uploaded and not sidecar.is_file():
+                raise HTTPException(422, "上传视频的记录缺失，请重新上传")
             if sidecar.is_file():
                 record = json.loads(sidecar.read_text(encoding="utf-8"))
+                if uploaded and (record.get("origin") != "upload" or record.get("file") != source.file):
+                    raise HTTPException(422, "上传视频记录与来源不匹配")
                 if record.get("status", "succeeded") != "succeeded":
                     raise HTTPException(409, "来源视频尚未成功完成")
                 job_id = record.get("job_id", "")

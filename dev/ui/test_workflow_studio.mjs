@@ -34,6 +34,7 @@ test('readiness checks actual provider constraints before submitting work', () =
 })
 test('imports keep project revision and never resume foreign generation or video URLs', () => {
   const source = emptyWorkflow(), shot = makeShot(30, -100)
+  shot.data.duration = 1
   shot.data.status = 'running'; shot.data.jobId = 'foreign'
   shot.data.versions = [{ id: 'foreign-version', status: 'running', jobId: 'foreign', url: '/files/other/private.mp4' }]
   source.nodes.push(shot, makeNode('video', 400, 0, { status: 'succeeded', url: '/files/other/output.mp4', file: 'output.mp4', jobId: 'foreign' }))
@@ -42,6 +43,7 @@ test('imports keep project revision and never resume foreign generation or video
   mergeWorkflow(target, source)
   assert.equal(target.revision, 12)
   assert.equal(target.nodes[0].data.status, 'draft')
+  assert.equal(target.nodes[0].data.duration, 1)
   assert.equal(target.nodes.length, 1)
   assert.deepEqual(target.nodes[0].data.versions, [])
   assert.ok(target.nodes.every(n => !n.data.url && !n.data.jobId))
@@ -56,4 +58,19 @@ test('invalid and oversized imports leave the existing canvas intact', () => {
   assert.throws(() => appendStoryboard(target, Array(31).fill('镜头')))
   assert.throws(() => appendStoryboard(target, ['x'.repeat(1001)]))
   assert.deepEqual(target.nodes, [])
+})
+test('imported groups stay together and remain distinct from existing and repeated imports', () => {
+  const source = emptyWorkflow(), target = emptyWorkflow()
+  source.nodes = ['A', 'B'].map((title, i) => makeNode('note', i * 350, 0, { title, groupId: 'shared', groupTitle: '造型参考' }))
+  target.nodes.push(makeNode('note', 0, 0, { groupId: 'shared', groupTitle: '现有组' }))
+  mergeWorkflow(target, source)
+  mergeWorkflow(target, source)
+  assert.equal(target.nodes[1].data.groupId, target.nodes[2].data.groupId)
+  assert.equal(target.nodes[3].data.groupId, target.nodes[4].data.groupId)
+  assert.equal(target.nodes[1].data.groupTitle, '造型参考')
+  assert.equal(new Set(target.nodes.map(n => n.data.groupId)).size, 3)
+  const broken = structuredClone(source); broken.nodes[0].data.groupId = {}
+  const before = structuredClone(target)
+  assert.throws(() => mergeWorkflow(target, broken))
+  assert.deepEqual(target, before)
 })

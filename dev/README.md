@@ -27,6 +27,7 @@ npm run browser:install --prefix web
 npm run dev --prefix web
 # 在另一个终端执行
 npm run test:browser --prefix web
+npm run test:browser:export --prefix web
 ```
 
 验收使用 `web` 的 Playwright 依赖和安装的 Chromium，默认地址为 `http://127.0.0.1:5173`。全部 API 和素材请求被拦截，不需要启动后端或 ComfyUI，不创建真实作品，也不消耗模型额度。测试视频在临时目录生成，截图写到已忽略的 `docs/_shots/`。
@@ -48,7 +49,7 @@ PowerShell 示例：`$env:PYTHON='D:\miniforge\python.exe'`，然后执行测试
 | --- | --- |
 | `dev/api/test_h3_prompt_policy.py`、`test_video_contract.py` | 提示词结构、时间轴、素材编号、参数和模型输出纠错 |
 | `dev/api/test_video_sources.py` | 来源归属、成功版本、指纹、参考片段和尾帧、工作流接线 |
-| `dev/api/test_video_controls.py`、`test_canvas_export.py` | 实际视频尺寸、时长、音轨和成片合并 |
+| `dev/api/test_video_controls.py`、`test_canvas_export.py` | 实际视频尺寸、时长、音轨、成片合并和原片 ZIP 打包 |
 | `dev/api/test_workflow_store.py`、`test_config_store.py` | 原子保存、并发、冲突、配置缓存及失败保护 |
 | `dev/api/test_project_summary.py` | 作品摘要、封面、数量和缓存 |
 | `dev/ui/test_workflow_*.mjs` | 图结构、迁移、编排、队列与版本 |
@@ -56,6 +57,7 @@ PowerShell 示例：`$env:PYTHON='D:\miniforge\python.exe'`，然后执行测试
 | `dev/ui/test_prompt_mentions.mjs` | 素材身份标签、解析和断开校验 |
 | `dev/ui/test_service_settings.mjs`、`test_project_library.mjs`、`test_theme.mjs` | 配置草稿、作品筛选、主题偏好 |
 | `dev/ui/test_studio_browser.mjs` | 当前界面的完整离线浏览器验收 |
+| `dev/ui/test_canvas_export_browser.mjs` | 镜头勾选、版本、ZIP 下载、成片合成和导出布局 |
 
 单项测试也可直接运行，例如：
 

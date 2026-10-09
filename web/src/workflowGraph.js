@@ -1,6 +1,13 @@
 export const NODE_WIDTH = 320;
-export const NODE_HEIGHT = 282;
-export const TYPE_LABELS = { material: '素材', shot: '视频', video: '视频', note: '便签' };
+export const NODE_HEIGHT = 218;
+export const NODE_PORT_Y = 118;
+export const TYPE_LABELS = {
+  material: '素材',
+  shot: '视频',
+  video: '视频',
+  note: '便签',
+  footage: '参考视频',
+};
 export const KIND_LABELS = { character: '角色', scene: '场景', prop: '道具', image: '图片', audio: '音频' };
 export const clone = (value) => JSON.parse(JSON.stringify(value));
 export const uid = () => globalThis.crypto.randomUUID();
@@ -35,7 +42,11 @@ export function canConnect(nodes, edges, source, target) {
   const from = nodes.find((n) => n.id === source);
   const to = nodes.find((n) => n.id === target);
   if (!from || !to || source === target) return '不能连接到自身';
-  if (!['material:shot', 'note:shot', 'shot:shot', 'shot:video'].includes(`${from.type}:${to.type}`)) {
+  if (
+    !['material:shot', 'note:shot', 'shot:shot', 'shot:video', 'footage:shot'].includes(
+      `${from.type}:${to.type}`
+    )
+  ) {
     return '素材或便签连接视频，视频连接后续视频';
   }
   if (edges.some((e) => e.source === source && e.target === target)) return '这两个节点已经连接';
@@ -92,9 +103,9 @@ export function graphBounds(nodes) {
 
 export function edgePath(from, to) {
   const x1 = from.x + NODE_WIDTH,
-    y1 = from.y + 46;
+    y1 = from.y + NODE_PORT_Y;
   const x2 = to.x,
-    y2 = to.y + 46;
+    y2 = to.y + NODE_PORT_Y;
   const bend = Math.max(65, Math.abs(x2 - x1) * 0.45);
   return `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`;
 }

@@ -118,6 +118,7 @@ export function mergeWorkflow(graph, document) {
     throw new Error('请选择有效的镜序画布备份');
   if (graph.nodes.length + document.nodes.length > 300 || graph.edges.length + document.edges.length > 1200)
     throw new Error('导入后超过画布容量');
+  const groups = new Map();
   const ids = new Map(),
     nodes = [],
     edges = [];
@@ -129,7 +130,7 @@ export function mergeWorkflow(graph, document) {
       typeof raw.id !== 'string' ||
       !raw.id ||
       ids.has(raw.id) ||
-      !['shot', 'material', 'note', 'video'].includes(raw.type) ||
+      !['shot', 'material', 'note', 'video', 'footage'].includes(raw.type) ||
       !Number.isFinite(raw.x) ||
       !Number.isFinite(raw.y) ||
       !raw.data ||
@@ -138,6 +139,17 @@ export function mergeWorkflow(graph, document) {
     )
       throw new Error('备份中有无效节点');
     const node = clone(raw);
+    if (node.data.groupId != null) {
+      if (
+        typeof node.data.groupId !== 'string' ||
+        !node.data.groupId ||
+        (node.data.groupTitle != null && typeof node.data.groupTitle !== 'string')
+      )
+        throw new Error('备份中的素材组格式无效');
+      if (!groups.has(node.data.groupId)) groups.set(node.data.groupId, uid());
+      node.data.groupId = groups.get(node.data.groupId);
+      node.data.groupTitle = (node.data.groupTitle || '素材组').slice(0, 80);
+    }
     for (const key of ['title', 'description', 'text', 'materialName', 'materialKind', 'materialFile']) {
       if (node.data[key] != null && typeof node.data[key] !== 'string')
         throw new Error('备份中的节点文字格式无效');
@@ -156,7 +168,7 @@ export function mergeWorkflow(graph, document) {
       delete node.data.error;
       node.data.versions = [];
       delete node.data.activeVersionId;
-      if (!Number.isFinite(Number(node.data.duration)) || node.data.duration < 4 || node.data.duration > 15)
+      if (!Number.isFinite(Number(node.data.duration)) || node.data.duration < 1 || node.data.duration > 15)
         node.data.duration = 5;
       if (creationSettingsError(node.data)) throw new Error('备份中的视频生成参数无效');
       if (
@@ -166,6 +178,11 @@ export function mergeWorkflow(graph, document) {
           Number(node.data.megapixels) > 0.98)
       )
         node.data.megapixels = null;
+    }
+    if (node.type === 'footage') {
+      node.data.versions = [];
+      node.data.status = 'empty';
+      delete node.data.activeVersionId;
     }
     if (node.type === 'video') {
       node.data.status = 'empty';
@@ -197,7 +214,7 @@ export function mergeWorkflow(graph, document) {
   for (const edge of edges) {
     if (
       edge.usage !== 'text' &&
-      (nodes.find((n) => n.id === edge.source)?.type !== 'shot' ||
+      (!['shot', 'footage'].includes(nodes.find((n) => n.id === edge.source)?.type) ||
         nodes.find((n) => n.id === edge.target)?.type !== 'shot')
     )
       throw new Error('备份中的视频用途只能用于视频连线');
@@ -208,7 +225,7 @@ export function mergeWorkflow(graph, document) {
       { video_workflow: 'ref2va' },
       nodes.map((n) => n.id)
     );
-    if (error) throw new Error(error);
+    if (error && !error.startsWith('请重新上传')) throw new Error(error);
   }
   if (
     JSON.stringify({ nodes: [...graph.nodes, ...nodes], edges: [...graph.edges, ...edges] }).length > 500000

@@ -18,7 +18,7 @@ test('switching updates native controls and remains usable when storage is block
     assert.equal(document.documentElement.dataset.theme, 'light')
     assert.equal(document.documentElement.style.colorScheme, 'light')
     assert.equal(saved[THEME_KEY], 'light')
-    assert.equal(attributes.content, '#f6f5fa')
+    assert.equal(attributes.content, '#f5f5f5')
     window.localStorage.setItem = () => { throw new Error('Storage blocked') }
     assert.equal(applyTheme('invalid'), 'dark')
     assert.equal(document.documentElement.dataset.theme, 'dark')

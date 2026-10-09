@@ -108,7 +108,8 @@ class ConfigApiTests(unittest.TestCase):
     def test_invalid_settings_leave_previous_config_intact(self):
         before = self.path.read_bytes()
         for values in ({"video_steps": "1.5"}, {"video_megapixels": "nan"}, {"video_timeout_s": "10"},
-                       {"video_workflow": "unknown"}, {"video_workflow": "ref2va"}, {"unknown": "x"}):
+                       {"video_workflow": "unknown"}, {"video_workflow": "ref2va"},
+                       {"video_ref_image_size": "unknown"}, {"unknown": "x"}):
             with self.subTest(values=values):
                 self.assertEqual(self.client.patch("/api/config", json=values).status_code, 422)
                 self.assertEqual(self.path.read_bytes(), before)
@@ -117,6 +118,14 @@ class ConfigApiTests(unittest.TestCase):
         response = self.client.patch("/api/config", json={"video_lora": "", "video_steps": "20"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.client.get("/api/config").json()["video_lora"], "")
+
+    def test_reference_precision_roundtrips_without_changing_other_settings(self):
+        response = self.client.patch("/api/config", json={"video_ref_image_size": "max"})
+        self.assertEqual(response.status_code, 200)
+        cfg = self.client.get("/api/config").json()
+        self.assertEqual(cfg["video_ref_image_size"], "max")
+        self.assertEqual(cfg["text_api_key"], "test-only")
+        self.assertEqual(cfg["video_steps"], self.module.SERVICE_DEFAULTS["video_steps"])
 
     def test_connection_test_never_saves_draft(self):
         before = self.path.read_bytes()

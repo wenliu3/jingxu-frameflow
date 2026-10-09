@@ -54,6 +54,19 @@ function uploadFile(path, file, filename = '') {
 }
 
 export const api = {
+  uploadVideo(taskId, file) {
+    return request(`/api/tasks/${taskId}/video-uploads?filename=${encodeURIComponent(file.name)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: file,
+    });
+  },
+  exportClips(taskId, clips) {
+    return request(`/api/tasks/${taskId}/canvas-export/clips`, {
+      method: 'POST',
+      body: JSON.stringify({ clips }),
+    });
+  },
   exportCanvas(taskId, files, aspect) {
     return request(`/api/tasks/${taskId}/canvas-export`, {
       method: 'POST',

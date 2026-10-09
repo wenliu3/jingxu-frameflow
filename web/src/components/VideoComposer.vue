@@ -29,6 +29,7 @@ const emit = defineEmits([
   'disconnect',
   'references',
   'upload',
+  'upload-video',
   'configure',
   'version',
   'resize',
@@ -119,6 +120,7 @@ function camera(preset) {
           <WorkflowIcon name="plus" />参考素材 <small v-if="references.length">{{ references.length }}</small>
         </button>
         <button @click="emit('upload')"><WorkflowIcon name="upload" />上传图片</button>
+        <button @click="emit('upload-video')"><WorkflowIcon name="video" />上传视频</button>
         <div class="composer-popover-anchor">
           <button
             :class="{ active: cameraOpen }"

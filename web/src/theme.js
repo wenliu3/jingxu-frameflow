@@ -13,7 +13,7 @@ export function applyTheme(theme) {
   document.documentElement.style.colorScheme = selected;
   document
     .querySelector('meta[name="theme-color"]')
-    ?.setAttribute('content', selected === 'light' ? '#f6f5fa' : '#1b1b22');
+    ?.setAttribute('content', selected === 'light' ? '#f5f5f5' : '#1b1b22');
   try {
     window.localStorage.setItem(THEME_KEY, selected);
   } catch {

@@ -31,6 +31,8 @@ const paths = {
   help: 'M9 8a3 3 0 1 1 5 2c-1 1-2 1-2 3 M12 17h.01 M22 12a10 10 0 1 1-20 0a10 10 0 0 1 20 0',
   check: 'M5 12l4 4L19 6',
   hand: 'M8 12V5a2 2 0 0 1 4 0v7 M12 7a2 2 0 0 1 4 0v6 M16 9a2 2 0 0 1 4 0v8l-4 5H9l-6-9a2 2 0 0 1 3-2z',
+  pointer: 'M5 3l14 10-7 1-3 7z M12 14l5 6',
+  group: 'M8 3H3v5 M16 3h5v5 M3 16v5h5 M21 16v5h-5 M7 7h4v4H7z M13 13h4v4h-4z',
   spark: 'M12 2l3 7 7 3-7 3-3 7-3-7-7-3 7-3z',
 };
 </script>

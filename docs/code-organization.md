@@ -28,6 +28,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
+| `server/video_uploads.py` | 本地视频流式上传、格式校验、MP4 转换、预览和作品内持久保存 |
 | `server/app.py` | 接口注册、作品与素材解析、配置快照和生成前检查；保留仍在使用的旧作品与 CLI 接口 |
 | `server/video_contracts.py` | 编排、提示词优化和候选生成请求的字段、类型与范围 |
 | `server/prompt_mentions.py` | 根据本次真实参考槽位，把素材身份转换为 Subject/Picture 标签；拒绝未选择的引用 |
@@ -39,7 +40,7 @@
 | `video_provider.py` | ComfyUI/API 协议、工作流接线、远端轮询与下载 |
 | `video_controls.py` | 输出尺寸、H3 帧数、精确时长和音轨处理 |
 | `server/workflow_store.py` / `config_store.py` | 画布和服务配置的保存、版本冲突与配置缓存 |
-| `server/canvas_export.py` | 成片导出的文件校验、后台合并和进度 |
+| `server/canvas_export.py` | 视频导出的文件校验、原片 ZIP 打包、后台合并和进度 |
 | `server/project_summary.py` | 作品列表摘要和封面 |
 
 接口层负责校验与解析，后台执行模块使用已固定的 Provider 和生成参数；保存模块不依赖 HTTP 或远端服务。写记录失败时停止尚未提交的候选。临时文件完整写入后才替换目标文件，保留已有完整记录。

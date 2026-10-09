@@ -49,6 +49,8 @@ test('history restores custom timing and actual candidate settings instead of ro
   const settings = recordSettings({ note: '晨光', duration: 6.5, ratio: '9:16', resolution: '480p', candidate_count: 4, generate_audio: false, exact_duration: true, seed: 0, megapixels: .41 })
   assert.deepEqual(settings, { description: '晨光', manual: false, duration: 6.5, ratio: '9:16', resolution: '480p', candidateCount: 4, generateAudio: false, exactDuration: true, seed: 0, megapixels: .41 })
   assert.equal(recordSettings({ duration: 6.5, planned_duration: 7.25 }).duration, 7.25)
+  assert.equal(recordSettings({ duration: 1 }).duration, 1)
+  assert.equal(recordSettings({ duration: 1.5 }).duration, 1.5)
   assert.equal(recordSettings({ duration: 'broken' }).duration, 5)
   assert.equal(recordSettings({ video_backend: 'api', megapixels: .5 }).megapixels, null)
   assert.equal(recordSettings({}).resolution, 'custom', 'old records keep their pixel-budget behavior')

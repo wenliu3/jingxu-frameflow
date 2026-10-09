@@ -19,6 +19,7 @@ function range(key, value) {
         v-if="version?.url"
         :key="version.id"
         :src="version.url"
+        :poster="version.poster"
         preload="metadata"
         controls
         muted
@@ -34,6 +35,7 @@ function range(key, value) {
         <option v-for="use in VIDEO_USES" :key="use.value" :value="use.value">{{ use.label }}</option>
       </select>
       <select
+        v-if="node.type !== 'footage' && versions.length > 1"
         :aria-label="`${node.data.title} 来源版本`"
         :value="edge.sourceVersionId || ''"
         @change="emit('change', { sourceVersionId: $event.target.value, start: null, end: null })"
@@ -44,58 +46,61 @@ function range(key, value) {
         </option>
       </select>
     </div>
-    <div v-if="edge.usage && edge.usage !== 'text'" class="range-options">
-      <template v-if="edge.usage === 'reference'"
-        ><label
-          >开始
+    <details v-if="edge.usage && edge.usage !== 'text'" class="source-advanced">
+      <summary>{{ edge.usage === 'continue' ? '续拍设置' : '参考范围' }}</summary>
+      <div class="range-options">
+        <template v-if="edge.usage === 'reference'"
+          ><label
+            >开始
+            <input
+              type="number"
+              min="0"
+              step="0.1"
+              :value="edge.start"
+              placeholder="自动"
+              :aria-label="`${node.data.title} 参考开始秒`"
+              @change="range('start', $event.target.value)" /></label
+          ><label
+            >结束
+            <input
+              type="number"
+              min="0"
+              step="0.1"
+              :value="edge.end"
+              placeholder="片尾"
+              :aria-label="`${node.data.title} 参考结束秒`"
+              @change="range('end', $event.target.value)" /></label
+        ></template>
+        <label v-else
+          ><input
+            type="checkbox"
+            :checked="edge.motionReference !== false"
+            @change="emit('change', { motionReference: $event.target.checked })"
+          />同时参考结尾动作</label
+        >
+        <label
+          >参考长度
           <input
             type="number"
-            min="0"
-            step="0.1"
-            :value="edge.start"
-            placeholder="自动"
-            :aria-label="`${node.data.title} 参考开始秒`"
-            @change="range('start', $event.target.value)" /></label
-        ><label
-          >结束
-          <input
-            type="number"
-            min="0"
-            step="0.1"
-            :value="edge.end"
-            placeholder="片尾"
-            :aria-label="`${node.data.title} 参考结束秒`"
-            @change="range('end', $event.target.value)" /></label
-      ></template>
-      <label v-else
-        ><input
-          type="checkbox"
-          :checked="edge.motionReference !== false"
-          @change="emit('change', { motionReference: $event.target.checked })"
-        />同时参考结尾动作</label
+            min="0.25"
+            max="15"
+            step="0.25"
+            :value="edge.tailSeconds ?? 3"
+            :aria-label="`${node.data.title} 参考长度秒`"
+            @change="emit('change', { tailSeconds: Number($event.target.value) })"
+          />秒</label
+        >
+      </div>
+      <small
+        >{{
+          (edge.usage || 'text') === 'text'
+            ? '仅提供文字前情'
+            : edge.usage === 'continue'
+              ? '尾帧作为新片开头 · 时长表示新增内容'
+              : '借鉴画面与动作 · 不锁定新片开头'
+        }}{{ edge.usage !== 'text' && edge.usage ? ' · 不复用来源音轨' : '' }}</small
       >
-      <label
-        >参考长度
-        <input
-          type="number"
-          min="0.25"
-          max="15"
-          step="0.25"
-          :value="edge.tailSeconds ?? 3"
-          :aria-label="`${node.data.title} 参考长度秒`"
-          @change="emit('change', { tailSeconds: Number($event.target.value) })"
-        />秒</label
-      >
-    </div>
-    <small
-      >{{
-        (edge.usage || 'text') === 'text'
-          ? '仅提供文字前情'
-          : edge.usage === 'continue'
-            ? '尾帧作为新片开头 · 时长表示新增内容'
-            : '借鉴画面与动作 · 不锁定新片开头'
-      }}{{ edge.usage !== 'text' && edge.usage ? ' · 不复用来源音轨' : '' }}</small
-    >
+    </details>
   </article>
 </template>
 <style scoped>
@@ -133,6 +138,14 @@ function range(key, value) {
 }
 .source-options {
   margin: 7px 0;
+}
+.source-advanced summary {
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--day-muted, #a4a5b4);
+}
+.source-advanced[open] .range-options {
+  margin: 9px 0;
 }
 .video-source select {
   width: auto;

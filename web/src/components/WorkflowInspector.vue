@@ -1,6 +1,7 @@
 <script setup>
 import WorkflowIcon from './WorkflowIcon.vue';
 import { TYPE_LABELS, KIND_LABELS } from '../workflowGraph';
+import { currentVideo } from '../workflowVideo.js';
 defineProps({ node: Object, material: Object, generating: Boolean });
 const emit = defineEmits(['edit', 'checkpoint', 'close', 'duplicate', 'remove']);
 </script>
@@ -37,10 +38,31 @@ const emit = defineEmits(['edit', 'checkpoint', 'close', 'duplicate', 'remove'])
           <div class="material-info">
             <span>{{ KIND_LABELS[node.data.materialKind] }}</span
             ><b>{{ material?.name || node.data.materialName }}</b>
-            <p>{{ material?.description || '素材尚未就绪，请前往素材工坊准备。' }}</p>
+            <p>
+              {{ material?.description || (material?.ready ? '' : '素材尚未就绪，请前往素材工坊准备。') }}
+            </p>
           </div>
           <p class="field-hint">同一份素材可以连接多个视频。移除画布节点会保留原素材。</p></template
         >
+        <template v-else-if="node.type === 'footage'">
+          <video
+            v-if="currentVideo(node)"
+            class="material-large"
+            :src="currentVideo(node).url"
+            :poster="currentVideo(node).poster"
+            controls
+            preload="metadata"
+          />
+          <div class="material-info">
+            <span>本地上传</span><b>{{ currentVideo(node)?.original_filename || node.data.title }}</b>
+            <p v-if="currentVideo(node)">
+              {{ currentVideo(node).width }} × {{ currentVideo(node).height }} ·
+              {{ Number(Number(currentVideo(node).actual_duration).toFixed(2)) }} 秒
+            </p>
+          </div>
+          <p class="field-hint">连接到视频节点后，可选择视频参考或从结尾续拍。需要 Ref2VA 工作流。</p>
+          <p v-if="!currentVideo(node)" class="field-hint">画布备份不包含视频文件，请重新上传并连接。</p>
+        </template>
       </fieldset>
       <div class="node-actions">
         <button :disabled="generating" @click="emit('duplicate')"><WorkflowIcon name="copy" />复制节点</button

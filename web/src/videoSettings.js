@@ -19,8 +19,8 @@ export function creationSettings(data, cfg) {
   };
 }
 export function creationSettingsError(data) {
-  if (!Number.isFinite(Number(data.duration)) || data.duration < 4 || data.duration > 15)
-    return '视频时长应为 4–15 秒';
+  if (!Number.isFinite(Number(data.duration)) || data.duration < 1 || data.duration > 15)
+    return '视频时长应为 1–15 秒';
   if (!RATIO_OPTIONS.includes(data.ratio || 'auto')) return '请选择有效的画幅比例';
   if (!['custom', '480p', '720p'].includes(data.resolution || 'custom')) return '请选择有效的清晰度';
   if (![1, 2, 4].includes(data.candidateCount ?? 1)) return '一次可生成 1、2 或 4 个候选';

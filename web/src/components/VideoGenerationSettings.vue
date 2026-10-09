@@ -171,13 +171,13 @@ defineExpose({ close });
         </select></label
       >
       <label class="settings-label"
-        >{{ cfg.video_backend === 'api' ? '计划节奏' : '视频时长' }}<span>4–15 秒</span></label
+        >{{ cfg.video_backend === 'api' ? '计划节奏' : '视频时长' }}<span>1–15 秒</span></label
       >
       <div class="duration-control">
         <input
           aria-label="视频时长滑块"
           type="range"
-          min="4"
+          min="1"
           max="15"
           step="0.5"
           :value="node.data.duration"
@@ -185,7 +185,7 @@ defineExpose({ close });
         /><input
           aria-label="视频时长"
           type="number"
-          min="4"
+          min="1"
           max="15"
           step="0.5"
           :value="node.data.duration"

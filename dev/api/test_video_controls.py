@@ -17,7 +17,7 @@ class VideoControlsTests(unittest.TestCase):
         self.assertIsNone(output_size("auto", "custom", "unused", 0.7))
         with patch("video_controls.image_size", return_value=(1000, 2000)):
             self.assertEqual(output_size("auto", "720p", "image", 0.7), (640, 1280))
-        for duration in (4, 4.5, 6.5, 15):
+        for duration in (1, 1.5, 2, 3, 4, 4.5, 6.5, 15):
             self.assertEqual(h3_frames(duration) % 17, 5)
             self.assertLessEqual(abs(h3_frames(duration) / 24 - duration), 17 / 48)
 

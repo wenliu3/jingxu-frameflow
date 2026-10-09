@@ -69,6 +69,7 @@ SERVICE_DEFAULTS = {
     "image_model": "Tongyi-MAI/Z-Image-Turbo",
     "video_megapixels": "0.5",
     "video_steps": "4",
+    "video_ref_image_size": "match",
     "video_lora": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
     # 用哪份 ComfyUI 工作流（2026-09-19 加）。**默认 i2v，不自动切**：
     #   i2v    = comfyui/h3_i2v_api.json —— 单张首帧（最多再加一张尾帧）
@@ -111,6 +112,7 @@ _ENV_OF = {
     "image_model": "MODELSCOPE_IMAGE_MODEL",
     "video_megapixels": "H3_MEGAPIXELS",
     "video_steps": "H3_STEPS",
+    "video_ref_image_size": "H3_REF_IMAGE_SIZE",
     "video_lora": "H3_LORA",
     "video_workflow": "H3_WORKFLOW",
     "video_timeout_s": "H3_VIDEO_TIMEOUT",
@@ -207,6 +209,7 @@ def _make_video_provider(cfg: dict | None = None):
         timeout_per_shot=timeout_s,
         megapixels=resolve_resolution(None, cfg), steps=int(cfg["video_steps"]),
         lora=str(cfg.get("video_lora") or ""),
+        ref_image_size=str(cfg.get("video_ref_image_size") or "match"),
     )
 
 
@@ -377,6 +380,7 @@ class ServiceConfigPatch(BaseModel):
     image_model: str = ""
     video_megapixels: str = ""
     video_steps: str = ""
+    video_ref_image_size: str = "match"
     video_lora: str = ""
     # 用哪份 ComfyUI 工作流（i2v / ref2va）。⚠️ 默认空串 —— 空串会被
     # _load_service_config 兜回 SERVICE_DEFAULTS 的 "i2v"，
@@ -516,7 +520,7 @@ class BlockCreate(BaseModel):
     camera: str = Field("", max_length=20)
     motion: str = Field("", max_length=40)
     avoid: str = Field("", max_length=1000)
-    duration: float = Field(10.0, ge=2, le=15)
+    duration: float = Field(10.0, ge=1, le=15)
     continue_last: bool = False
 
 
@@ -531,7 +535,7 @@ class BlockPatch(BaseModel):
     camera: str | None = Field(None, max_length=20)
     motion: str | None = Field(None, max_length=40)
     avoid: str | None = Field(None, max_length=1000)
-    duration: float | None = Field(None, ge=2, le=15)
+    duration: float | None = Field(None, ge=1, le=15)
     continue_last: bool | None = None
     visual_prompt: str | None = None
     negative_prompt: str | None = None
@@ -2721,7 +2725,7 @@ REF2VA_MAX_REFS = 9
 @app.get("/api/video-capabilities")
 def video_capabilities() -> dict:
     api = effective_workflow(_load_service_config()) == "api"
-    return {"controls_version": 1, "candidate_counts": [1, 2, 4], "duration_min": 4, "duration_max": 15,
+    return {"controls_version": 1, "candidate_counts": [1, 2, 4], "duration_min": 1, "duration_max": 15,
             "ratios": ["auto"] if api else ["auto", "16:9", "4:3", "1:1", "3:4", "9:16", "21:9"],
             "resolutions": ["custom"] if api else ["custom", "480p", "720p"], "exact_duration": not api, "seed": not api, "video_sources_version": 1,
             "video_references": effective_workflow(_load_service_config()) == "ref2va", "remote_verified": False}
@@ -2940,6 +2944,7 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
         "model_duration": None if workflow == "api" else h3_frames(duration) / 24,
         "candidate_count": body.candidate_count,
         "video_steps": None if workflow == "api" else int(cfg_now["video_steps"]),
+        "video_ref_image_size": str(cfg_now.get("video_ref_image_size") or "match") if workflow == "ref2va" else None,
         "video_lora": "" if workflow == "api" else str(cfg_now.get("video_lora") or ""),
         "video_backend": str(cfg_now.get("video_backend") or ""),
         "video_mode": str(cfg_now.get("video_mode") or ""),
@@ -5321,6 +5326,7 @@ def _validate_service_config(cfg: dict) -> None:
     for key, allowed in (
         ("video_backend", ("comfyui", "api")), ("video_mode", VIDEO_MODES),
         ("video_workflow", VIDEO_WORKFLOWS), ("audio_provider", AUDIO_PROVIDERS),
+        ("video_ref_image_size", ("match", "max")),
     ):
         if cfg.get(key) not in allowed:
             raise ValueError(f"{key} 的选项无效")
@@ -5384,6 +5390,10 @@ from server.workflow_store import register_workflow_routes
 from server.project_summary import project_summary
 
 register_workflow_routes(app, _task, _out_dir)
+
+from server.video_uploads import register_video_upload_routes
+
+register_video_upload_routes(app, lambda task_id: _task(task_id), lambda task_id: _out_dir(task_id))
 
 # 启动时把磁盘上的历史任务认回来，这样任务列表不再依赖浏览器
 _scan_tasks()

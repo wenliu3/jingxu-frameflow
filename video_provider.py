@@ -234,7 +234,7 @@ class ComfyUIVideoProvider:
         poll_interval: float = 10.0,
         timeout_per_shot: float = 3600.0,
         *, megapixels: float | None = None, steps: int | None = None,
-        lora: str | None = None,
+        lora: str | None = None, ref_image_size: str | None = None,
     ) -> None:
         # ⚠️ 超时别按"看起来够用"给。2026-09-19 实测：H3 跑一条 **10 秒**的片，
         #    从 execution_start 到 execution_success 是 **1868 秒（31 分钟）**，
@@ -269,11 +269,32 @@ class ComfyUIVideoProvider:
         self.megapixels = float(megapixels if megapixels is not None else os.getenv("H3_MEGAPIXELS", "0.9"))
         self.steps = int(steps if steps is not None else os.getenv("H3_STEPS", "8"))
         self.lora = str(lora if lora is not None else os.getenv("H3_LORA", "")).strip()
+        self.ref_image_size = ref_image_size
+        if ref_image_size is not None and ref_image_size not in ("match", "max"):
+            raise ValueError("人物参考精度必须是 match 或 max")
 
     # 轮询时能容忍的**连续**失败次数（poll_interval 默认 10 秒 → 约 5 分钟）。
     # 覆盖隧道断线重连、ComfyUI 短暂卡住；真断了就如实报错，不无限等。
     # 见 _wait 的 docstring。
     _POLL_TOLERANCE = 30
+
+    # Uploads overwrite the same input file; downloads are published atomically.
+    # Retrying these transfers is safe. Never retry /prompt here: a lost reply
+    # could otherwise submit a second expensive generation.
+    _TRANSFER_RETRY_DELAYS = (2, 4, 8, 16, 30)
+
+    def _retry_transfer(self, operation: str, action):
+        for attempt in range(len(self._TRANSFER_RETRY_DELAYS) + 1):
+            try:
+                return action()
+            except requests.RequestException as exc:
+                code = getattr(getattr(exc, "response", None), "status_code", None)
+                transient = code is None or code in (408, 429) or code >= 500
+                if not transient or attempt == len(self._TRANSFER_RETRY_DELAYS):
+                    raise
+                delay = self._TRANSFER_RETRY_DELAYS[attempt]
+                print(f"[出片] {operation}暂时失败，{delay} 秒后重试（第 {attempt + 1} 次）")
+                time.sleep(delay)
 
     def generate(
         self,
@@ -414,9 +435,11 @@ class ComfyUIVideoProvider:
             required["MiniMaxH3AddGuide"] = {"positive", "latent", "image", "frame_idx", "vae"}
         for name, fields in required.items():
             try:
-                response = requests.get(f"{self.base}/object_info/{name}", timeout=20)
-                response.raise_for_status()
-                schema = response.json().get(name)
+                def fetch_schema():
+                    response = requests.get(f"{self.base}/object_info/{name}", timeout=20)
+                    response.raise_for_status()
+                    return response.json().get(name)
+                schema = self._retry_transfer("检查视频参考能力", fetch_schema)
             except (requests.RequestException, ValueError) as exc:
                 raise RuntimeError("无法确认 ComfyUI 的视频参考能力，请启动实例并检查连接") from exc
             inputs = (schema or {}).get("input", {})
@@ -425,15 +448,19 @@ class ComfyUIVideoProvider:
                 raise RuntimeError(f"ComfyUI 缺少视频参考所需节点或输入：{name}，请更新 ComfyUI 后重试")
 
     def _upload(self, image_path: str) -> str:
-        with open(image_path, "rb") as fh:
-            resp = requests.post(
-                f"{self.base}/upload/image",
-                files={"image": (os.path.basename(image_path), fh)},
-                data={"overwrite": "true"},
-                timeout=120,
-            )
-        resp.raise_for_status()
-        data = resp.json()
+        def upload():
+            # Reopen on every attempt, including when a failed request consumed
+            # the whole multipart body before its response was lost.
+            with open(image_path, "rb") as fh:
+                resp = requests.post(
+                    f"{self.base}/upload/image",
+                    files={"image": (os.path.basename(image_path), fh)},
+                    data={"overwrite": "true"},
+                    timeout=120,
+                )
+            resp.raise_for_status()
+            return resp.json()
+        data = self._retry_transfer("上传参考素材", upload)
         # 带子目录时 LoadImage 的 image 字段要写 "subfolder/name" 形式
         sub = data.get("subfolder", "")
         name = data.get("name", "")
@@ -469,6 +496,8 @@ class ComfyUIVideoProvider:
             )
         h3 = wf[h3_id]
         is_ref2va = h3["class_type"] == "MiniMaxH3ReferenceToVideo"
+        if is_ref2va and self.ref_image_size is not None:
+            h3["inputs"]["ref_image_size"] = self.ref_image_size
         # Ref2VA 用 ref_images.ref_image_N 收参考图；I2V 只有 first_frame（+可选 last_frame）
         first_slot = "ref_images.ref_image_0" if is_ref2va else "first_frame"
 
@@ -600,8 +629,12 @@ class ComfyUIVideoProvider:
             # turbo LoRA 蒸馏档：8 步左右出片
             wf["121"]["inputs"]["lora_name"] = lora_name
         else:
-            # 标准（无 LoRA）档：卸掉 LoRA 节点，模型直连采样器，20 步以上无蒸馏伪影
-            wf["9"]["inputs"]["model"] = ["6", 0]
+            # Removing the acceleration node must reconnect both scheduler and guider.
+            # Otherwise the standard model path still contains a dangling guider link.
+            for node in wf.values():
+                for key, value in node.get("inputs", {}).items():
+                    if value == ["121", 0]:
+                        node["inputs"][key] = ["6", 0]
             wf.pop("121", None)
         return wf
 
@@ -701,26 +734,35 @@ class ComfyUIVideoProvider:
                 raise RuntimeError(f"工作流执行出错：{json.dumps(status.get('messages', []), ensure_ascii=False)[:600]}")
             if not status.get("completed"):
                 continue
-            # 从 outputs 里翻出视频文件（不依赖具体节点 id / 键名）
+            # LoadVideo also appears in history outputs, but its file lives in
+            # input/. Only saved output videos are generated results; preview
+            # images and input/reference videos must never be downloaded here.
             for outputs in entry.get("outputs", {}).values():
                 for items in outputs.values():
                     if not isinstance(items, list):
                         continue
                     for item in items:
-                        if isinstance(item, dict) and item.get("filename"):
-                            return item["filename"], item.get("subfolder", "")
-            raise RuntimeError("工作流完成但 outputs 里没有文件")
+                        if not isinstance(item, dict):
+                            continue
+                        filename = item.get("filename", "")
+                        if (isinstance(filename, str)
+                                and item.get("type", "output") == "output"
+                                and os.path.splitext(filename)[1].lower() in (".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v")):
+                            return filename, item.get("subfolder", "")
+            raise RuntimeError("工作流完成但没有保存生成的视频文件；输入参考视频和预览图片不算成片")
         raise TimeoutError(f"视频生成超时（{self.timeout:.0f}s），prompt_id={prompt_id}")
 
     def _download(self, filename: str, subfolder: str, out_path: str) -> None:
         parent = os.path.dirname(out_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with requests.get(
-            f"{self.base}/view",
-            params={"filename": filename, "subfolder": subfolder, "type": "output"},
-            stream=True,
-            timeout=300,
-        ) as resp:
-            resp.raise_for_status()
-            _save_video_stream(resp, out_path)
+        def download():
+            with requests.get(
+                f"{self.base}/view",
+                params={"filename": filename, "subfolder": subfolder, "type": "output"},
+                stream=True,
+                timeout=300,
+            ) as resp:
+                resp.raise_for_status()
+                _save_video_stream(resp, out_path)
+        self._retry_transfer("下载生成视频", download)

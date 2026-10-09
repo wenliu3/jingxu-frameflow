@@ -24,7 +24,7 @@ class PromptPolicyTests(unittest.TestCase):
             material_lines=self.materials, duration=6.5, **extra)
 
     def test_default_single_take_even_for_long_video(self):
-        for duration in (4, 6.5, 10, 15):
+        for duration in (1, 1.5, 4, 6.5, 10, 15):
             self.assertEqual(shot_intent("女孩回头，镜头缓慢推进", duration), (1, []))
 
     def test_explicit_cuts_and_single_take_override(self):

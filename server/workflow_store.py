@@ -24,7 +24,7 @@ class Viewport(Position):
 
 class CanvasNode(Position):
     id: str = Field(min_length=1, max_length=100)
-    type: Literal["material", "shot", "video", "note"]
+    type: Literal["material", "shot", "video", "note", "footage"]
     data: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -65,7 +65,7 @@ class WorkflowDocument(BaseModel):
                 raise ValueError("相同节点之间不能重复连线")
             pairs.add((edge.source, edge.target))
             allowed = (kinds[edge.source], kinds[edge.target]) in {
-                ("material", "shot"), ("note", "shot"),
+                ("material", "shot"), ("note", "shot"), ("footage", "shot"),
                 ("shot", "shot"), ("shot", "video"),
             }
             if edge.source == edge.target or not allowed:
@@ -73,7 +73,7 @@ class WorkflowDocument(BaseModel):
             outgoing[edge.source].append(edge.target)
             indegree[edge.target] += 1
         for edge in self.edges:
-            if edge.usage != "text" and (kinds[edge.source], kinds[edge.target]) != ("shot", "shot"):
+            if edge.usage != "text" and (kinds[edge.source] not in {"shot", "footage"} or kinds[edge.target] != "shot"):
                 raise ValueError("只有视频卡之间可以设置视频参考用途")
             if edge.start is not None and edge.end is not None and edge.start >= edge.end:
                 raise ValueError("参考结束时间必须晚于开始时间")

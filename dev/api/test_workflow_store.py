@@ -63,6 +63,16 @@ class WorkflowStoreTests(unittest.TestCase):
         self.assertEqual(self.client.put(self.url, json=self.document).status_code, 409)
         self.assertEqual(self.client.get(self.url).json()["nodes"][1]["data"]["title"], "第一镜")
 
+    def test_group_members_and_names_survive_recreation_with_reference_edges(self):
+        for node in self.document["nodes"][:2]:
+            node["data"].update(groupId="reference-group", groupTitle="场景与动作参考")
+        self.assertEqual(self.client.put(self.url, json=self.document).status_code, 200)
+        with self.new_client() as restarted:
+            restored = restarted.get(self.url).json()
+        self.assertEqual(restored["nodes"], self.document["nodes"])
+        self.assertEqual(restored["edges"][0]["source"], "material")
+        self.assertEqual(restored["edges"][0]["target"], "shot")
+
     def test_unified_video_versions_and_job_survive_service_recreation(self):
         self.document["nodes"] = self.document["nodes"][:2]
         data = self.document["nodes"][1]["data"]

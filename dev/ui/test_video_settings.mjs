@@ -28,5 +28,6 @@ test('creation controls preserve custom duration and supported candidate setting
   assert.equal(creationSettingsError(data), '')
   assert.deepEqual(creationSettings(data, {}), { ratio: '9:16', resolution: '480p', candidate_count: 4, generate_audio: false, exact_duration: true, seed: 0 })
   assert.deepEqual(creationSettings(data, { video_backend: 'api' }), { ratio: 'auto', resolution: 'custom', candidate_count: 4, generate_audio: false, exact_duration: false })
-  for (const patch of [{ duration: 3 }, { duration: 16 }, { seed: -1 }, { candidateCount: 3 }, { ratio: '2:3' }, { resolution: '4k' }]) assert.ok(creationSettingsError({ ...data, ...patch }))
+  for (const duration of [1, 1.5, 2, 3, 15]) assert.equal(creationSettingsError({ ...data, duration }), '')
+  for (const patch of [{ duration: 0.5 }, { duration: 16 }, { seed: -1 }, { candidateCount: 3 }, { ratio: '2:3' }, { resolution: '4k' }]) assert.ok(creationSettingsError({ ...data, ...patch }))
 })

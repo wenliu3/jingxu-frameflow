@@ -14,7 +14,7 @@ export function recordSettings(detail) {
   return {
     description: (detail?.note || detail?.prompt || '').slice(0, detail?.note ? 1000 : 8000),
     manual: !detail?.note,
-    duration: Number.isFinite(duration) ? Math.max(4, Math.min(15, duration)) : 5,
+    duration: Number.isFinite(duration) ? Math.max(1, Math.min(15, duration)) : 5,
     megapixels: detail?.video_backend === 'api' ? null : (detail?.megapixels ?? null),
     ratio: detail?.ratio || 'auto',
     resolution: detail?.resolution || 'custom',
