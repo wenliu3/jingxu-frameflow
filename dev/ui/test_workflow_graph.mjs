@@ -2,6 +2,13 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { canConnect, arrange, graphBounds, seedWorkflow } from '../../web/src/workflowGraph.js'
 
+test('standalone audio cannot become a video image reference', () => {
+  const nodes = [{ id: 'audio', type: 'material', data: { materialKind: 'audio' } }, { id: 'target', type: 'shot' }]
+  assert.ok(canConnect(nodes, [], 'audio', 'target'))
+  nodes[0].data.materialKind = 'image'
+  assert.equal(canConnect(nodes, [], 'audio', 'target'), '')
+})
+
 const nodes = [
   { id: 'material', type: 'material', x: 0, y: 0 },
   { id: 'first', type: 'shot', x: 0, y: 0 },

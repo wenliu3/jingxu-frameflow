@@ -15,6 +15,16 @@ test('disconnects and missing references do not silently redirect a prompt', () 
   assert.ok(mentionsError('@{image:First}', [{ kind: 'image', name: 'First', ready: false }]))
   assert.equal(displayPrompt('普通文本 <Picture 1> @{image:%ZZ}'), '普通文本 <Picture 1> @{image:%ZZ}')
 })
+test('video mentions bind node identity even with duplicate titles and punctuation', () => {
+  const first = { kind: 'video', nodeId: 'node-first', name: '视频 01 | 剪辑', ready: true };
+  const second = { ...first, nodeId: 'node-second' };
+  const token = mentionToken(first);
+  assert.equal(displayPrompt(token), '@视频 01 | 剪辑');
+  assert.equal(promptParts(token)[0].nodeId, first.nodeId);
+  assert.equal(mentionsError(token, [second]).includes(first.name), true);
+  assert.equal(mentionsError(token, [{ ...first, name: '已更名的视频' }]), '');
+  assert.notEqual(mentionToken(first), mentionToken(second));
+})
 test('mention search respects caret and does not trigger in existing tokens or email addresses', () => {
   assert.deepEqual(mentionQuery('在 @山海 晨光中', 5), { start: 2, end: 5, query: '山海' })
   assert.equal(mentionQuery('@{image:First}', 14), null)

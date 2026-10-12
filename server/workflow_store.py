@@ -56,6 +56,7 @@ class WorkflowDocument(BaseModel):
             raise ValueError("连线编号不能重复")
         pairs = set()
         kinds = {n.id: n.type for n in self.nodes}
+        audio_ids = {n.id for n in self.nodes if n.type == "material" and n.data.get("materialKind") == "audio"}
         outgoing = {nid: [] for nid in ids}
         indegree = {nid: 0 for nid in ids}
         for edge in self.edges:
@@ -68,7 +69,7 @@ class WorkflowDocument(BaseModel):
                 ("material", "shot"), ("note", "shot"), ("footage", "shot"),
                 ("shot", "shot"), ("shot", "video"),
             }
-            if edge.source == edge.target or not allowed:
+            if edge.source == edge.target or not allowed or edge.source in audio_ids:
                 raise ValueError("这两种节点不能连接")
             outgoing[edge.source].append(edge.target)
             indegree[edge.target] += 1

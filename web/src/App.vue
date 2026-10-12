@@ -501,7 +501,7 @@ const KIND_LABEL = { character: '角色', scene: '场景', prop: '道具', image
 // 「首帧」问"我都没选首尾帧怎么冒出个首帧" —— 因为没显式挑时，后端会自动把
 // 第一张能当帧的素材当首帧（I2V 工作流必须有一张），标签得说清楚它是"被当成了首帧"。
 const ROLE_LABEL = { first_frame: '首帧图', last_frame: '尾帧图', selected: '参考图' };
-const BACKEND_LABEL = { comfyui: 'ComfyUI', api: '第三方 API' };
+const BACKEND_LABEL = { comfyui: 'ComfyUI', api: '第三方 API', muse: 'Muse' };
 
 async function openSegDetail(it) {
   if (segDetail.value?.name === it.name) {
@@ -738,7 +738,13 @@ watchEffect(() => {
               <circle cx="13" cy="14" r="2" fill="currentColor" />
             </svg>
             <span>{{
-              workspaceMode ? (cfg.video_backend === 'api' ? '视频 API' : 'ComfyUI') : '服务设置'
+              workspaceMode
+                ? cfg.video_backend === 'muse'
+                  ? 'Muse'
+                  : cfg.video_backend === 'api'
+                    ? '视频 API'
+                    : 'ComfyUI'
+                : '服务设置'
             }}</span>
           </button>
         </div>
@@ -1036,13 +1042,15 @@ watchEffect(() => {
                           <dt>模式</dt>
                           <dd>
                             {{
-                              segDetail.data.video_backend === 'api'
-                                ? '视频 API · 单张首帧'
-                                : segDetail.data.video_workflow === 'ref2va'
-                                  ? 'Ref2VA · 图片 / 视频参考'
-                                  : segDetail.data.mode === 'flf'
-                                    ? 'FLF · 首尾帧'
-                                    : 'I2V · 图生视频'
+                              segDetail.data.video_backend === 'muse'
+                                ? 'Muse · 浏览器生成'
+                                : segDetail.data.video_backend === 'api'
+                                  ? '视频 API · 单张首帧'
+                                  : segDetail.data.video_workflow === 'ref2va'
+                                    ? 'Ref2VA · 图片 / 视频参考'
+                                    : segDetail.data.mode === 'flf'
+                                      ? 'FLF · 首尾帧'
+                                      : 'I2V · 图生视频'
                             }}
                           </dd>
                         </div>
@@ -1050,11 +1058,13 @@ watchEffect(() => {
                           <dt>请求时长</dt>
                           <dd>
                             {{
-                              segDetail.data.video_backend === 'api'
-                                ? 'API 模型决定（此协议不接收时长）'
-                                : segDetail.data.duration != null
-                                  ? segDetail.data.duration + ' 秒'
-                                  : '未记录'
+                              segDetail.data.video_backend === 'muse'
+                                ? `计划 ${segDetail.data.planned_duration} 秒 · 由 Muse 生成`
+                                : segDetail.data.video_backend === 'api'
+                                  ? 'API 模型决定（此协议不接收时长）'
+                                  : segDetail.data.duration != null
+                                    ? segDetail.data.duration + ' 秒'
+                                    : '未记录'
                             }}
                           </dd>
                         </div>
@@ -1062,11 +1072,13 @@ watchEffect(() => {
                           <dt>像素预算</dt>
                           <dd>
                             {{
-                              segDetail.data.video_backend === 'api'
-                                ? 'API 模型决定（此协议不接收像素预算）'
-                                : segDetail.data.megapixels != null
-                                  ? segDetail.data.megapixels + ' MP'
-                                  : '未记录'
+                              segDetail.data.video_backend === 'muse'
+                                ? 'Muse 决定'
+                                : segDetail.data.video_backend === 'api'
+                                  ? 'API 模型决定（此协议不接收像素预算）'
+                                  : segDetail.data.megapixels != null
+                                    ? segDetail.data.megapixels + ' MP'
+                                    : '未记录'
                             }}<template
                               v-if="
                                 segDetail.data.video_backend !== 'api' && segDetail.data.resolution_source

@@ -1122,15 +1122,7 @@ html[data-theme='light'] .canvas-tools > button:first-child {
   z-index: 8;
   box-shadow: -10px 0 35px var(--day-shadow, #0004);
 }
-.flow-body :deep(.flow-inspector) {
-  position: absolute;
-  right: 0;
-  top: 0;
-  bottom: 0;
-  box-shadow: -10px 0 35px var(--day-shadow, #0004);
-  z-index: 8;
-}
-.flow-board:has(.video-composer) .minimap {
+.flow-board:has(.video-composer, .creation-composer) .minimap {
   opacity: 0.55;
 }
 @media (max-width: 1250px) {
@@ -1182,7 +1174,6 @@ html[data-theme='light'] .canvas-tools > button:first-child {
     padding: 6px 8px;
     font-size: 10px;
   }
-  .flow-body :deep(.flow-inspector),
   .studio-overview {
     position: absolute;
     right: 0;
@@ -1242,11 +1233,13 @@ html[data-theme='light'] .canvas-tools > button:first-child {
   }
 }
 
-.add-video-menu {
+.canvas-add-menu {
   position: absolute;
   left: 0;
   bottom: calc(100% + 10px);
-  min-width: 142px;
+  width: 245px;
+  max-height: min(570px, calc(100vh - 260px));
+  overflow-y: auto;
   background: var(--day-accent-soft, #282630);
   border: 1px solid var(--day-accent-line, #53485f);
   padding: 7px;
@@ -1254,9 +1247,34 @@ html[data-theme='light'] .canvas-tools > button:first-child {
   box-shadow: 0 12px 40px var(--day-shadow, #0008);
   z-index: 10;
 }
-.add-video-menu button {
-  display: block;
+.canvas-tools .canvas-add-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  padding: 9px 10px;
+  height: auto;
   width: 100%;
   white-space: nowrap;
   font-size: 12px;
+  text-align: left;
+  border-radius: 6px;
+}
+.canvas-add-menu p {
+  margin: 8px 10px 4px;
+  font-size: 10px;
+  color: var(--day-muted, #9795a1);
+}
+.canvas-add-menu p:not(:first-child) {
+  border-top: 1px solid var(--day-line, #ffffff12);
+  padding-top: 12px;
+}
+.canvas-add-menu small {
+  display: block;
+  margin-top: 3px;
+  font-size: 10px;
+  color: var(--day-muted, #9795a1);
+}
+.canvas-add-menu button:hover {
+  background: var(--day-hover, #ffffff0a);
 }

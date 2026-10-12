@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { api } from '../api';
 import WorkflowIcon from './WorkflowIcon.vue';
+import MuseBrowserPanel from './MuseBrowserPanel.vue';
 import { RESOLUTION_OPTIONS, resolutionLabel } from '../videoSettings';
 import { LORAS, settingsPatch, workflowPreset, loraPreset, settingsError } from '../serviceSettings';
 
@@ -18,6 +19,12 @@ const error = ref('');
 const saved = ref(false);
 const discard = ref(false);
 const connection = ref(null);
+const muse = ref(null);
+const museWorking = ref(false);
+const musePanelOpen = ref(false);
+let museTimer,
+  museSerial = 0,
+  museReading = false;
 let opener,
   previousOverflow,
   testSerial = 0,
@@ -41,7 +48,9 @@ const configured = (id) =>
   id === 'video'
     ? !!(draft.value.video_backend === 'api'
         ? draft.value.video_api_url && draft.value.video_api_key && draft.value.video_api_model
-        : draft.value.comfyui_url)
+        : draft.value.video_backend === 'muse'
+          ? muse.value?.connected
+          : draft.value.comfyui_url)
     : id === 'audio'
       ? draft.value.audio_provider === 'edge' || !!draft.value.audio_api_key
       : !!draft.value[`${id}_api_key`];
@@ -135,6 +144,54 @@ async function testConnection() {
     if (serial === testSerial) testing.value = false;
   }
 }
+async function openMusePanel() {
+  if (museWorking.value) return;
+  const serial = ++museSerial;
+  museWorking.value = true;
+  error.value = '';
+  try {
+    const result = await api.openMuse();
+    if (!disposed && serial === museSerial) {
+      muse.value = result;
+      musePanelOpen.value = true;
+    }
+  } catch (err) {
+    if (!disposed) error.value = err.message;
+  } finally {
+    if (!disposed) museWorking.value = false;
+  }
+}
+async function refreshMuse() {
+  if (
+    disposed ||
+    musePanelOpen.value ||
+    museWorking.value ||
+    museReading ||
+    draft.value.video_backend !== 'muse'
+  )
+    return;
+  const serial = museSerial;
+  museReading = true;
+  try {
+    const result = await api.museStatus();
+    if (!disposed && serial === museSerial) muse.value = result;
+  } catch (err) {
+    if (!disposed && serial === museSerial) muse.value = { connected: false, message: err.message };
+  } finally {
+    museReading = false;
+  }
+}
+function updateMuseStatus(status) {
+  museSerial++;
+  muse.value = status;
+}
+watch(
+  () => draft.value.video_backend,
+  () => {
+    museSerial++;
+    refreshMuse();
+  }
+);
 watch(
   () => draft.value.comfyui_url,
   () => {
@@ -152,12 +209,15 @@ watch(
   { deep: true }
 );
 onMounted(() => {
+  refreshMuse();
+  museTimer = setInterval(refreshMuse, 4000);
   opener = document.activeElement;
   previousOverflow = document.body.style.overflow;
   document.body.style.overflow = 'hidden';
   dialog.value?.focus();
 });
 onBeforeUnmount(() => {
+  clearInterval(museTimer);
   disposed = true;
   document.body.style.overflow = previousOverflow;
   opener?.focus?.();
@@ -248,9 +308,59 @@ onBeforeUnmount(() => {
                   ><input v-model="draft.video_backend" type="radio" value="api" /><span
                     ><b>外接视频 API</b><small>使用云端生成服务</small></span
                   ></label
+                ><label :class="{ chosen: draft.video_backend === 'muse' }"
+                  ><input v-model="draft.video_backend" type="radio" value="muse" /><span
+                    ><b>Muse</b><small>登录账号 · 后台生成</small></span
+                  ></label
                 >
               </div>
-              <template v-if="draft.video_backend === 'comfyui'">
+              <template v-if="draft.video_backend === 'muse'">
+                <div class="settings-info">
+                  <WorkflowIcon name="link" />
+                  <p>
+                    登录和选择聊天统一在 Muse 面板完成。连接后收起面板即可生成，
+                    素材自动上传，成片自动保存到作品并回填画布。
+                  </p>
+                </div>
+                <div class="connection-row">
+                  <button
+                    class="secondary-button"
+                    :disabled="museWorking || (muse?.busy && !muse?.background)"
+                    @click="openMusePanel"
+                  >
+                    {{ museWorking ? '连接中…' : '打开 Muse 面板' }}
+                  </button>
+                </div>
+                <p class="connection-result" :class="{ connected: muse?.connected }" role="status">
+                  {{ muse?.message || '尚未连接 Muse' }}
+                </p>
+                <p v-if="muse?.connected" class="field-note">
+                  已连接，可直接回到画布生成；切换聊天时再打开 Muse 面板。
+                </p>
+                <p v-if="muse?.download_dir" class="field-note">
+                  自动成片保存到作品；手动下载保存在：{{ muse.download_dir }}
+                  <span v-if="muse.last_download"> · 最近保存：{{ muse.last_download }}</span>
+                </p>
+                <p v-if="muse?.download_error" class="field-note">{{ muse.download_error }}</p>
+                <label class="settings-field"
+                  >等待时长（秒）<input
+                    v-model="draft.video_timeout_s"
+                    type="number"
+                    min="30"
+                    max="86400"
+                    step="30"
+                /></label>
+                <p class="field-note">
+                  首次在 Muse 面板登录一次，登录状态保存在本机。收起面板后仍可生成。
+                  一次生成一个视频，支持文字、图片和视频参考；比例、清晰度会作为要求发送给
+                  Muse，成片显示实际参数。
+                </p>
+                <p class="field-note">
+                  浏览器接入为试用功能。登录或生成能力需由你的 Muse
+                  账号提供；遇到超时不会自动重发，可在旁聊检查结果。
+                </p>
+              </template>
+              <template v-else-if="draft.video_backend === 'comfyui'">
                 <label class="settings-field"
                   >ComfyUI 地址<input
                     v-model="draft.comfyui_url"
@@ -467,6 +577,12 @@ onBeforeUnmount(() => {
       </footer>
     </section>
   </div>
+  <MuseBrowserPanel
+    v-if="musePanelOpen"
+    @close="musePanelOpen = false"
+    @connected="updateMuseStatus"
+    @status="updateMuseStatus"
+  />
 </template>
 
 <style scoped>
@@ -641,7 +757,7 @@ fieldset {
 }
 .provider-picker {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 23px;
 }

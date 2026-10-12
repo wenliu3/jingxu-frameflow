@@ -1,13 +1,30 @@
 <script setup>
-import { computed } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { videoVersions } from '../workflowVideo.js';
 import { sourceVersion, VIDEO_USES } from '../videoSources.js';
-const props = defineProps({ node: Object, edge: Object });
+const props = defineProps({ node: Object, edge: Object, backend: String });
+const preview = ref(false);
+const loadedDuration = ref(null);
 const emit = defineEmits(['change', 'disconnect']);
 const versions = computed(() =>
   videoVersions(props.node).filter((v) => v.status === 'succeeded' && v.url && v.file)
 );
 const version = computed(() => sourceVersion(props.node, props.edge));
+const durationLabel = computed(() => {
+  const duration = Number(version.value?.actual_duration ?? version.value?.duration ?? loadedDuration.value);
+  return Number.isFinite(duration) && duration > 0
+    ? `${Number(duration.toFixed(2))} 秒`
+    : version.value
+      ? '已生成版本'
+      : '等待生成';
+});
+watch(
+  () => version.value?.id,
+  () => {
+    loadedDuration.value = null;
+    preview.value = false;
+  }
+);
 function range(key, value) {
   emit('change', { [key]: value === '' ? null : Number(value) });
 }
@@ -15,17 +32,38 @@ function range(key, value) {
 <template>
   <article class="video-source" :aria-label="`视频来源 ${node.data.title}`">
     <div class="source-heading">
-      <video
+      <button
         v-if="version?.url"
-        :key="version.id"
-        :src="version.url"
-        :poster="version.poster"
-        preload="metadata"
-        controls
-        muted
-      /><span v-else class="waiting">等待来源视频完成</span><b>{{ node.data.title }}</b
-      ><button :aria-label="`断开 ${node.data.title}`" @click="emit('disconnect')">×</button>
+        class="source-thumbnail"
+        :aria-label="`预览来源 ${node.data.title}`"
+        :aria-expanded="preview"
+        @click="preview = !preview"
+      >
+        <video
+          :key="version.id"
+          :src="`${version.url}#t=0.1`"
+          :poster="version.poster"
+          preload="auto"
+          muted
+          @loadedmetadata="loadedDuration = $event.target.duration"
+        ></video
+        ><span>▶</span></button
+      ><span v-else class="waiting">等待来源视频完成</span>
+      <div class="source-name">
+        <b>{{ node.data.title }}</b
+        ><small
+          >{{ durationLabel }} · {{ edge.usage && edge.usage !== 'text' ? '视频附件' : '文字前情' }}</small
+        >
+      </div>
+      <button :aria-label="`断开 ${node.data.title}`" @click="emit('disconnect')">×</button>
     </div>
+    <video
+      v-if="preview && version?.url"
+      class="source-preview"
+      :src="version.url"
+      controls
+      preload="metadata"
+    />
     <div class="source-options">
       <select
         :aria-label="`${node.data.title} 来源用途`"
@@ -71,14 +109,14 @@ function range(key, value) {
               :aria-label="`${node.data.title} 参考结束秒`"
               @change="range('end', $event.target.value)" /></label
         ></template>
-        <label v-else
+        <label v-else-if="backend !== 'muse'"
           ><input
             type="checkbox"
             :checked="edge.motionReference !== false"
             @change="emit('change', { motionReference: $event.target.checked })"
           />同时参考结尾动作</label
         >
-        <label
+        <label v-if="backend !== 'muse' || edge.usage === 'continue'"
           >参考长度
           <input
             type="number"
@@ -96,9 +134,13 @@ function range(key, value) {
           (edge.usage || 'text') === 'text'
             ? '仅提供文字前情'
             : edge.usage === 'continue'
-              ? '尾帧作为新片开头 · 时长表示新增内容'
-              : '借鉴画面与动作 · 不锁定新片开头'
-        }}{{ edge.usage !== 'text' && edge.usage ? ' · 不复用来源音轨' : '' }}</small
+              ? backend === 'muse'
+                ? '将结尾片段上传给 Muse，要求接续动作；实际衔接以成片为准'
+                : '尾帧作为新片开头 · 时长表示新增内容'
+              : backend === 'muse'
+                ? '默认上传整段视频；可指定开始和结束位置'
+                : '借鉴画面与动作 · 不锁定新片开头'
+        }}{{ backend !== 'muse' && edge.usage !== 'text' && edge.usage ? ' · 不复用来源音轨' : '' }}</small
       >
     </details>
   </article>
@@ -135,6 +177,42 @@ function range(key, value) {
   background: none;
   color: var(--day-accent, #b5a6cb);
   cursor: pointer;
+}
+.source-heading .source-thumbnail {
+  position: relative;
+  flex: 0 0 80px;
+  margin-left: 0;
+  padding: 0;
+  overflow: hidden;
+  height: 46px;
+  border-radius: 6px;
+}
+.source-thumbnail video {
+  display: block;
+}
+.source-thumbnail span {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-size: 16px;
+  background: #0003;
+}
+.source-name {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.source-name small {
+  margin: 0;
+}
+.source-preview {
+  width: 100%;
+  max-height: 240px;
+  margin-top: 8px;
+  background: #121216;
+  border-radius: 7px;
 }
 .source-options {
   margin: 7px 0;

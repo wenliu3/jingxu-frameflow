@@ -8,11 +8,15 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "node ../dev/tools/check_frontend.mjs",
-    "test": "node --test ../dev/ui/test_workflow_graph.mjs ../dev/ui/test_workflow_studio.mjs ../dev/ui/test_workflow_video.mjs ../dev/ui/test_video_settings.mjs ../dev/ui/test_service_settings.mjs ../dev/ui/test_project_library.mjs ../dev/ui/test_video_sources.mjs ../dev/ui/test_prompt_mentions.mjs ../dev/ui/test_theme.mjs",
+    "test": "node --test ../dev/ui/test_workflow_graph.mjs ../dev/ui/test_workflow_studio.mjs ../dev/ui/test_workflow_video.mjs ../dev/ui/test_video_settings.mjs ../dev/ui/test_service_settings.mjs ../dev/ui/test_project_library.mjs ../dev/ui/test_video_sources.mjs ../dev/ui/test_prompt_mentions.mjs ../dev/ui/test_theme.mjs ../dev/ui/test_async_tasks.mjs ../dev/ui/test_muse_settings.mjs ../dev/ui/test_muse_panel_input.mjs",
     "format": "prettier --write \"src/**/*.{vue,js,css}\" index.html vite.config.js",
     "format:check": "prettier --check \"src/**/*.{vue,js,css}\" index.html vite.config.js",
     "browser:install": "playwright install chromium",
     "test:browser": "node ../dev/ui/test_studio_browser.mjs",
+    "test:browser:lifecycle": "node ../dev/ui/test_canvas_lifecycle_browser.mjs",
+    "test:browser:connections": "node ../dev/ui/test_canvas_connections_browser.mjs",
+    "test:browser:media": "node ../dev/ui/test_canvas_media_browser.mjs",
+    "test:browser:muse": "node ../dev/ui/test_muse_browser.mjs && node ../dev/ui/test_muse_video_references.mjs && node ../dev/ui/test_muse_panel.mjs && node ../dev/ui/test_muse_ui_browser.mjs",
     "test:browser:export": "node ../dev/ui/test_canvas_export_browser.mjs"
   },
   "dependencies": {

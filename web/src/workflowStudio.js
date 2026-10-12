@@ -77,6 +77,7 @@ export function shotReadiness(node, refs, cfg, hasVideo = false) {
   if (refs.some((r) => !r?.ready)) return '参考素材未就绪或已移除';
   const error = videoSelectionError(refs, cfg, hasVideo);
   if (error) return error;
+  if (cfg.video_backend === 'muse') return '';
   if (cfg.video_backend === 'api') {
     if (!cfg.video_api_url || !cfg.video_api_key || !cfg.video_api_model) return '请配置视频 API';
   } else if (!cfg.comfyui_url) return '请先配置 ComfyUI 地址';
@@ -154,8 +155,40 @@ export function mergeWorkflow(graph, document) {
       if (node.data[key] != null && typeof node.data[key] !== 'string')
         throw new Error('备份中的节点文字格式无效');
     }
-    if (node.type === 'material' && !['character', 'scene', 'prop', 'image'].includes(node.data.materialKind))
+    if (
+      node.type === 'material' &&
+      !['character', 'scene', 'prop', 'image', 'audio'].includes(node.data.materialKind)
+    )
       throw new Error('备份中有不支持的素材类型');
+    if (node.data.creationKind != null) {
+      if (
+        node.type !== 'material' ||
+        !['image', 'audio'].includes(node.data.creationKind) ||
+        !(node.data.creationKind === 'image'
+          ? ['image', 'character', 'scene', 'prop'].includes(node.data.materialKind)
+          : node.data.materialKind === 'audio') ||
+        (node.data.imageMode != null &&
+          !['native', 'character', 'scene', 'prop'].includes(node.data.imageMode)) ||
+        (node.data.imageCount != null && ![1, 2, 4].includes(node.data.imageCount)) ||
+        typeof node.data.prompt !== 'string' ||
+        node.data.prompt.length > 3000 ||
+        (node.data.voiceId != null && typeof node.data.voiceId !== 'string')
+      )
+        throw new Error('备份中的图片或语音节点无效');
+      node.data.imageMode ||= 'native';
+      node.data.imageCount ??= 1;
+      delete node.data.imageStyle;
+      node.data.materialKind = node.data.creationKind;
+      node.data.materialName = '';
+      node.data.materialFile = '';
+      node.data.status = 'draft';
+      delete node.data.jobId;
+      delete node.data.mediaSubmission;
+      delete node.data.error;
+      delete node.data.materialVersion;
+      delete node.data.materialIndex;
+      delete node.data.mediaVariants;
+    }
     if (node.type === 'shot' && typeof node.data.manual !== 'boolean') node.data.manual = false;
     node.id = uid();
     ids.set(raw.id, node.id);

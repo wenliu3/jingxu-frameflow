@@ -47,6 +47,53 @@ class VideoSourceTests(unittest.TestCase):
     def resolve(self, **changes):
         return resolve_video_sources(self.root, [VideoSource(**{**self.source, **changes})], 5, "ref2va")[0]
 
+    def test_muse_video_mentions_settings_and_actual_attachments_reach_provider(self):
+        self.cfg.update(video_backend="muse", comfyui_url="")
+        from server.video_contracts import VideoSource
+        source = {**self.source, "usage": "reference"}
+        with patch("server.app.MUSE_BRIDGE", Mock(status=Mock(return_value={"connected": True, "busy": False}))):
+            response = self.client.post("/api/tasks/abcdef123456/compose", json={
+                "description": "@{video:origin%7CFirst%20video} continues walking.", "duration": 1, "video_sources": [source]})
+            self.assertEqual(response.status_code, 200, response.text)
+            data = response.json()
+            self.assertIn("First video（参考视频 1）", data["prompt"])
+            self.assertEqual(data["video_sources"][0]["start"], 0)
+            self.assertEqual(data["video_sources"][0]["end"], 4)
+            self.assertNotIn("clip_path", data["video_sources"][0])
+            snapshot = [{k: v for k, v in data["video_sources"][0].items() if k in VideoSource.model_fields}]
+            started = self.client.post(self.url, json={"prompt": data["prompt"], "video_sources": snapshot,
+                "ratio": "9:16", "resolution": "720p", "duration": 1})
+            self.assertEqual(started.status_code, 200, started.text)
+            self.runners[0]()
+        self.assertEqual(len(self.calls), 1)
+        call = self.calls[0]
+        self.assertEqual(call["ratio"], "9:16")
+        self.assertEqual(call["resolution"], "720p")
+        self.assertEqual(call["ref_image_paths"], [])
+        self.assertNotIn("guide_frame_path", call)
+        self.assertEqual(len(call["ref_video_paths"]), 1)
+        self.assertEqual(Path(call["ref_video_paths"][0]).read_bytes(), self.path.read_bytes())
+        self.assertNotEqual(Path(call["ref_video_paths"][0]), self.path)
+        self.writer.assert_not_called()
+
+    def test_muse_reference_ranges_continuation_and_ownership(self):
+        def muse(**changes):
+            return resolve_video_sources(self.root, [VideoSource(**{**self.source, **changes})], 1, "muse")[0]
+        result = muse(usage="reference", start=2.1, end=3.4)
+        reader = imageio_ffmpeg.read_frames(result["clip_path"])
+        metadata = next(reader)
+        frames = list(reader)
+        self.assertAlmostEqual(metadata["duration"], 1.3, delta=0.08)
+        self.assertGreater(frames[0][2], 230)
+        tail = muse(tail_seconds=1)
+        self.assertEqual(tail["start"], 3)
+        self.assertEqual(tail["guide"], "last_frame_requested")
+        for changes in ({"source_node": "foreign"}, {"version_id": "foreign"}, {"end": 9}, {"expected_sha256": "f" * 64}):
+            with self.subTest(changes=changes), self.assertRaises(HTTPException):
+                muse(**changes)
+        response = self.client.post("/api/tasks/abcdef123456/compose", json={"video_prompt": "@{video:foreign%7CFirst}", "video_sources": [self.source]})
+        self.assertEqual(response.status_code, 422)
+
     def test_tail_and_video_batch_use_actual_ending_and_content_cache(self):
         result = self.resolve(tail_seconds=1)
         self.assertEqual(result["frames"] % 17, 5)

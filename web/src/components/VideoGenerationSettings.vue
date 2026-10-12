@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import WorkflowIcon from './WorkflowIcon.vue';
 import { defaultResolution, RESOLUTION_OPTIONS, resolutionLabel, RATIO_OPTIONS } from '../videoSettings.js';
 const props = defineProps({ node: Object, cfg: Object, anchor: Object });
+const remote = computed(() => ['api', 'muse'].includes(props.cfg.video_backend));
+const fixedSettings = computed(() => props.cfg.video_backend === 'api');
 const emit = defineEmits(['edit', 'open']);
 const settingsOpen = ref(false),
   settingsTrigger = ref(null),
@@ -60,14 +62,18 @@ function choose(key, value) {
 }
 const summary = computed(() =>
   [
-    props.node.data.ratio === 'auto' || !props.node.data.ratio ? 'Auto' : props.node.data.ratio,
-    props.cfg.video_backend === 'api'
-      ? '模型默认'
+    fixedSettings.value || props.node.data.ratio === 'auto' || !props.node.data.ratio
+      ? 'Auto'
+      : props.node.data.ratio,
+    fixedSettings.value
+      ? '服务默认'
       : props.node.data.resolution && props.node.data.resolution !== 'custom'
         ? props.node.data.resolution.toUpperCase()
-        : `${props.node.data.megapixels ?? defaultResolution(props.cfg)}MP`,
+        : remote.value
+          ? '服务默认'
+          : `${props.node.data.megapixels ?? defaultResolution(props.cfg)}MP`,
     `${props.node.data.duration}s`,
-    `${props.node.data.candidateCount || 1}个`,
+    `${props.cfg.video_backend === 'muse' ? 1 : props.node.data.candidateCount || 1}个`,
   ].join(' · ')
 );
 watch(() => props.node.id, close);
@@ -124,14 +130,17 @@ defineExpose({ close });
           <WorkflowIcon name="close" />
         </button>
       </header>
-      <label class="settings-label">比例<span v-if="cfg.video_backend === 'api'">API 跟随首帧</span></label>
+      <label class="settings-label"
+        >比例<span v-if="cfg.video_backend === 'muse'">交给 Muse 作为生成要求</span
+        ><span v-else-if="fixedSettings">由服务决定</span></label
+      >
       <div class="ratio-grid">
         <button
           v-for="ratio in RATIO_OPTIONS"
           :key="ratio"
-          :disabled="cfg.video_backend === 'api'"
-          :aria-pressed="(node.data.ratio || 'auto') === ratio"
-          :class="{ chosen: (node.data.ratio || 'auto') === ratio }"
+          :disabled="fixedSettings"
+          :aria-pressed="(fixedSettings ? 'auto' : node.data.ratio || 'auto') === ratio"
+          :class="{ chosen: (fixedSettings ? 'auto' : node.data.ratio || 'auto') === ratio }"
           @click="choose('ratio', ratio)"
         >
           <i :style="{ aspectRatio: ratio === 'auto' ? '16/10' : ratio.replace(':', '/') }"></i
@@ -143,15 +152,15 @@ defineExpose({ close });
         <button
           v-for="quality in ['480p', '720p', 'custom']"
           :key="quality"
-          :disabled="cfg.video_backend === 'api'"
-          :class="{ chosen: (node.data.resolution || 'custom') === quality }"
-          :aria-pressed="(node.data.resolution || 'custom') === quality"
+          :disabled="fixedSettings"
+          :class="{ chosen: (fixedSettings ? 'custom' : node.data.resolution || 'custom') === quality }"
+          :aria-pressed="(fixedSettings ? 'custom' : node.data.resolution || 'custom') === quality"
           @click="choose('resolution', quality)"
         >
-          {{ quality === 'custom' ? '自定义' : quality.toUpperCase() }}
+          {{ quality === 'custom' ? (remote ? '服务默认' : '自定义') : quality.toUpperCase() }}
         </button>
       </div>
-      <label v-if="cfg.video_backend !== 'api' && node.data.resolution === 'custom'" class="custom-resolution"
+      <label v-if="!remote && node.data.resolution === 'custom'" class="custom-resolution"
         >像素预算<select
           aria-label="视频分辨率"
           :value="node.data.megapixels ?? ''"
@@ -170,9 +179,7 @@ defineExpose({ close });
           </option>
         </select></label
       >
-      <label class="settings-label"
-        >{{ cfg.video_backend === 'api' ? '计划节奏' : '视频时长' }}<span>1–15 秒</span></label
-      >
+      <label class="settings-label">{{ remote ? '计划节奏' : '视频时长' }}<span>1–15 秒</span></label>
       <div class="duration-control">
         <input
           aria-label="视频时长滑块"
@@ -211,16 +218,16 @@ defineExpose({ close });
       <label class="settings-label">生成数量<span>不同结果，逐个生成</span></label>
       <div class="setting-options">
         <button
-          v-for="count in [1, 2, 4]"
+          v-for="count in cfg.video_backend === 'muse' ? [1] : [1, 2, 4]"
           :key="count"
-          :class="{ chosen: (node.data.candidateCount || 1) === count }"
-          :aria-pressed="(node.data.candidateCount || 1) === count"
+          :class="{ chosen: (cfg.video_backend === 'muse' ? 1 : node.data.candidateCount || 1) === count }"
+          :aria-pressed="(cfg.video_backend === 'muse' ? 1 : node.data.candidateCount || 1) === count"
           @click="choose('candidateCount', count)"
         >
           {{ count }}个
         </button>
       </div>
-      <details v-if="cfg.video_backend !== 'api'" class="seed-settings">
+      <details v-if="!remote" class="seed-settings">
         <summary>高级设置</summary>
         <label
           >随机种子<input
@@ -245,9 +252,11 @@ defineExpose({ close });
       </details>
       <p class="settings-footnote">
         {{
-          cfg.video_backend === 'api'
-            ? '当前 API 的画幅、清晰度和实际时长由模型决定。'
-            : 'H3 按帧数规则生成；精确时长会裁掉多出的尾帧，或补齐少量尾帧。清晰度是输出规格，不保证画面质量。'
+          cfg.video_backend === 'muse'
+            ? '比例、清晰度和时长会作为生成要求发送给 Muse；成片显示实际尺寸和时长。不支持的要求请 Muse 明确说明。'
+            : remote
+              ? '画幅、清晰度和实际时长由生成服务决定。'
+              : 'H3 按帧数规则生成；精确时长会裁掉多出的尾帧，或补齐少量尾帧。清晰度是输出规格，不保证画面质量。'
         }}关闭音频后输出不含音轨。生成多个候选会执行多次生成。
       </p>
     </section>

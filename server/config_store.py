@@ -50,7 +50,7 @@ class ConfigStore:
                 result[key] = str(saved[key] if saved[key] is not None else "").strip()
         # Normalize retired enum values, while explicit blank keys/LoRA stay blank.
         for key, allowed, default in (
-            ("video_backend", ("comfyui", "api"), "comfyui"),
+            ("video_backend", ("comfyui", "api", "muse"), "comfyui"),
             ("video_mode", ("i2v", "flf", "portrait"), "i2v"),
             ("video_workflow", ("i2v", "ref2va"), "i2v"),
             ("audio_provider", ("edge", "minimax"), "edge"),

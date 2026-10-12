@@ -42,6 +42,8 @@ export function canConnect(nodes, edges, source, target) {
   const from = nodes.find((n) => n.id === source);
   const to = nodes.find((n) => n.id === target);
   if (!from || !to || source === target) return '不能连接到自身';
+  if (from.type === 'material' && from.data?.materialKind === 'audio')
+    return '音频可独立试听和下载，当前视频通道暂不支持音频参考';
   if (
     !['material:shot', 'note:shot', 'shot:shot', 'shot:video', 'footage:shot'].includes(
       `${from.type}:${to.type}`

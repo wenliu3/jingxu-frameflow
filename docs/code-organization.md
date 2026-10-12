@@ -21,6 +21,7 @@
 | `web/src/workflowGraph.js` / `workflowStudio.js` / `workflowVideo.js` | 图结构、编排与校验、节点迁移、版本与候选进度；保持与界面独立 |
 | `web/src/videoSettings.js` / `serviceSettings.js` | 参数选项、请求转换与服务配置校验 |
 | `web/src/api.js` | 当前界面使用的 HTTP 封装、合并并发读取和上传 |
+| `web/src/asyncTasks.js` | 历史记录读取的并发限制、结果顺序与离开页面后的停止调度 |
 
 素材工作台不再有隐藏的视频表单；所有视频创作走画布。模板、队列和历史导入统一使用同一套视频参数。修改版本或参数规则时，优先修改对应逻辑模块，再修改界面。
 
@@ -42,6 +43,7 @@
 | `server/workflow_store.py` / `config_store.py` | 画布和服务配置的保存、版本冲突与配置缓存 |
 | `server/canvas_export.py` | 视频导出的文件校验、原片 ZIP 打包、后台合并和进度 |
 | `server/project_summary.py` | 作品列表摘要和封面 |
+| `atomic_io.py` | CLI 与接口共用的完整文件替换，保护作品、镜头、分块、预览与运行元数据 |
 
 接口层负责校验与解析，后台执行模块使用已固定的 Provider 和生成参数；保存模块不依赖 HTTP 或远端服务。写记录失败时停止尚未提交的候选。临时文件完整写入后才替换目标文件，保留已有完整记录。
 
@@ -79,3 +81,7 @@ npm run test:browser --prefix web
 前端统一使用 `web/.prettierrc.json` 定义代码格式；`npm run format --prefix web` 格式化，`format:check` 校验。浏览器测试使用 `web` 的 Playwright 依赖和安装的 Chromium，无需本机工具目录；可通过 `PYTHON` 指定生成测试视频的 Python。节点样式合并重复选择器，保留现有状态和主题规则。
 
 新增功能应放进负责该行为的模块。旧入口撤掉时一起检查事件、状态、接口封装、样式与验收脚本，避免只藏界面、留下第二套执行逻辑。
+
+## Muse 浏览器接入
+
+`server/muse_bridge.py` 管理本机浏览器工作进程和并发消息；`server/muse_browser.mjs` 上传素材、发送指令并捕获对应页面的下载；`server/muse_dom.mjs` 识别公开回复、网页组件、成片卡片和图标下载入口；`muse_video_provider.py` 校验并发布成片。登录态放在已忽略的 `.local/muse-browser/`，不进入服务配置或 Git。操作及能力限制见 [Muse 接入说明](muse-browser.md)。

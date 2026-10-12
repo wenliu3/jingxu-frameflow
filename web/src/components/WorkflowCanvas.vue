@@ -1,13 +1,21 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { api } from '../api';
-import { videoInputs, videoSourcesError, sourceSnapshot, sourceContext } from '../videoSources.js';
+import { mapConcurrent } from '../asyncTasks.js';
+import { imageCount, imageMode, imageRatio } from '../imageModes.js';
+import {
+  videoInputs,
+  videoSourcesError,
+  sourceSnapshot,
+  sourceContext,
+  videoMentionMaterials,
+} from '../videoSources.js';
 import { creationSettings, defaultResolution, submissionResolution } from '../videoSettings';
 import { videoSelectionError } from '../videoSettings.js';
 import { displayPrompt, mentionsError } from '../promptMentions.js';
 import WorkflowIcon from './WorkflowIcon.vue';
 import WorkflowNode from './WorkflowNode.vue';
-import WorkflowInspector from './WorkflowInspector.vue';
+import CreationComposer from './CreationComposer.vue';
 import VideoComposer from './VideoComposer.vue';
 import {
   applyVideoProgress,
@@ -85,6 +93,7 @@ const COMPOSER_GAP = 14;
 const past = ref([]);
 const future = ref([]);
 const jobTimers = new Map();
+const recoveringMuse = ref('');
 const dialogMode = ref('');
 const reviews = ref([]);
 const queueOpen = ref(false);
@@ -93,6 +102,7 @@ const sequenceCollapsed = ref(true);
 const importInput = ref(null);
 const uploadInput = ref(null);
 const videoUploadInput = ref(null);
+const mediaUploadInput = ref(null);
 const uploading = ref(false);
 const exportJob = ref(null);
 let exportTimer;
@@ -124,6 +134,7 @@ const gestureState = ref('');
 let gesture = null;
 let saveTimer, backupTimer, observer;
 let disposed = false;
+let loadSequence = 0;
 let savedContent = '';
 const cacheKey = `frameflow.workflow.${props.taskId}`;
 // Moving the camera should not reserialize every prompt and reference node.
@@ -138,7 +149,9 @@ const inputsById = computed(() => {
   });
   return index;
 });
-const say = (text, kind = 'info') => props.notify?.(text, kind);
+const say = (text, kind = 'info') => {
+  if (!disposed) props.notify?.(text, kind);
+};
 const selection = computed(() => graph.value.nodes.filter((n) => selectedIds.value.includes(n.id)));
 const selected = computed(() => (selection.value.length > 1 ? null : nodesById.value.get(selectedId.value)));
 function boxFor(nodes, padding = 16) {
@@ -201,10 +214,18 @@ watch(connecting, (id) => {
   }
 });
 const composerWidth = computed(() => Math.min(780, Math.max(0, dimensions.value.width - 24)));
+function isCreationNode(node) {
+  return (
+    node &&
+    (node.type === 'shot' ||
+      node.type === 'note' ||
+      (node.type === 'material' && ['image', 'audio'].includes(node.data.creationKind)))
+  );
+}
 const composerPosition = computed(() => {
   const node = selected.value,
     view = graph.value.viewport;
-  if (node?.type !== 'shot') return {};
+  if (!isCreationNode(node)) return {};
   return {
     left: `${view.x + (node.x + NODE_WIDTH / 2) * view.zoom}px`,
     top: `${view.y + (node.y + NODE_HEIGHT) * view.zoom + COMPOSER_GAP}px`,
@@ -222,9 +243,11 @@ const pendingShots = computed(() =>
   sequence.value.filter((n) => !ACTIVE_STATUSES.includes(n.data.status) && n.data.status !== 'succeeded')
 );
 const serviceConfigured = computed(() =>
-  props.cfg.video_backend === 'api'
-    ? !!(props.cfg.video_api_url && props.cfg.video_api_key && props.cfg.video_api_model)
-    : !!props.cfg.comfyui_url
+  props.cfg.video_backend === 'muse'
+    ? true
+    : props.cfg.video_backend === 'api'
+      ? !!(props.cfg.video_api_url && props.cfg.video_api_key && props.cfg.video_api_model)
+      : !!props.cfg.comfyui_url
 );
 const selectedInputs = computed(() => inputNodes(selectedId.value));
 const shotCount = computed(() => graph.value.nodes.filter((n) => n.type === 'shot').length);
@@ -249,7 +272,10 @@ const viewportRect = computed(() => ({
 const materials = computed(() => {
   const result = [];
   for (const [index, c] of (props.project.characters || []).entries()) {
-    const path = props.cfg.video_workflow === 'ref2va' ? c.sheet || c.image_path : c.image_path;
+    const path =
+      props.cfg.video_backend === 'comfyui' && props.cfg.video_workflow === 'ref2va'
+        ? c.sheet || c.image_path
+        : c.image_path;
     result.push({
       kind: 'character',
       name: c.name,
@@ -261,9 +287,10 @@ const materials = computed(() => {
     });
   }
   for (const [index, a] of (props.project.assets || []).entries()) {
-    if (a.kind === 'audio') continue; // Reference audio is not wired into the video provider yet.
     const path =
-      props.cfg.video_workflow === 'ref2va' || a.kind === 'prop' ? a.sheet || a.images?.[0] : a.images?.[0];
+      (props.cfg.video_backend === 'comfyui' && props.cfg.video_workflow === 'ref2va') || a.kind === 'prop'
+        ? a.sheet || a.images?.[0]
+        : a.images?.[0];
     result.push({
       kind: a.kind,
       name: a.name,
@@ -292,8 +319,65 @@ function resolveMaterial(node) {
   return (
     materialsByName.value.get(`${node.data.materialKind}:${node.data.materialName}`) ||
     materialsByFile.value.get(`${node.data.materialKind}:${node.data.materialFile}`) ||
-    null
+    (node.data.creationKind && node.data.materialFile && !/[\\/]/.test(node.data.materialFile)
+      ? {
+          kind: node.data.materialKind,
+          name: node.data.materialName || node.data.title,
+          index: node.data.materialIndex,
+          file: node.data.materialFile,
+          url: (node.data.materialKind === 'character' ? api.characterImageUrl : api.assetImageUrl)(
+            props.taskId,
+            node.data.materialFile,
+            node.data.materialVersion
+          ),
+          ready: true,
+        }
+      : null)
   );
+}
+function resolveNodeMaterial(node) {
+  const material = resolveMaterial(node);
+  // Show a generated character sheet on its creator; video references retain the single-person image.
+  if (
+    node?.data.creationKind === 'image' &&
+    node.data.materialKind === 'character' &&
+    node.data.materialFile &&
+    !/[\\/]/.test(node.data.materialFile)
+  ) {
+    return {
+      ...material,
+      file: node.data.materialFile,
+      url: api.characterImageUrl(props.taskId, node.data.materialFile, node.data.materialVersion),
+      ready: true,
+    };
+  }
+  return material;
+}
+function mediaVariants(node) {
+  return (node?.data.mediaVariants || [])
+    .filter((variant) => variant.file && !/[\\/]/.test(variant.file))
+    .map((variant) => ({
+      ...variant,
+      url: (variant.kind === 'character' ? api.characterImageUrl : api.assetImageUrl)(
+        props.taskId,
+        variant.file,
+        variant.version
+      ),
+    }));
+}
+function selectMediaVariant(index) {
+  const node = selected.value;
+  if (!ready.value || !node || ACTIVE_STATUSES.includes(node.data.status)) return;
+  const variant = mediaVariants(node)[index];
+  if (!variant || variant.file === node.data.materialFile) return;
+  checkpoint();
+  Object.assign(node.data, {
+    materialKind: variant.kind,
+    materialName: variant.asset_name,
+    materialFile: variant.file,
+    materialVersion: variant.version,
+    materialIndex: variant.index,
+  });
 }
 function inputNodes(id) {
   return (inputsById.value.get(id) || []).map((source) => nodesById.value.get(source)).filter(Boolean);
@@ -399,12 +483,17 @@ watch(
 );
 
 async function load() {
+  const sequence = ++loadSequence;
+  const isActive = () => !disposed && sequence === loadSequence;
   loading.value = true;
   loadError.value = '';
   ready.value = false;
   clearTimeout(saveTimer);
+  jobTimers.forEach(clearTimeout);
+  jobTimers.clear();
   try {
     const remote = await api.getWorkflow(props.taskId);
+    if (!isActive()) return;
     let document = clone(remote);
     try {
       const cached = JSON.parse(localStorage.getItem(cacheKey) || 'null');
@@ -419,13 +508,15 @@ async function load() {
       } catch {
         /* A new project can have no records. */
       }
+      if (!isActive()) return;
       document = seedWorkflow(
         materials.value,
         [],
-        props.cfg.video_backend !== 'api' && props.cfg.video_workflow === 'ref2va'
+        props.cfg.video_backend === 'comfyui' && props.cfg.video_workflow === 'ref2va'
       );
       document.revision = remote.revision;
-      await bringRecordsInto(document, records);
+      await bringRecordsInto(document, records, null, isActive);
+      if (!isActive()) return;
       const oldShots = props.blocks.length ? props.blocks : props.shots;
       if (oldShots.length) {
         const placeholders = new Set(
@@ -483,16 +574,21 @@ async function load() {
             document.nodes.find((n) => n.type === 'shot')?.id ||
             ''
     );
-    queueOpen.value = document.nodes.some((n) => n.data.status === 'queued');
+    queueOpen.value = document.nodes.some((n) => n.type === 'shot' && n.data.status === 'queued');
     for (const node of document.nodes.filter(
       (n) => n.type === 'shot' && n.data.status === 'running' && n.data.jobId
     ))
       pollJob(node.id, node.data.jobId);
+    for (const node of document.nodes.filter(
+      (n) => n.data.creationKind && ACTIVE_STATUSES.includes(n.data.status) && n.data.jobId
+    ))
+      pollMediaJob(node.id, node.data.jobId);
     if (dirty.value) saveTimer = setTimeout(save, 700);
   } catch (err) {
+    if (!isActive()) return;
     loadError.value = err.status === 404 ? '当前后端还没有载入画布功能，请重启后端服务。' : err.message;
   } finally {
-    loading.value = false;
+    if (isActive()) loading.value = false;
   }
 }
 function reload() {
@@ -501,19 +597,22 @@ function reload() {
   load();
 }
 
-async function recordDetails(records) {
-  return Promise.all(
-    records.map(async (r) => {
+async function recordDetails(records, isActive = () => !disposed) {
+  return mapConcurrent(
+    records,
+    async (r) => {
       try {
         return await api.segmentDetail(props.taskId, r.name);
       } catch {
         return null;
       }
-    })
+    },
+    { concurrency: 6, isActive }
   );
 }
-async function bringRecordsInto(document, records, knownDetails = null) {
-  const details = knownDetails || (await recordDetails(records));
+async function bringRecordsInto(document, records, knownDetails = null, isActive = () => !disposed) {
+  const details = knownDetails || (await recordDetails(records, isActive));
+  if (!isActive()) return 0;
   unifyVideoNodes(document);
   let added = 0;
   for (const [index, record] of records.entries()) {
@@ -605,9 +704,130 @@ function positionForNew() {
   };
 }
 function chooseAdd() {
-  if (['shot', 'footage'].includes(selected.value?.type) && currentVideo(selected.value))
-    addMenuOpen.value = !addMenuOpen.value;
-  else addShot();
+  addMenuOpen.value = !addMenuOpen.value;
+  menuOpen.value = false;
+  helpOpen.value = false;
+}
+function addCreation(kind) {
+  addMenuOpen.value = false;
+  drawerOpen.value = false;
+  if (!ready.value || graph.value.nodes.length >= 300) return;
+  checkpoint();
+  const p = mediaPosition(null, 0, positionForNew());
+  const number = graph.value.nodes.filter((n) => n.data.creationKind === kind).length + 1;
+  const node = makeNode('material', p.x, p.y, {
+    title: `${kind === 'audio' ? '语音' : '图片'} ${String(number).padStart(2, '0')}`,
+    creationKind: kind,
+    imageMode: 'native',
+    imageCount: 1,
+    materialKind: kind,
+    materialName: '',
+    materialFile: '',
+    status: 'draft',
+    prompt: '',
+    ratio: ['16:9', '9:16', '1:1', '4:3', '3:4'].includes(props.project.aspect_ratio)
+      ? props.project.aspect_ratio
+      : '16:9',
+    voiceId: '',
+  });
+  graph.value.nodes.push(node);
+  focusNode(node.id);
+}
+async function generateMedia(id) {
+  const node = nodesById.value.get(id);
+  if (!ready.value || !node?.data.creationKind || ACTIVE_STATUSES.includes(node.data.status)) return;
+  const payload = {
+    node_id: id,
+    kind: node.data.creationKind,
+    image_mode: node.data.creationKind === 'image' ? imageMode(node.data).value : 'native',
+    style_prompt: '',
+    count: node.data.creationKind === 'image' ? imageCount(node.data) : 1,
+    title: node.data.title.trim(),
+    prompt: node.data.prompt?.trim() || '',
+    ratio: node.data.creationKind === 'image' ? imageRatio(node.data) : node.data.ratio || '16:9',
+    voice_id: node.data.voiceId || '',
+  };
+  if (!payload.prompt || !payload.title) return say('请填写名称和生成内容', 'error');
+  const previous = node.data.mediaSubmission;
+  const sameInput =
+    previous &&
+    Object.entries(payload).every(
+      ([key, value]) =>
+        (key === 'image_mode'
+          ? previous[key] || 'native'
+          : key === 'style_prompt'
+            ? previous[key] || ''
+            : key === 'count'
+              ? (previous[key] ?? 1)
+              : previous[key]) === value
+    );
+  const submission = { ...payload, request_id: sameInput ? previous.request_id : uid().replaceAll('-', '') };
+  checkpoint();
+  Object.assign(node.data, {
+    status: 'running',
+    error: '',
+    jobId: submission.request_id,
+    mediaSubmission: submission,
+  });
+  backup();
+  await save();
+  try {
+    const job = await api.generateCanvasMedia(props.taskId, submission);
+    if (disposed || nodesById.value.get(id) !== node) return;
+    pollMediaJob(id, job.job_id);
+  } catch (err) {
+    if (disposed || nodesById.value.get(id) !== node) return;
+    node.data.status = 'failed';
+    node.data.error = err.status ? err.message : '连接中断，重试会查询原任务，不会重复生成。';
+    if (err.status) delete node.data.mediaSubmission;
+  }
+}
+function pollMediaJob(nodeId, jobId) {
+  const serial = loadSequence,
+    key = `media:${jobId}`;
+  clearTimeout(jobTimers.get(key));
+  const poll = async () => {
+    if (disposed || serial !== loadSequence) return;
+    const node = nodesById.value.get(nodeId);
+    if (!node || node.data.jobId !== jobId) return jobTimers.delete(key);
+    try {
+      const job = await api.canvasMediaStatus(props.taskId, jobId);
+      if (disposed || serial !== loadSequence || nodesById.value.get(nodeId) !== node) return;
+      node.data.status = job.status === 'queued' ? 'running' : job.status;
+      if (['succeeded', 'failed', 'interrupted'].includes(job.status)) {
+        node.data.error = job.error || '';
+        if (job.status === 'succeeded')
+          Object.assign(node.data, {
+            materialKind: job.result.kind || node.data.creationKind,
+            materialName: job.result.asset_name,
+            materialFile: job.result.file,
+            materialVersion: job.result.version,
+            materialIndex: job.result.index,
+            mediaVariants: job.result.results || [job.result],
+          });
+        delete node.data.mediaSubmission;
+        jobTimers.delete(key);
+        past.value = [];
+        future.value = [];
+        emit('refresh');
+        say(
+          job.status === 'succeeded' ? `「${node.data.title}」已生成并保存到作品` : job.error,
+          job.status === 'succeeded' ? 'ok' : 'error'
+        );
+        return;
+      }
+    } catch (err) {
+      if (disposed || serial !== loadSequence) return;
+      if (err.status === 404) {
+        node.data.status = 'interrupted';
+        node.data.error = '找不到上次任务，确认素材结果后可以重试。';
+        jobTimers.delete(key);
+        return;
+      }
+    }
+    if (!disposed && serial === loadSequence) jobTimers.set(key, setTimeout(poll, 2000));
+  };
+  jobTimers.set(key, setTimeout(poll, 150));
 }
 function addShot(continuation = false) {
   addMenuOpen.value = false;
@@ -690,17 +910,21 @@ async function importBackup(event) {
   }
 }
 function addNote() {
+  addMenuOpen.value = false;
+  drawerOpen.value = false;
   if (!ready.value || graph.value.nodes.length >= 300) return;
   checkpoint();
   const p = positionForNew(),
     n = makeNode('note', p.x, p.y, { title: '创作便签', text: '' });
   graph.value.nodes.push(n);
-  selectedId.value = n.id;
+  focusNode(n.id);
 }
 function addMaterial(material) {
   if (!ready.value) return false;
   const target =
-    selected.value?.type === 'shot' && !ACTIVE_STATUSES.includes(selected.value.data.status)
+    material.kind !== 'audio' &&
+    selected.value?.type === 'shot' &&
+    !ACTIVE_STATUSES.includes(selected.value.data.status)
       ? selected.value
       : null;
   if (target) {
@@ -824,7 +1048,7 @@ watch(
   [selectedId, dimensions, composerHeight],
   async () => {
     await nextTick();
-    if (!gesture && selected.value?.type === 'shot') frameCreation(selected.value);
+    if (!gesture && isCreationNode(selected.value)) frameCreation(selected.value);
   },
   { flush: 'post' }
 );
@@ -833,7 +1057,7 @@ async function focusNode(id) {
   await nextTick();
   const node = nodesById.value.get(id);
   if (!node || disposed || !board.value) return;
-  if (node.type === 'shot') {
+  if (isCreationNode(node)) {
     frameCreation(node, true);
     return;
   }
@@ -841,17 +1065,56 @@ async function focusNode(id) {
   const zoom = Math.max(graph.value.viewport.zoom, 0.75);
   graph.value.viewport = {
     x: rect.width / 2 - (node.x + NODE_WIDTH / 2) * zoom,
-    y:
-      Math.max(140, (rect.height - (node.type === 'shot' ? 280 : 0)) / 2) - (node.y + NODE_HEIGHT / 2) * zoom,
+    y: Math.max(140, rect.height / 2) - (node.y + NODE_HEIGHT / 2) * zoom,
     zoom,
   };
 }
-function beginLink(id) {
+function beginLink(id, toggle = true) {
   if (selectedIds.value.length > 1 && selectedIds.value.includes(id)) return beginBatchLink();
   linkingIds.value = [];
-  connecting.value = connecting.value === id ? '' : id;
+  connecting.value = toggle && connecting.value === id ? '' : id;
   const n = graph.value.nodes.find((n) => n.id === id);
   if (n) pointer.value = { x: n.x + NODE_WIDTH + 70, y: n.y + NODE_PORT_Y };
+}
+function startLinkGesture(event, id) {
+  if (event.button !== 0 || gesture) return;
+  event.preventDefault();
+  board.value.closest('.workflow-editor').focus({ preventScroll: true });
+  const cancelOnClick =
+    connecting.value === id && !(selectedIds.value.length > 1 && selectedIds.value.includes(id));
+  beginLink(id, false);
+  gesture = {
+    kind: 'link',
+    pointerId: event.pointerId,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    cancelOnClick,
+    moved: false,
+  };
+  gestureState.value = 'link';
+  pointer.value = screenToWorld(event);
+  linkTargetId.value = '';
+  board.value.setPointerCapture(event.pointerId);
+}
+function linkNodeAt(event) {
+  const hit = document.elementFromPoint(event.clientX, event.clientY);
+  return hit && board.value?.contains(hit) ? hit.closest('.flow-node')?.dataset.nodeId || '' : '';
+}
+function cancelLinkGesture(event) {
+  if (gesture?.kind !== 'link') return;
+  // A touch can transfer its implicit capture from the port to the board.
+  if (
+    event?.type === 'lostpointercapture' &&
+    (event.target !== board.value ||
+      event.pointerId !== gesture.pointerId ||
+      board.value?.hasPointerCapture(event.pointerId))
+  )
+    return;
+  const pointerId = gesture.pointerId;
+  gesture = null;
+  gestureState.value = '';
+  connecting.value = '';
+  if (board.value?.hasPointerCapture(pointerId)) board.value.releasePointerCapture(pointerId);
 }
 function isLinkTarget(id) {
   if (!connecting.value || ACTIVE_STATUSES.includes(nodesById.value.get(id)?.data.status)) return false;
@@ -991,6 +1254,12 @@ function duplicate() {
       n.data.versions = [];
       n.data.status = 'draft';
     }
+    if (n.data.creationKind) {
+      delete n.data.jobId;
+      delete n.data.mediaSubmission;
+      delete n.data.error;
+      n.data.title = n.data.title.slice(0, 80);
+    }
     return n;
   });
   const edges = graph.value.edges
@@ -1088,7 +1357,11 @@ function movePointer(event) {
   if (!gesture) return;
   const dx = event.clientX - gesture.clientX,
     dy = event.clientY - gesture.clientY;
-  if (gesture.kind === 'pan') {
+  if (gesture.kind === 'link') {
+    if (event.pointerId !== gesture.pointerId || !connecting.value) return;
+    if (Math.hypot(dx, dy) > 5) gesture.moved = true;
+    hoverLinkTarget(gesture.moved ? linkNodeAt(event) : '');
+  } else if (gesture.kind === 'pan') {
     if (Math.hypot(dx, dy) > 5) gesture.moved = true;
     graph.value.viewport.x = gesture.x + dx;
     graph.value.viewport.y = gesture.y + dy;
@@ -1127,6 +1400,19 @@ function movePointer(event) {
   }
 }
 function endGesture(event) {
+  const clickedCreation =
+    event.type === 'pointerup' && gesture?.kind === 'nodes' && !gesture.moved ? selected.value : null;
+  if (gesture?.kind === 'link') {
+    if (event.pointerId !== gesture.pointerId) return;
+    if (event.type === 'pointerup' && connecting.value) {
+      if (gesture.moved) {
+        const target = linkNodeAt(event);
+        if (target) finishLink(target);
+        connecting.value = '';
+      } else if (gesture.cancelOnClick) connecting.value = '';
+    } else connecting.value = '';
+    linkTargetId.value = '';
+  }
   if (
     event.type === 'pointerup' &&
     event.button === 0 &&
@@ -1142,6 +1428,10 @@ function endGesture(event) {
   gestureState.value = '';
   marquee.value = null;
   if (board.value?.hasPointerCapture(event.pointerId)) board.value.releasePointerCapture(event.pointerId);
+  if (isCreationNode(clickedCreation))
+    nextTick(() => {
+      if (!gesture && selected.value?.id === clickedCreation.id) frameCreation(selected.value);
+    });
 }
 function zoomAt(nextZoom, x, y) {
   const v = graph.value.viewport;
@@ -1236,6 +1526,7 @@ async function pollExport(jobId) {
   if (disposed) return;
   try {
     const job = await api.canvasExportStatus(props.taskId, jobId);
+    if (disposed) return;
     if (job.url && !job.url.startsWith(`/files/${props.taskId}/export/`))
       throw new Error('导出返回了无效的文件地址');
     exportJob.value = { ...job, mode: job.mode || exportJob.value?.mode || 'merge' };
@@ -1261,6 +1552,7 @@ async function pollExport(jobId) {
       return;
     }
   } catch (err) {
+    if (disposed) return;
     if (err.status === 404 || !err.status) {
       exportJob.value = { status: 'failed', error: err.message };
       cacheExport('');
@@ -1287,6 +1579,7 @@ function onKey(event) {
     return;
   }
   if (event.key === 'Escape') {
+    cancelLinkGesture();
     connecting.value = '';
     drawerOpen.value = false;
     menuOpen.value = false;
@@ -1313,6 +1606,7 @@ function onKey(event) {
 }
 function releaseSpace(event) {
   if (!event || event.type === 'blur' || event.code === 'Space') spacePressed.value = false;
+  if (event?.type === 'blur') cancelLinkGesture();
 }
 
 function selectVersion(id, versionId) {
@@ -1326,7 +1620,10 @@ function generationError(node, queuedIds = []) {
     .map(resolveMaterial);
   const inputs = videoInputs(graph.value, node.id);
   return (
-    mentionsError(node.data.description, refs) ||
+    mentionsError(node.data.description, [
+      ...refs,
+      ...videoMentionMaterials(inputs).filter((m) => m.usage !== 'text'),
+    ]) ||
     videoSourcesError(inputs, props.cfg, queuedIds) ||
     shotReadiness(
       node,
@@ -1353,13 +1650,15 @@ async function uploadMedia(files) {
   if (
     images.length > 8 ||
     images.some((file) =>
-      /\.(mp4|mov|webm|mkv|m4v)$/i.test(file.name)
-        ? file.size > 100_000_000
-        : !['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size > 15_000_000
+      /\.(mp3|wav|m4a|ogg|aac)$/i.test(file.name)
+        ? file.size > 20_000_000
+        : /\.(mp4|mov|webm|mkv|m4v)$/i.test(file.name)
+          ? file.size > 100_000_000
+          : !['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size > 15_000_000
     )
   )
     return say(
-      '每次最多上传 8 个文件。图片支持 PNG、JPG、WebP（15MB）；视频支持 MP4、MOV、WebM、MKV、M4V（100MB、两分钟以内）',
+      '每次最多上传 8 个文件：图片 PNG/JPG/WebP（15MB）、视频 MP4/MOV/WebM/MKV/M4V（100MB）、音频 MP3/WAV/M4A/OGG/AAC（20MB）',
       'error'
     );
   if (graph.value.nodes.length + images.length > 300) return say('画布节点已达上限', 'error');
@@ -1395,19 +1694,26 @@ async function uploadMedia(files) {
         if (!target) selectedId.value = source.id;
         continue;
       }
-      const uploaded = await api.uploadMaterial(props.taskId, 'image', file);
+      const kind = /\.(mp3|wav|m4a|ogg|aac)$/i.test(file.name) ? 'audio' : 'image';
+      const uploaded = await api.uploadMaterial(props.taskId, kind, file);
       if (disposed) break;
       const location = mediaPosition(target, index, position);
       const source = makeNode('material', location.x, location.y, {
         title: uploaded.name,
-        materialKind: 'image',
+        materialKind: kind,
         materialName: uploaded.name,
         materialFile: uploaded.entry?.images?.[0]?.split(/[\\/]/).pop() || '',
       });
       graph.value.nodes.push(source);
       const liveTarget = target && nodesById.value.get(target.id);
-      if (liveTarget && !ACTIVE_STATUSES.includes(liveTarget.data.status))
+      if (
+        kind !== 'audio' &&
+        liveTarget &&
+        graph.value.edges.length < 1200 &&
+        !ACTIVE_STATUSES.includes(liveTarget.data.status)
+      )
         graph.value.edges.push({ id: uid(), source: source.id, target: liveTarget.id });
+      if (!target || kind === 'audio') selectedId.value = source.id;
     }
     emit('refresh');
     say('素材已上传并加入画布', 'ok');
@@ -1430,13 +1736,15 @@ function requestGeneration(ids) {
       duration: node.data.duration,
       refs: inputNodes(node.id).filter((n) => n.type === 'material').length,
       manual: node.data.manual,
-      count: node.data.candidateCount || 1,
+      count: props.cfg.video_backend === 'muse' ? 1 : node.data.candidateCount || 1,
       resolution:
         props.cfg.video_backend === 'api'
-          ? '模型默认分辨率'
+          ? '服务默认分辨率'
           : node.data.resolution && node.data.resolution !== 'custom'
             ? node.data.resolution.toUpperCase()
-            : `${node.data.megapixels ?? defaultResolution(props.cfg)}MP`,
+            : props.cfg.video_backend === 'muse'
+              ? '服务默认'
+              : `${node.data.megapixels ?? defaultResolution(props.cfg)}MP`,
     }));
   if (!reviews.value.length) return say('没有可加入队列的分镜');
   if (ids.length === 1) {
@@ -1661,14 +1969,61 @@ async function generate(id) {
     }
   }
 }
+async function recoverMuse(nodeId, downloadedFile = null) {
+  const node = graph.value.nodes.find((n) => n.id === nodeId);
+  if (!node?.data.jobId || recoveringMuse.value || disposed) return;
+  const jobId = node.data.jobId,
+    sequence = loadSequence;
+  recoveringMuse.value = nodeId;
+  try {
+    const recovered = downloadedFile
+      ? await api.importMuseVideo(jobId, props.taskId, downloadedFile)
+      : await api.recoverMuseVideo(jobId, props.taskId);
+    if (disposed || sequence !== loadSequence || node.data.jobId !== jobId) return;
+    // A completed import must carry its successful version/file before the
+    // canvas reports completion or persists a node that can be referenced.
+    const completed = recovered.status !== 'running' ? await api.segmentVideo(jobId, props.taskId) : null;
+    if (disposed || sequence !== loadSequence || node.data.jobId !== jobId) return;
+    if (completed) applyVideoProgress(node, { ...completed, job_id: jobId }, props.taskId);
+    node.data.status = completed?.status || recovered.status;
+    node.data.error = '';
+    if (recovered.status === 'running') {
+      videoVersions(node)
+        .filter((v) => v.jobId === jobId)
+        .forEach((v) => {
+          v.status = 'running';
+          v.error = '';
+        });
+    }
+    await save();
+    if (completed && ['succeeded', 'failed', 'interrupted'].includes(completed.status))
+      emit('segment-done', completed);
+    else pollJob(nodeId, jobId);
+    if (recovered.status !== 'failed')
+      say(
+        downloadedFile ? '已导入原 Muse 任务成片，正在更新画布' : '正在取回原 Muse 任务的成片，不会重新生成',
+        'ok'
+      );
+  } catch (error) {
+    if (!disposed && sequence === loadSequence) say(error.message, 'error');
+  } finally {
+    if (!disposed) recoveringMuse.value = '';
+  }
+}
 function pollJob(nodeId, jobId) {
   if (disposed || jobTimers.has(jobId)) return;
+  const sequence = loadSequence;
+  const isActive = () => !disposed && sequence === loadSequence;
   const poll = async () => {
-    if (disposed) return;
+    if (!isActive()) return;
     try {
       const job = await api.segmentVideo(jobId, props.taskId);
+      if (!isActive()) return;
       const node = graph.value.nodes.find((n) => n.id === nodeId);
-      if (!node || node.data.jobId !== jobId) return;
+      if (!node || node.data.jobId !== jobId) {
+        jobTimers.delete(jobId);
+        return;
+      }
       applyVideoProgress(node, { ...job, job_id: jobId }, props.taskId);
       if (['succeeded', 'failed', 'interrupted'].includes(job.status)) {
         node.data.status = job.status;
@@ -1687,23 +2042,24 @@ function pollJob(nodeId, jobId) {
         return;
       }
     } catch (err) {
+      if (!isActive()) return;
       if (err.status === 404) {
         const node = graph.value.nodes.find((n) => n.id === nodeId);
-        if (node) {
+        if (node?.data.jobId === jobId) {
           node.data.status = 'interrupted';
           node.data.error = '后端重启后无法继续查询任务。请查看生成记录，确认远端任务结果后再生成。';
+          videoVersions(node)
+            .filter((v) => v.jobId === jobId)
+            .forEach((v) => {
+              v.status = 'interrupted';
+            });
+          queuePaused.value = true;
         }
-        queuePaused.value = true;
-        videoVersions(node)
-          .filter((v) => v.jobId === jobId)
-          .forEach((v) => {
-            v.status = 'interrupted';
-          });
         jobTimers.delete(jobId);
         return;
       }
     }
-    if (!disposed) jobTimers.set(jobId, setTimeout(poll, 3000));
+    if (isActive()) jobTimers.set(jobId, setTimeout(poll, 3000));
   };
   jobTimers.set(jobId, setTimeout(poll, 300));
 }
@@ -1747,6 +2103,7 @@ onMounted(async () => {
   }
 });
 onBeforeUnmount(() => {
+  cancelLinkGesture();
   window.removeEventListener('keyup', releaseSpace);
   window.removeEventListener('blur', releaseSpace);
   disposed = true;
@@ -1930,6 +2287,7 @@ onBeforeUnmount(() => {
         @pointermove="movePointer"
         @pointerup="endGesture"
         @pointercancel="endGesture"
+        @lostpointercapture="cancelLinkGesture"
         @wheel.prevent="wheel"
         @dragover.prevent
         @drop.prevent="uploadMedia($event.dataTransfer.files)"
@@ -1997,7 +2355,7 @@ onBeforeUnmount(() => {
               v-for="node in graph.nodes"
               :key="node.id"
               :node="node"
-              :material="resolveMaterial(node)"
+              :material="resolveNodeMaterial(node)"
               :dimmed="false"
               :selected="selectedIds.includes(node.id)"
               :connecting="!!connecting"
@@ -2007,6 +2365,7 @@ onBeforeUnmount(() => {
               @focus="focusNode"
               @drag="startNodeDrag"
               @connect="beginLink"
+              @link-start="startLinkGesture"
               @finish-connect="finishLink"
               @hover="hoverLinkTarget"
               @generate="requestGeneration([$event])"
@@ -2062,12 +2421,67 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <div class="canvas-tools" @pointerdown.stop @wheel.stop>
-            <button title="添加视频" aria-label="添加视频" @click="chooseAdd">
+            <button
+              title="添加节点和素材"
+              aria-label="添加节点"
+              aria-haspopup="menu"
+              :aria-expanded="addMenuOpen"
+              :class="{ active: addMenuOpen }"
+              @click="chooseAdd"
+            >
               <WorkflowIcon name="plus" />
             </button>
-            <div v-if="addMenuOpen" class="add-video-menu" aria-label="添加视频选项">
-              <button @click="addShot(false)">空白视频</button
-              ><button @click="addShot(true)">续拍当前视频</button>
+            <div v-if="addMenuOpen" class="canvas-add-menu" role="menu" aria-label="添加节点和素材">
+              <p>添加节点</p>
+              <button role="menuitem" @click="addNote">
+                <WorkflowIcon name="note" /><span>文本<small>剧情、台词与创作说明</small></span>
+              </button>
+              <button role="menuitem" @click="addCreation('image')">
+                <WorkflowIcon name="image" /><span>图片<small>描述画面，生成参考图</small></span>
+              </button>
+              <button role="menuitem" @click="addShot(false)">
+                <WorkflowIcon name="video" /><span>视频<small>使用图片和视频参考创作</small></span>
+              </button>
+              <button role="menuitem" @click="addCreation('audio')">
+                <WorkflowIcon name="audio" /><span>语音<small>选择音色，生成配音与旁白</small></span>
+              </button>
+              <button
+                v-if="['shot', 'footage'].includes(selected?.type) && currentVideo(selected)"
+                role="menuitem"
+                @click="addShot(true)"
+              >
+                <WorkflowIcon name="link" /><span>续拍当前视频</span>
+              </button>
+              <p>添加素材</p>
+              <button
+                role="menuitem"
+                @click="
+                  addMenuOpen = false;
+                  drawerOpen = true;
+                "
+              >
+                <WorkflowIcon name="grid" /><span>素材库<small>使用作品中的图片和音频</small></span>
+              </button>
+              <button
+                role="menuitem"
+                :disabled="uploading"
+                @click="
+                  addMenuOpen = false;
+                  mediaUploadInput.click();
+                "
+              >
+                <WorkflowIcon name="upload" /><span>上传文件<small>图片、视频和音频</small></span>
+              </button>
+              <button
+                role="menuitem"
+                :disabled="importing || running"
+                @click="
+                  addMenuOpen = false;
+                  importRecords();
+                "
+              >
+                <WorkflowIcon name="queue" /><span>同步生成记录<small>把已有视频放回画布</small></span>
+              </button>
             </div>
             <span></span
             ><button
@@ -2142,7 +2556,7 @@ onBeforeUnmount(() => {
             </div>
             <div class="material-filters">
               <button
-                v-for="kind in ['all', 'character', 'scene', 'prop', 'image']"
+                v-for="kind in ['all', 'character', 'scene', 'prop', 'image', 'audio']"
                 :key="kind"
                 :class="{ active: kindFilter === kind }"
                 @click="kindFilter = kind"
@@ -2164,8 +2578,10 @@ onBeforeUnmount(() => {
                 class="drawer-material"
                 @click="addMaterial(m)"
               >
-                <img v-if="m.url" :src="m.url" :alt="m.name" /><span v-else class="material-placeholder"
-                  ><WorkflowIcon name="image" /></span
+                <img v-if="m.url && m.kind !== 'audio'" :src="m.url" :alt="m.name" /><span
+                  v-else
+                  class="material-placeholder"
+                  ><WorkflowIcon :name="m.kind === 'audio' ? 'audio' : 'image'" /></span
                 ><span class="material-copy"
                   ><b>{{ m.name }}</b
                   ><span>{{ KIND_LABELS[m.kind] }} · {{ m.ready ? '已就绪' : '待准备' }}</span></span
@@ -2181,9 +2597,9 @@ onBeforeUnmount(() => {
             </footer>
           </aside>
           <div v-if="connecting" class="connect-hint" @pointerdown.stop>
-            <WorkflowIcon name="link" />{{
-              linkingIds.length > 1 ? `${linkingIds.length} 项素材 · ` : ''
-            }}点击目标视频框即可连接<button @click="connecting = ''">取消</button>
+            <WorkflowIcon name="link" />{{ linkingIds.length > 1 ? `${linkingIds.length} 项素材 · ` : ''
+            }}{{ gestureState === 'link' ? '拖到目标视频框后松开即可连接' : '点击目标视频框即可连接'
+            }}<button @click="connecting = ''">取消</button>
           </div>
           <div v-if="selectedEdge" class="edge-toolbar" @pointerdown.stop>
             <WorkflowIcon name="link" /><span>已选中连线</span
@@ -2258,9 +2674,10 @@ onBeforeUnmount(() => {
                 <WorkflowIcon name="close" />
               </button>
             </header>
-            <p>底部加号添加视频，图片与视频也可以直接拖入画布。</p>
+            <p>底部加号添加文本、图片、视频或语音，素材文件也可以直接拖入画布。</p>
             <p>空白处左键框选；Shift 点击多选。在节点或组框内拖动，选中素材一起移动。</p>
             <p>中键或空格＋左键平移画布，滚轮缩放。Alt 点击组内节点，可单独编辑。</p>
+            <p>按住节点右侧圆点，拖到目标视频上松开即可连接；也可以点击圆点后再点目标视频。</p>
             <p>多选后点击「一起连接」或框右侧加号，再点击目标视频框即可连接。</p>
             <div>
               <span>撤销</span><kbd>Ctrl Z</kbd><span>重做</span><kbd>Ctrl Shift Z</kbd
@@ -2269,6 +2686,9 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <VideoComposer
+            :recovering="recoveringMuse === selected.id"
+            @recover-muse="recoverMuse"
+            @import-muse="recoverMuse"
             v-if="selected?.type === 'shot'"
             :style="composerPosition"
             :anchor="composerPosition"
@@ -2280,7 +2700,7 @@ onBeforeUnmount(() => {
             :cfg="cfg"
             :error="generationError(selected)"
             :resolve-material="resolveMaterial"
-            :materials="materials"
+            :materials="materials.filter((m) => m.kind !== 'audio')"
             @edit="editNode"
             @checkpoint="checkpoint"
             @close="selectedId = ''"
@@ -2293,6 +2713,25 @@ onBeforeUnmount(() => {
             @remove="removeSelected"
             @disconnect="disconnect"
             @version="selectVersion(selectedId, $event)"
+          />
+          <CreationComposer
+            v-else-if="isCreationNode(selected)"
+            :key="selected.id"
+            :style="composerPosition"
+            :node="selected"
+            :material="resolveNodeMaterial(selected)"
+            :variants="mediaVariants(selected)"
+            :busy="ACTIVE_STATUSES.includes(selected.data.status)"
+            :cfg="cfg"
+            @resize="composerHeight = $event"
+            @edit="editNode"
+            @checkpoint="checkpoint"
+            @close="selectedId = ''"
+            @duplicate="duplicate"
+            @remove="removeSelected"
+            @generate="generateMedia"
+            @variant="selectMediaVariant"
+            @configure="emit('configure')"
           />
           <div v-if="!graph.nodes.length" class="empty-canvas" @pointerdown.stop>
             <WorkflowIcon name="shot" />
@@ -2333,14 +2772,18 @@ onBeforeUnmount(() => {
             ><button class="engine-card" @click="emit('configure')">
               <span class="engine-logo"><WorkflowIcon name="spark" /></span>
               <div>
-                <b>{{ cfg.video_backend === 'api' ? '视频 API' : 'ComfyUI' }}</b
+                <b>{{
+                  cfg.video_backend === 'muse' ? 'Muse' : cfg.video_backend === 'api' ? '视频 API' : 'ComfyUI'
+                }}</b
                 ><span>{{
                   serviceConfigured
-                    ? cfg.video_backend === 'api'
-                      ? '单张首帧'
-                      : cfg.video_workflow === 'ref2va'
-                        ? 'Ref2VA · 多图参考'
-                        : 'I2V · 首帧生成'
+                    ? cfg.video_backend === 'muse'
+                      ? '登录账号 · 浏览器生成'
+                      : cfg.video_backend === 'api'
+                        ? '单张首帧'
+                        : cfg.video_workflow === 'ref2va'
+                          ? 'Ref2VA · 多图参考'
+                          : 'I2V · 首帧生成'
                     : '待配置连接地址'
                 }}</span>
               </div>
@@ -2428,17 +2871,6 @@ onBeforeUnmount(() => {
         </div>
         <footer><WorkflowIcon name="shield" />本地保存 · 你的创作由你掌控</footer>
       </aside>
-      <WorkflowInspector
-        v-else-if="selected && selected.type !== 'shot'"
-        :node="selected"
-        :material="resolveMaterial(selected)"
-        :generating="ACTIVE_STATUSES.includes(selected.data.status)"
-        @edit="editNode"
-        @checkpoint="checkpoint"
-        @close="selectedId = ''"
-        @duplicate="duplicate"
-        @remove="removeSelected"
-      />
     </div>
     <StoryboardSequence
       :shots="sequence"
@@ -2451,7 +2883,7 @@ onBeforeUnmount(() => {
           queueOpen = false;
         }
       "
-      @add="chooseAdd"
+      @add="addShot()"
       @toggle="sequenceCollapsed = !sequenceCollapsed"
     />
     <WorkflowDialogs
@@ -2471,6 +2903,17 @@ onBeforeUnmount(() => {
       "
     />
     <input ref="importInput" type="file" accept=".json,application/json" hidden @change="importBackup" />
+    <input
+      ref="mediaUploadInput"
+      type="file"
+      accept=".png,.jpg,.jpeg,.webp,.mp4,.mov,.webm,.mkv,.m4v,.mp3,.wav,.m4a,.ogg,.aac"
+      multiple
+      hidden
+      @change="
+        uploadMedia($event.target.files);
+        $event.target.value = '';
+      "
+    />
     <input
       ref="uploadInput"
       type="file"

@@ -127,6 +127,13 @@ class WorkflowStoreTests(unittest.TestCase):
         self.assertEqual(self.client.put("/api/tasks/missing/workflow", json=self.document).status_code, 404)
         self.assertFalse((self.directory / "workflow.json").exists())
 
+    def test_audio_nodes_save_independently_but_cannot_be_video_image_references(self):
+        self.document["nodes"][0]["data"] = {"materialKind": "audio", "title": "Narration"}
+        self.assertEqual(self.client.put(self.url, json=self.document).status_code, 422)
+        self.document["edges"] = []
+        self.assertEqual(self.client.put(self.url, json=self.document).status_code, 200)
+        self.assertEqual(self.client.get(self.url).json()["nodes"][0]["data"]["materialKind"], "audio")
+
     def test_corrupt_file_is_preserved_and_reported(self):
         path = self.directory / "workflow.json"
         path.write_text("broken", encoding="utf-8")

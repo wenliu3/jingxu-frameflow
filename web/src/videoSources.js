@@ -19,11 +19,26 @@ export function videoInputs(graph, target) {
     .filter((e) => e.target === target && ['shot', 'footage'].includes(nodes.get(e.source)?.type))
     .map((edge) => ({ edge, node: nodes.get(edge.source) }));
 }
+export function videoMentionMaterials(inputs) {
+  return inputs.map(({ node, edge }, index) => {
+    const version = sourceVersion(node, edge);
+    return {
+      kind: 'video',
+      nodeId: node.id,
+      name: node.data.title,
+      number: index + 1,
+      poster: version?.poster,
+      videoUrl: version?.url,
+      ready: !!(version?.file && version?.url && version.status === 'succeeded'),
+      usage: edge.usage || 'text',
+    };
+  });
+}
 export function videoSourcesError(inputs, cfg, queuedIds = []) {
   const visual = inputs.filter(({ edge }) => edge.usage && edge.usage !== 'text');
   if (!visual.length) return '';
-  if (cfg.video_backend === 'api' || cfg.video_workflow !== 'ref2va')
-    return '视频参考和续拍需要切换到 ComfyUI · Ref2VA';
+  if (cfg.video_backend !== 'muse' && (cfg.video_backend === 'api' || cfg.video_workflow !== 'ref2va'))
+    return '视频参考和续拍需要切换到 Muse 或 ComfyUI · Ref2VA';
   if (visual.length > 3) return '最多引用三个视频来源';
   if (visual.filter(({ edge }) => edge.usage === 'continue').length > 1)
     return '请只保留一个续拍起点，其他来源可设为视频参考';
@@ -70,6 +85,7 @@ export function sourceSnapshot(inputs) {
 }
 export function sourceContext(inputs) {
   return inputs
+    .filter(({ edge }) => !edge.usage || edge.usage === 'text')
     .map(({ node, edge }) => {
       const version = sourceVersion(node, edge);
       const description = displayPrompt(version?.description ?? node.data.description);

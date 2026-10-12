@@ -74,8 +74,8 @@ class SegmentVideoBody(BaseModel):
     # 与服务设置采用相同范围；不把像素预算伪装成固定 1080p。
     megapixels: float | None = Field(None, ge=0.1, le=0.98, allow_inf_nan=False)
     frame_names: dict[str, str] = Field(default_factory=dict)
-    expected_backend: str | None = Field(None, pattern="^(comfyui|api)$")
-    expected_workflow: str | None = Field(None, pattern="^(i2v|ref2va|api)$")
+    expected_backend: str | None = Field(None, pattern="^(comfyui|api|muse)$")
+    expected_workflow: str | None = Field(None, pattern="^(i2v|ref2va|api|muse)$")
     # 「AI 帮我写」模式下用户输入的那段中文描述。**不参与出片**，只为「生成记录」
     # 留个底 —— 过几天回看时，一段英文正文（prompt）是看不懂自己当初想要什么的。
     # 手写模式没有这一层，留空即可。

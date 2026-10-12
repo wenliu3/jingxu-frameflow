@@ -7,6 +7,7 @@ import {
   mentionToken,
   mentionQuery,
   promptParts,
+  sameMention,
 } from '../promptMentions.js';
 
 const props = defineProps({
@@ -16,7 +17,7 @@ const props = defineProps({
   disabled: Boolean,
   manual: Boolean,
 });
-const emit = defineEmits(['update:modelValue', 'checkpoint', 'generate']);
+const emit = defineEmits(['update:modelValue', 'checkpoint', 'generate', 'mention']);
 const editor = ref(null),
   menu = ref(null),
   query = ref(null),
@@ -24,9 +25,18 @@ const editor = ref(null),
   position = ref({});
 let composing = false;
 const limit = computed(() => (props.manual ? 8000 : 1000));
-const isLinked = (m) => props.connected.some((c) => c?.kind === m.kind && c.name === m.name);
+const isLinked = (m) => props.connected.some((c) => sameMention(c, m));
 const choices = computed(() => connectedMentionChoices(props.connected, query.value?.query || ''));
 const available = computed(() => choices.value.filter((m) => m.ready));
+// Parent updates can rebuild identical catalogs. Preserve native selection and undo
+// unless the identity, appearance or availability of a reference actually changed.
+const catalogState = computed(() =>
+  JSON.stringify(
+    [props.materials, props.connected].map((materials) =>
+      materials.map((m) => [m.kind, m.nodeId || '', m.name, m.url || '', m.poster || '', !!m.ready])
+    )
+  )
+);
 
 function read(node) {
   if (node.nodeType === Node.TEXT_NODE) return node.textContent;
@@ -85,20 +95,21 @@ function selectRange(start, end = start) {
   selection.addRange(range);
 }
 function chip(part) {
-  const material = props.materials.find((m) => m.kind === part.kind && m.name === part.name);
+  const material =
+    props.connected.find((m) => sameMention(m, part)) || props.materials.find((m) => sameMention(m, part));
   const element = document.createElement('span');
   element.className = `prompt-mention${!material?.ready || !isLinked(part) ? ' missing' : ''}`;
   element.contentEditable = 'false';
   element.dataset.token = part.token;
-  element.title = `${KIND_LABELS[part.kind]} · ${part.name}${!isLinked(part) ? ' · 未连接' : ''}`;
-  if (material?.url) {
+  element.title = `${part.kind === 'video' ? '视频' : KIND_LABELS[part.kind]} · ${material?.name || part.name}${!isLinked(part) ? ' · 未连接' : ''}`;
+  if (material?.url || material?.poster) {
     const image = document.createElement('img');
-    image.src = material.url;
+    image.src = material.poster || material.url;
     image.alt = '';
     image.draggable = false;
     element.append(image);
   }
-  element.append(document.createTextNode(`@${part.name}`));
+  element.append(document.createTextNode(`@${material?.name || part.name}`));
   return element;
 }
 function render(text, offset = null) {
@@ -142,9 +153,10 @@ function choose(material) {
   editor.value.focus();
   selectRange(start, end);
   // Browser insertion retains native typing undo and treats each mention as one unit.
-  const element = chip({ token, kind: material.kind, name: material.name });
+  const element = chip({ token, kind: material.kind, name: material.name, nodeId: material.nodeId });
   document.execCommand('insertHTML', false, `${element.outerHTML} `);
   query.value = null;
+  emit('mention', material);
   publish();
 }
 function key(event) {
@@ -201,14 +213,10 @@ watch(
       render(text, document.activeElement === editor.value ? caret() : null);
   }
 );
-watch(
-  () => [props.materials, props.connected],
-  () => {
-    if (editor.value && !composing)
-      render(read(editor.value), document.activeElement === editor.value ? caret() : null);
-  },
-  { deep: true }
-);
+watch(catalogState, () => {
+  if (editor.value && !composing)
+    render(read(editor.value), document.activeElement === editor.value ? caret() : null);
+});
 watch(
   () => props.disabled,
   (disabled) => {
@@ -270,26 +278,36 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', outside));
         <div role="listbox" aria-label="选择提示词素材">
           <button
             v-for="material in choices"
-            :key="`${material.kind}:${material.name}`"
+            :key="`${material.kind}:${material.nodeId || material.name}`"
             role="option"
             :aria-selected="available[active] === material"
             :disabled="!material.ready"
             @click="choose(material)"
           >
             <span class="mention-image"
-              ><img v-if="material.url" :src="material.url" alt="" /><span v-else class="mention-icon">@</span
+              ><img
+                v-if="material.poster || material.url"
+                :src="material.poster || material.url"
+                alt=""
+              /><span v-else class="mention-icon">{{ material.kind === 'video' ? '▶' : '@' }}</span
               ><i>{{ material.number }}</i></span
             >
             <span
               ><b>{{ material.name }}</b
               ><small
-                >{{ KIND_LABELS[material.kind] }} ·
-                {{ !material.ready ? '待准备' : `图片 ${material.number}` }}</small
+                >{{ material.kind === 'video' ? '视频' : KIND_LABELS[material.kind] }} ·
+                {{
+                  !material.ready
+                    ? '待准备'
+                    : material.kind === 'video'
+                      ? '选择后作为视频附件参考'
+                      : `图片 ${material.number}`
+                }}</small
               ></span
             >
           </button>
           <p v-if="!choices.length">
-            {{ connected.length ? '没有匹配的素材，试试其他名称' : '先从「参考素材」为这个视频添加图片' }}
+            {{ connected.length ? '没有匹配的素材，试试其他名称' : '先添加图片，或连接、上传参考视频' }}
           </p>
           <p v-else-if="!available.length">请先在素材工坊准备图片</p>
         </div>

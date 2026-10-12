@@ -9,6 +9,7 @@ import ReferenceThumbnail from './ReferenceThumbnail.vue';
 import { displayPrompt, numberMaterials } from '../promptMentions.js';
 import { ACTIVE_STATUSES, STATUS_LABELS } from '../workflowStudio.js';
 import { currentVideo, videoVersions } from '../workflowVideo.js';
+import { videoMentionMaterials } from '../videoSources.js';
 const props = defineProps({
   node: Object,
   inputs: Array,
@@ -17,6 +18,7 @@ const props = defineProps({
   resolveMaterial: Function,
   materials: Array,
   anchor: Object,
+  recovering: Boolean,
   videoInputs: { type: Array, default: () => [] },
 });
 const emit = defineEmits([
@@ -34,8 +36,16 @@ const emit = defineEmits([
   'version',
   'resize',
   'source-change',
+  'recover-muse',
+  'import-muse',
 ]);
 const composer = ref(null);
+const museDownloadInput = ref(null);
+function importMuseDownload(event) {
+  const file = event.target.files?.[0];
+  event.target.value = '';
+  if (file) emit('import-muse', props.node.id, file);
+}
 let sizeObserver;
 onMounted(() => {
   sizeObserver = new ResizeObserver(() => emit('resize', composer.value.getBoundingClientRect().height));
@@ -60,7 +70,23 @@ const connectedMaterials = computed(() =>
     }))
   )
 );
+const mentionMaterials = computed(() => [
+  ...connectedMaterials.value,
+  ...videoMentionMaterials(props.videoInputs),
+]);
+function mention(material) {
+  if (material.kind !== 'video') return;
+  const input = props.videoInputs.find((item) => item.node.id === material.nodeId);
+  if (input && (!input.edge.usage || input.edge.usage === 'text'))
+    emit('source-change', input.edge.id, { usage: 'reference', start: null, end: null });
+}
 const versions = computed(() => videoVersions(props.node).filter((v) => v.status === 'succeeded' && v.url));
+const canRecoverMuse = computed(
+  () =>
+    props.node.data.jobId &&
+    props.node.data.status !== 'succeeded' &&
+    videoVersions(props.node).some((v) => v.jobId === props.node.data.jobId && v.backend === 'muse')
+);
 const presets = [
   { label: '缓慢推进', zh: '镜头缓慢推进。', en: 'Slow camera push-in.' },
   { label: '平稳跟拍', zh: '镜头平稳跟随主体移动。', en: 'Smooth tracking shot following the subject.' },
@@ -167,6 +193,7 @@ function camera(preset) {
           :key="input.edge.id"
           :node="input.node"
           :edge="input.edge"
+          :backend="cfg.video_backend"
           @change="emit('source-change', input.edge.id, $event)"
           @disconnect="emit('disconnect', input.node.id)"
         />
@@ -175,18 +202,22 @@ function camera(preset) {
         :key="node.id"
         :model-value="node.data.description"
         :materials="materials"
-        :connected="connectedMaterials"
+        :connected="mentionMaterials"
         :manual="node.data.manual"
         :disabled="busy"
         @checkpoint="emit('checkpoint')"
+        @mention="mention"
         @update:model-value="emit('edit', { description: $event })"
         @generate="emit('generate', node.id)"
       />
       <div class="composer-footer">
         <button class="engine-choice" title="更改生成服务" @click="emit('configure')">
-          <WorkflowIcon name="spark" /><span>{{ cfg.video_backend === 'api' ? '视频 API' : 'ComfyUI' }}</span>
+          <WorkflowIcon name="spark" /><span>{{
+            cfg.video_backend === 'muse' ? 'Muse' : cfg.video_backend === 'api' ? '视频 API' : 'ComfyUI'
+          }}</span>
         </button>
         <select
+          v-if="cfg.video_backend !== 'muse'"
           aria-label="提示词模式"
           :value="node.data.manual ? 'manual' : 'ai'"
           @change="change({ manual: $event.target.value === 'manual' })"
@@ -194,6 +225,7 @@ function camera(preset) {
           <option value="ai">AI 编排</option>
           <option value="manual">英文直出</option>
         </select>
+        <span v-else class="composer-length">直接交给 Muse 编排</span>
         <VideoGenerationSettings
           ref="settingsPanel"
           :node="node"
@@ -215,6 +247,21 @@ function camera(preset) {
         </button>
       </div>
     </fieldset>
+    <div v-if="canRecoverMuse" class="composer-message">
+      <span>Muse 已出片但画布仍在等待？可取回原任务，不会重新生成。</span>
+      <button :disabled="recovering" @click="emit('recover-muse', node.id)">
+        {{ recovering ? '正在取回' : '取回 Muse 成片' }}
+      </button>
+      <button :disabled="recovering || busy" @click="museDownloadInput.click()">导入已下载成片</button>
+      <input
+        ref="museDownloadInput"
+        type="file"
+        accept=".mp4"
+        aria-label="选择 Muse 已下载成片"
+        hidden
+        @change="importMuseDownload"
+      />
+    </div>
     <details v-if="currentVideo(node)?.videoSources?.length" class="composer-warnings">
       <summary>当前成片引用了 {{ currentVideo(node).videoSources.length }} 个视频来源</summary>
       <p
@@ -247,7 +294,7 @@ function camera(preset) {
             <button @click="emit('version', v.id)">
               <WorkflowIcon name="play" />版本 {{ index + 1
               }}<small
-                >{{ v.duration ? `${v.duration}s` : '' }}
+                >{{ (v.actual_duration ?? v.duration) ? `${v.actual_duration ?? v.duration}s` : '' }}
                 {{ currentVideo(node)?.id === v.id ? '当前' : '' }}</small
               >
             </button>

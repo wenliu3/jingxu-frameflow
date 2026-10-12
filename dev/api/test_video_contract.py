@@ -339,6 +339,53 @@ class VideoContractTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in result["results"]], ["succeeded", "interrupted", "interrupted", "interrupted"])
         self.assertTrue(result["results"][0]["video_url"])
 
+    def test_transient_preflight_write_failure_stops_all_unsubmitted_candidates(self):
+        response = self.start(candidate_count=4)
+        from server.segment_generation import save_job as real_save_job
+        writes = 0
+
+        def fail_once(directory, job):
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                raise OSError("temporary disk failure")
+            return real_save_job(directory, job)
+
+        with patch("server.segment_generation.save_job", side_effect=fail_once):
+            self.runners[0]()
+        result = self.client.get(f"/api/segment-jobs/{response.json()['job_id']}").json()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(result["done"], 0)
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(all(r["status"] == "interrupted" for r in result["results"]))
+        self.assertIn("保存失败", result["error"])
+        for candidate in result["results"]:
+            sidecar = json.loads((self.root / "segments" / Path(candidate["file"]).with_suffix(".json")).read_text(encoding="utf-8"))
+            self.assertEqual(sidecar["status"], "interrupted")
+        self.module.SEGMENT_JOBS.clear()
+        recovered = self.client.get(f"/api/segment-jobs/{response.json()['job_id']}?task_id=abcdef123456").json()
+        self.assertEqual(recovered["results"], result["results"])
+        self.assertEqual(self.calls, [])
+
+    def test_later_preflight_failure_retains_success_and_stops_new_submissions(self):
+        response = self.start(candidate_count=4)
+        from server.segment_generation import save_job as real_save_job
+
+        def fail_second_preflight(directory, job):
+            if job["results"][1]["status"] == "running":
+                raise OSError("temporary disk failure")
+            return real_save_job(directory, job)
+
+        with patch("server.segment_generation.save_job", side_effect=fail_second_preflight):
+            self.runners[0]()
+        result = self.client.get(f"/api/segment-jobs/{response.json()['job_id']}").json()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(result["done"], 1)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual([r["status"] for r in result["results"]], ["succeeded", "interrupted", "interrupted", "interrupted"])
+        self.assertIn("保存失败", result["error"])
+        self.assertTrue(result["results"][0]["video_url"])
+
     def test_candidate_sidecar_replacement_failure_preserves_complete_previous_record(self):
         from server.segment_job_store import save_candidate
         response = self.start()

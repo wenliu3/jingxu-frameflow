@@ -54,6 +54,39 @@ function uploadFile(path, file, filename = '') {
 }
 
 export const api = {
+  mediaVoices() {
+    return readOnce('/api/voices');
+  },
+  generateCanvasMedia(taskId, payload) {
+    return request(`/api/tasks/${taskId}/media-jobs`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+  canvasMediaStatus(taskId, jobId) {
+    return request(`/api/tasks/${taskId}/media-jobs/${jobId}`);
+  },
+  museStatus() {
+    return request('/api/muse/status');
+  },
+  openMuse() {
+    return request('/api/muse/open', { method: 'POST' });
+  },
+  openMuseWindow() {
+    return request('/api/muse/window', { method: 'POST' });
+  },
+  museFrame() {
+    return request('/api/muse/frame');
+  },
+  museInput(input) {
+    return request('/api/muse/input', { method: 'POST', body: JSON.stringify(input) });
+  },
+  museResize(size) {
+    return request('/api/muse/resize', { method: 'POST', body: JSON.stringify(size) });
+  },
+  connectMuse() {
+    return request('/api/muse/connect', { method: 'POST' });
+  },
   uploadVideo(taskId, file) {
     return request(`/api/tasks/${taskId}/video-uploads?filename=${encodeURIComponent(file.name)}`, {
       method: 'POST',
@@ -260,6 +293,21 @@ export const api = {
   segmentVideo(jobId, taskId = '') {
     return request(`/api/segment-jobs/${jobId}${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ''}`);
   },
+  recoverMuseVideo(jobId, taskId) {
+    return request(`/api/segment-jobs/${jobId}/muse/recover?task_id=${encodeURIComponent(taskId)}`, {
+      method: 'POST',
+    });
+  },
+  importMuseVideo(jobId, taskId, file) {
+    return request(
+      `/api/segment-jobs/${jobId}/muse/import?task_id=${encodeURIComponent(taskId)}&filename=${encodeURIComponent(file.name)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: file,
+      }
+    );
+  },
 
   // 这个作品出过的所有单段视频（「生成记录」面板用）。
   // ⚠️ 后端读的是磁盘上的 mp4，不是内存里的 job —— 刷新页面后 segJob 就没了，
@@ -290,7 +338,7 @@ export const api = {
   // version 同 `characterImageUrl`：就地覆盖 + URL 不变 = 浏览器不重新请求。
   assetImageUrl(taskId, imagePath, version = '') {
     const name = (imagePath || '').split(/[\\/]/).pop();
-    const url = `/files/${taskId}/assets/${name}`;
+    const url = `/files/${taskId}/assets/${encodeURIComponent(name)}`;
     return version ? `${url}?v=${encodeURIComponent(version)}` : url;
   },
 

@@ -1,5 +1,8 @@
 // Store material identity, never a transient Picture/Subject ordinal.
-const pattern = /@\{(character|prop|scene|image):([^{}]+)\}/g;
+const pattern = /@\{(character|prop|scene|image|video):([^{}]+)\}/g;
+export function sameMention(a, b) {
+  return a?.kind === b?.kind && (a.kind === 'video' ? a.nodeId === b.nodeId : a.name === b.name);
+}
 // Match the backend's Picture order while retaining selection order within a kind.
 export function numberMaterials(materials) {
   const kinds = ['character', 'prop', 'scene', 'image'];
@@ -11,7 +14,8 @@ export function connectedMentionChoices(connected, query = '') {
   return connected.filter((m) => m.name.toLowerCase().includes(query.toLowerCase()));
 }
 export function mentionToken(material) {
-  return `@{${material.kind}:${encodeURIComponent(material.name)}}`;
+  const identity = material.kind === 'video' ? `${material.nodeId}|${material.name}` : material.name;
+  return `@{${material.kind}:${encodeURIComponent(identity)}}`;
 }
 export function promptParts(text = '') {
   const parts = [];
@@ -19,7 +23,16 @@ export function promptParts(text = '') {
   for (const match of text.matchAll(pattern)) {
     if (match.index > end) parts.push({ text: text.slice(end, match.index) });
     try {
-      parts.push({ token: match[0], kind: match[1], name: decodeURIComponent(match[2]) });
+      const name = decodeURIComponent(match[2]);
+      if (match[1] === 'video') {
+        const separator = name.indexOf('|');
+        parts.push({
+          token: match[0],
+          kind: 'video',
+          nodeId: separator < 0 ? name : name.slice(0, separator),
+          name: separator < 0 ? name : name.slice(separator + 1),
+        });
+      } else parts.push({ token: match[0], kind: match[1], name });
     } catch {
       parts.push({ text: match[0] });
     }
@@ -35,7 +48,7 @@ export function displayPrompt(text = '') {
 }
 export function mentionsError(text, materials) {
   const missing = promptParts(text).find(
-    (p) => p.token && !materials.some((m) => m?.kind === p.kind && m.name === p.name && m.ready)
+    (p) => p.token && !materials.some((m) => sameMention(m, p) && m.ready)
   );
   return missing ? `引用的素材「${missing.name}」未连接或未就绪，请重新选择或删除这处引用` : '';
 }

@@ -21,25 +21,29 @@ import shutil
 import subprocess
 import time
 import sys
+import tempfile
 import threading
 import traceback
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 from server.video_sources import resolve_video_sources, public_sources
 from server.prompt_mentions import resolve_mentions
 from server.video_contracts import ComposeBody, OptimizePromptBody, SegmentVideoBody
 from server.video_policy import effective_workflow, resolve_resolution
 from video_controls import h3_frames, output_size
+from atomic_io import atomic_write_json
 from server.segment_job_store import restore_job, save_candidate, save_job
 from server.segment_generation import make_candidates, run_candidates
+from server.muse_bridge import BRIDGE as MUSE_BRIDGE
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -183,6 +187,9 @@ def _video_mode() -> str:
 def _make_video_provider(cfg: dict | None = None):
     """按「服务配置」里的视频后端选择实例化 provider。"""
     cfg = dict(cfg if cfg is not None else _load_service_config())
+    if cfg.get("video_backend") == "muse":
+        from muse_video_provider import MuseVideoProvider
+        return MuseVideoProvider(timeout=float(cfg.get("video_timeout_s") or 3600))
     if cfg.get("video_backend") == "api":
         from video_provider import ApiVideoProvider
 
@@ -258,6 +265,16 @@ def _lora_workflow_error(cfg: dict) -> str | None:
 
 def _video_config_error(cfg: dict) -> str | None:
     """生成视频前的配置自检：返回给用户的报错文案，None 表示配置就绪。"""
+    if cfg.get("video_backend") == "muse":
+        try:
+            status = MUSE_BRIDGE.status()
+        except RuntimeError as exc:
+            return str(exc)
+        if not status.get("connected"):
+            return "Muse 尚未连接，请在服务设置打开 Muse 面板，登录后使用当前聊天"
+        if status.get("busy"):
+            return "Muse 正在生成其他视频，请等待当前任务完成"
+        return None
     if cfg.get("video_backend", "comfyui") == "api":
         if not (cfg.get("video_api_url") and cfg.get("video_api_key") and cfg.get("video_api_model")):
             return "外接视频 API 未配置完整：需要 API 地址、Key 和模型名称（服务配置面板）"
@@ -623,10 +640,9 @@ def _save_meta(task_id: str) -> None:
         "error": task.get("error"),
     }
     try:
-        with open(os.path.join(_out_dir(task_id), "task.json"), "w", encoding="utf-8") as fh:
-            json.dump(meta, fh, ensure_ascii=False, indent=2)
+        atomic_write_json(os.path.join(_out_dir(task_id), "task.json"), meta)
     except OSError:
-        pass
+        logging.getLogger(__name__).warning("任务 %s 的状态保存失败，原文件已保留", task_id, exc_info=True)
 
 
 def _load_task_from_disk(task_id: str) -> dict[str, Any] | None:
@@ -2407,6 +2423,9 @@ def compose_segment(task_id: str, body: ComposeBody) -> dict:
     cfg_snapshot = _load_service_config()
     workflow = effective_workflow(cfg_snapshot)
     wf_ref2va = workflow == "ref2va"
+    # Muse uploads reference images, so sheet-only characters/props are valid.
+    # Keep I2V/API on their single-image first-frame selection.
+    prefer_sheet = workflow in ("ref2va", "muse")
     sources = resolve_video_sources(_out_dir(task_id), body.video_sources, body.duration, workflow)
     if body.audios:
         raise HTTPException(422, "当前视频服务不接收参考音频，请只选择图片素材")
@@ -2425,14 +2444,38 @@ def compose_segment(task_id: str, body: ComposeBody) -> dict:
     selected_refs = [f"character:{i}" for i, c in enumerate(project.characters) if c.name in body.characters]
     selected_names = {"prop": set(body.props), "scene": {body.scene} if body.scene else set(), "image": set(body.images)}
     selected_refs.extend(f"{a.kind}:{i}" for i, a in enumerate(project.assets) if a.name in selected_names.get(a.kind, set()))
-    resolved_inputs = [_resolve_material_ref(project, ref, prefer_sheet=wf_ref2va) for ref in selected_refs]
-    if requested != actual or requested != len(resolved_inputs) or (not actual and not sources) or any(not m or not os.path.isfile(m["path"]) for m in resolved_inputs):
-        raise HTTPException(422, "所选图片素材缺失、尚未就绪或超出参考图上限：" + " ".join(seed_plan.warnings))
+    resolved_inputs = [_resolve_material_ref(project, ref, prefer_sheet=prefer_sheet) for ref in selected_refs]
+    unavailable = [_ref_display_name(project, ref) for ref, material in zip(selected_refs, resolved_inputs)
+                   if not material or not os.path.isfile(material["path"])]
+    if requested != actual or requested != len(resolved_inputs) or (not actual and not sources and workflow != "muse") or unavailable:
+        details = list(seed_plan.warnings)
+        if unavailable:
+            details.append("不可用素材：" + "、".join(unavailable))
+        raise HTTPException(422, "所选图片素材缺失、尚未就绪或超出参考图上限：" +
+                            (" ".join(details) or "请检查所选素材及参考图数量"))
+    if workflow == "muse":
+        description = body.video_prompt.strip() or body.description.strip()
+        if not description:
+            raise HTTPException(422, "请填写 Muse 视频描述")
+        try:
+            description = resolve_mentions(description, seed_plan, ref_mode=False, videos=sources, muse=True)
+        except (ValueError, UnicodeError) as exc:
+            raise HTTPException(422, f"素材引用无效：{exc}") from exc
+        materials = [f"参考图 {index + 1}：{slot.label}" for index, slot in enumerate(s for s in seed_plan.slots if s.kind == "image")]
+        materials.extend(f"参考视频 {index + 1}：{source['label']}（{source['start']:.2f}–{source['end']:.2f} 秒）" +
+                         ("；从其结尾状态接续新的动作，不重播来源视频。" if source["usage"] == "continue" else "；作为画面、人物和动作参考。")
+                         for index, source in enumerate(sources))
+        prompt = "\n\n".join(part for part in (
+            "参考素材（按上传顺序）：\n" + "\n".join(materials) if materials else "",
+            "前情参考：\n" + body.context.strip() if body.context.strip() else "", description,
+        ) if part)
+        return {"video_backend": "muse", "video_workflow": "muse", "video_prompt": description,
+                "prompt": prompt, "soundscape": "", "slots": [], "manifest": "", "warnings": [], "video_sources": public_sources(sources)}
     if not wf_ref2va and actual > 1:
         raise HTTPException(422, "当前视频服务只接受一张首帧图，请只选择一张图片")
     try:
-        description = resolve_mentions(body.description, seed_plan, ref_mode=wf_ref2va)
-        video_prompt = resolve_mentions(body.video_prompt.strip(), seed_plan, manual=True, ref_mode=wf_ref2va)
+        description = resolve_mentions(body.description, seed_plan, ref_mode=wf_ref2va, videos=sources)
+        video_prompt = resolve_mentions(body.video_prompt.strip(), seed_plan, manual=True, ref_mode=wf_ref2va, videos=sources)
     except (ValueError, UnicodeError) as exc:
         raise HTTPException(422, f"素材引用无效：{exc}") from exc
     # 音轨段：只有「让 AI 帮写」那条路才有（它和画面是同一件事的两面，交给同一个 Agent 写）。
@@ -2587,7 +2630,7 @@ def _resolve_material_ref(
     角色走哪张图由 `prefer_sheet` 决定（2026-09-19 斌哥定）：
       - False（I2V / 首尾帧那条链路）：用**正面定妆照**（image_path）—— 那张是要当**首帧**
         的，四格拼图当首帧 = 视频第一秒就是四个人并排，绝对不行。
-      - True（Ref2VA 多图参考）：优先用**四视图设定图**（sheet）—— 参考图不是帧，给的信息
+      - True（Ref2VA / Muse 多图参考）：优先用**四视图设定图**（sheet）—— 参考图不是帧，给的信息
         越多越好：一张里就有大特写 + 正/侧/背三个全身，正是用户做这张图的目的。
         （他的原话："我上传那个角色图肯定是要多视角那个啊"。）没有设定图才退回单张。
 
@@ -2724,11 +2767,12 @@ REF2VA_MAX_REFS = 9
 
 @app.get("/api/video-capabilities")
 def video_capabilities() -> dict:
-    api = effective_workflow(_load_service_config()) == "api"
-    return {"controls_version": 1, "candidate_counts": [1, 2, 4], "duration_min": 1, "duration_max": 15,
-            "ratios": ["auto"] if api else ["auto", "16:9", "4:3", "1:1", "3:4", "9:16", "21:9"],
-            "resolutions": ["custom"] if api else ["custom", "480p", "720p"], "exact_duration": not api, "seed": not api, "video_sources_version": 1,
-            "video_references": effective_workflow(_load_service_config()) == "ref2va", "remote_verified": False}
+    workflow = effective_workflow(_load_service_config())
+    remote = workflow in ("api", "muse")
+    return {"controls_version": 1, "candidate_counts": [1] if workflow == "muse" else [1, 2, 4], "duration_min": 1, "duration_max": 15,
+            "ratios": ["auto"] if workflow == "api" else ["auto", "16:9", "4:3", "1:1", "3:4", "9:16", "21:9"],
+            "resolutions": ["custom"] if workflow == "api" else ["custom", "480p", "720p"], "exact_duration": not remote, "seed": not remote, "video_sources_version": 1,
+            "video_references": workflow in ("ref2va", "muse"), "settings_as_requests": workflow == "muse", "text_to_video": workflow == "muse", "remote_verified": False}
 
 
 @app.post("/api/tasks/{task_id}/segment/video")
@@ -2757,10 +2801,16 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
         raise HTTPException(status_code=409, detail="这个作品还没有故事设定")
     # 走的是哪份工作流，这一处定两件事（2026-09-19）：
     #   ① 角色拿哪张图：I2V 拿正面定妆照（那张要当**首帧**，四格拼图当首帧＝第一秒四个人并排）；
-    #      Ref2VA 拿**四视图设定图**（参考图不是帧，信息越多越好 —— 这张图就是为此做的）。
+    #      Ref2VA / Muse 拿**四视图设定图**（参考图不是帧，信息越多越好）。
     #   ② 素材在记录里算什么身份：I2V 有首帧/尾帧；Ref2VA 没有首尾帧，全是参考图。
     workflow = effective_workflow(cfg_now)
     wf_ref2va = workflow == "ref2va"
+    muse = workflow == "muse"
+    prefer_sheet = wf_ref2va or muse
+    if muse and (body.first_frame or body.last_frame or body.candidate_count != 1):
+        raise HTTPException(422, "Muse 暂不支持锁定首尾帧，一次只生成一个视频")
+    if muse and (body.exact_duration or body.seed is not None or body.megapixels is not None):
+        raise HTTPException(422, "Muse 暂不支持精确时长、随机种子或像素预算，请使用默认参数")
     sources = resolve_video_sources(_out_dir(task_id), body.video_sources, body.duration, workflow)
     if (body.expected_backend and body.expected_backend != cfg_now.get("video_backend")) or (body.expected_workflow and body.expected_workflow != workflow):
         raise HTTPException(409, "视频服务或工作流已改变，请重新编排提示词后再生成")
@@ -2778,7 +2828,7 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
     resolved: list[dict[str, str]] = []
     missing: list[str] = []      # 解析不出来 / 图还不存在的，说得出名字（前端要弹提示）
     for ref in body.frames:
-        m = _resolve_material_ref(project, ref, prefer_sheet=wf_ref2va)
+        m = _resolve_material_ref(project, ref, prefer_sheet=prefer_sheet)
         if m and os.path.isfile(m["path"]):
             if body.frame_names.get(ref) and body.frame_names[ref] != m["name"]:
                 raise HTTPException(409, "素材列表已改变，请重新选择并编排提示词")
@@ -2830,7 +2880,7 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
     # 用户在选择器里显式挑的首/尾帧优先（2026-09-19）。挑的那张通常也在 frames 里，
     # 但也允许单独挑一张没勾选的图 —— 两种都吃。
     def _pick(ref: str) -> dict[str, str] | None:
-        m = _resolve_material_ref(project, ref, prefer_sheet=wf_ref2va) if ref.strip() else None
+        m = _resolve_material_ref(project, ref, prefer_sheet=prefer_sheet) if ref.strip() else None
         return m if m and os.path.isfile(m["path"]) else None
 
     first_pick, last_pick = _pick(body.first_frame), _pick(body.last_frame)
@@ -2840,19 +2890,19 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
     last = last_pick["path"] if last_pick else ""
     if not first and sources:
         first = next((v["tail_path"] for v in sources if v["usage"] == "continue"), sources[0]["tail_path"])
-    if not first:
+    if not first and not muse:
         raise HTTPException(
             status_code=422,
             detail="当前视频服务需要图片输入，请先选择至少一张已就绪的图片素材",
         )
-    if not wf_ref2va and any(path not in {first, last} for path in paths):
+    if not wf_ref2va and not muse and any(path not in {first, last} for path in paths):
         raise HTTPException(422, "当前工作流只接收首帧和显式尾帧，多余图片不会进入模型")
     duration = body.duration
     if workflow == "api" and (body.ratio != "auto" or body.resolution != "custom" or body.exact_duration or body.seed is not None):
         raise HTTPException(422, "当前视频 API 不支持画幅、清晰度、精确时长或随机种子，请切换 ComfyUI")
     try:
         size_reference = next((v["tail_path"] for v in sources if v["usage"] == "continue"), first)
-        dimensions = output_size(body.ratio, body.resolution, size_reference, effective_mp or 0.5, force=bool(sources))
+        dimensions = None if muse else output_size(body.ratio, body.resolution, size_reference, effective_mp or 0.5, force=bool(sources))
     except (ValueError, RuntimeError, OSError) as exc:
         raise HTTPException(422, "无法读取参考图尺寸或解析视频参数") from exc
     if dimensions:
@@ -2880,9 +2930,9 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
             "file": os.path.basename(m["path"]),
         })
 
-    _add(first_pick, "selected" if wf_ref2va else "first_frame")
+    _add(first_pick, "selected" if wf_ref2va or muse else "first_frame")
     if not first_pick and resolved:
-        _add(resolved[0], "selected" if wf_ref2va else "first_frame")
+        _add(resolved[0], "selected" if wf_ref2va or muse else "first_frame")
     if not wf_ref2va:
         # Ref2VA 那份工作流里根本没有 last_frame 这个口，写了也是假的
         _add(last_pick, "last_frame")
@@ -2918,7 +2968,7 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
         steps_now = int(str(cfg_now.get("video_steps") or "").strip() or 0)
     except ValueError:
         steps_now = 0
-    if workflow != "api" and lora_steps and steps_now and steps_now != lora_steps:
+    if workflow not in ("api", "muse") and lora_steps and steps_now and steps_now != lora_steps:
         notes.append(
             f"采样步数填的是 {steps_now}，但所选 LoRA 是 {lora_steps} 步蒸馏的 —— "
             "不报错，但通常更糊也更慢（采样时间大致与步数成正比）。"
@@ -2932,20 +2982,20 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
         "job_id": job_id,
         "file": os.path.basename(out_path),
         "created": time.time(),
-        "mode": workflow if workflow in ("ref2va", "api") else "flf" if last else "i2v",
-        "duration": None if workflow == "api" else duration,
+        "mode": workflow if workflow in ("ref2va", "api", "muse") else "flf" if last else "i2v",
+        "duration": None if workflow in ("api", "muse") else duration,
         "planned_duration": duration,
         # 提交时解析并固定的像素预算；API 不消费此参数，明确记录为 None。
         "megapixels": effective_mp,
-        "resolution_source": "api" if workflow == "api" else "preset" if body.resolution != "custom" else "default" if body.megapixels is None else "override",
+        "resolution_source": workflow if workflow in ("api", "muse") else "preset" if body.resolution != "custom" else "default" if body.megapixels is None else "override",
         "ratio": body.ratio, "resolution": body.resolution,
         "width": dimensions[0] if dimensions else None, "height": dimensions[1] if dimensions else None,
         "generate_audio": body.generate_audio, "exact_duration": body.exact_duration,
-        "model_duration": None if workflow == "api" else h3_frames(duration) / 24,
+        "model_duration": None if workflow in ("api", "muse") else h3_frames(duration) / 24,
         "candidate_count": body.candidate_count,
-        "video_steps": None if workflow == "api" else int(cfg_now["video_steps"]),
+        "video_steps": None if workflow in ("api", "muse") else int(cfg_now["video_steps"]),
         "video_ref_image_size": str(cfg_now.get("video_ref_image_size") or "match") if workflow == "ref2va" else None,
-        "video_lora": "" if workflow == "api" else str(cfg_now.get("video_lora") or ""),
+        "video_lora": "" if workflow in ("api", "muse") else str(cfg_now.get("video_lora") or ""),
         "video_backend": str(cfg_now.get("video_backend") or ""),
         "video_mode": str(cfg_now.get("video_mode") or ""),
         # 用哪份工作流（i2v / ref2va）。「生成记录」里要能说清"这段是单图首帧还是多图参考"——
@@ -2990,9 +3040,13 @@ def start_segment_video(task_id: str, body: SegmentVideoBody) -> dict:
         "generate_audio": body.generate_audio, "exact_duration": body.exact_duration,
     }
 
+    if muse:
+        generation.update(ratio=body.ratio, resolution=body.resolution)
+
     if sources:
         generation["ref_video_paths"] = [v["clip_path"] for v in sources if v["clip_path"]]
-        generation["guide_frame_path"] = next((v["tail_path"] for v in sources if v["usage"] == "continue"), "")
+        if not muse:
+            generation["guide_frame_path"] = next((v["tail_path"] for v in sources if v["usage"] == "continue"), "")
 
     def runner() -> None:
         run_candidates(SEGMENT_JOBS[job_id], provider, generation, _out_dir(task_id), _video_error_text, LOCK)
@@ -3030,6 +3084,120 @@ def segment_video_job(job_id: str, task_id: str = "") -> dict:
     if job["status"] == "succeeded" and os.path.isfile(job["out_path"]):
         out["video_url"] = f"/files/{job['task_id']}/segments/{os.path.basename(job['out_path'])}"
     return out
+
+
+def _muse_result_job(job_id: str, task_id: str):
+    segment_video_job(job_id, task_id)
+    job = SEGMENT_JOBS[job_id]
+    if job.get("mode") != "muse" or len(job.get("results", [])) != 1:
+        raise HTTPException(422, "该任务不是可取回的 Muse 视频")
+    candidate = job["results"][0]
+    expected = os.path.join(_out_dir(task_id), "segments", f"seg_{job_id}.mp4")
+    if os.path.abspath(candidate["out_path"]) != os.path.abspath(expected):
+        raise HTTPException(422, "Muse 结果文件与原任务不匹配")
+    try:
+        with open(os.path.splitext(expected)[0] + ".muse.json", encoding="utf-8") as handle:
+            submitted = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(409, "未找到原 Muse 提交记录，请保留旁聊结果") from exc
+    if submitted.get("stage") not in ("submitting", "submitted", "downloaded"):
+        raise HTTPException(409, "该任务尚未发送到 Muse，不能取回成片")
+    if not re.fullmatch(r"muse_[a-f0-9]{12}", submitted.get("task_id", "")):
+        raise HTTPException(409, "原 Muse 任务编号无效，请保留旁聊结果")
+    return job, submitted
+
+
+def _prepare_muse_result(job, task_id):
+    candidate = job["results"][0]
+    previous = json.loads(json.dumps(job))
+    job.update(status="running", error="", done=0)
+    candidate.update(status="queued", error="")
+    candidate["record"].update(status="queued", error="")
+    try:
+        save_candidate(_out_dir(task_id), candidate)
+        save_job(_out_dir(task_id), job)
+    except OSError as exc:
+        job.clear()
+        job.update(previous)
+        raise HTTPException(500, "取回任务保存失败，尚未操作 Muse") from exc
+
+
+@app.post("/api/segment-jobs/{job_id}/muse/recover")
+def recover_muse_video(job_id: str, task_id: str, request: Request) -> dict:
+    """Continue retrieval of a persisted Muse job, with no new generation request."""
+    _require_local_muse(request)
+    job, submitted = _muse_result_job(job_id, task_id)
+    if job["status"] in ("running", "succeeded"):
+        return {"job_id": job_id, "status": job["status"]}
+    connection = MUSE_BRIDGE.status()
+    if connection.get("busy"):
+        raise HTTPException(409, "请先连接原 Muse 聊天，并等待当前操作结束")
+    if not connection.get("connected"):
+        # A persisted, unique thread URL lets recovery reopen the original
+        # conversation after a restart. Never guess a chat from Muse's root URL.
+        if not re.fullmatch(r"https://muse\.ai/thread/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}", submitted.get("chat_url", ""), re.IGNORECASE):
+            raise HTTPException(409, "请在 Muse 面板选择原任务旁聊，并使用当前聊天")
+        journal_path = os.path.splitext(job["results"][0]["out_path"])[0] + ".muse.json"
+        try:
+            connection = MUSE_BRIDGE.call("resumeChat", {"journal_path": journal_path}, timeout=90)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not connection.get("connected") or connection.get("busy"):
+            raise HTTPException(409, "原 Muse 聊天未连接，请在面板检查登录状态")
+    from muse_video_provider import MuseVideoProvider
+    provider = MuseVideoProvider(timeout=min(float(_load_service_config().get("video_timeout_s", 3600)), 120), bridge=MUSE_BRIDGE)
+    with LOCK:
+        if job["status"] in ("running", "succeeded"):
+            return {"job_id": job_id, "status": job["status"]}
+        _prepare_muse_result(job, task_id)
+
+    def runner():
+        run_candidates(job, provider, {"image_path": "", "video_prompt": "", "duration": job["record"].get("planned_duration", 5),
+                       "generate_audio": job["record"].get("generate_audio", True), "recover_only": True},
+                       _out_dir(task_id), _video_error_text, LOCK)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return {"job_id": job_id, "status": "running"}
+
+
+@app.post("/api/segment-jobs/{job_id}/muse/import")
+async def import_muse_video(job_id: str, task_id: str, filename: str, request: Request) -> dict:
+    """Import the explicitly selected download into its existing Muse job."""
+    _require_local_muse(request)
+    job, submitted = _muse_result_job(job_id, task_id)
+    token = submitted["task_id"]
+    if not re.fullmatch(re.escape(token) + r"(?: \(\d+\))?\.mp4", filename, re.IGNORECASE):
+        raise HTTPException(422, f"请选择原任务的 {token}.mp4 文件")
+    with LOCK:
+        if job["status"] == "succeeded":
+            return {"job_id": job_id, "status": "succeeded"}
+        if job["status"] == "running":
+            raise HTTPException(409, "原任务仍在取回中，请等待当前操作结束后导入")
+    directory = os.path.join(_out_dir(task_id), "segments")
+    with tempfile.TemporaryDirectory(prefix=".muse-import-", dir=directory) as folder:
+        source = os.path.join(folder, "download.mp4")
+        size = 0
+        with open(source, "wb") as handle:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > 100_000_000:
+                    raise HTTPException(413, "每个视频不超过 100MB")
+                handle.write(chunk)
+        if not size:
+            raise HTTPException(400, "请选择视频文件")
+        from muse_video_provider import MuseVideoProvider
+        provider = MuseVideoProvider(bridge=MUSE_BRIDGE)
+        with LOCK:
+            if job["status"] == "succeeded":
+                return {"job_id": job_id, "status": "succeeded"}
+            if job["status"] == "running":
+                raise HTTPException(409, "原任务正在取回，请等待当前操作结束")
+            _prepare_muse_result(job, task_id)
+        await run_in_threadpool(run_candidates, job, provider,
+            {"image_path": "", "video_prompt": "", "duration": job["record"].get("planned_duration", 5),
+             "generate_audio": job["record"].get("generate_audio", True), "downloaded_path": source},
+            _out_dir(task_id), _video_error_text, LOCK)
+    return {"job_id": job_id, "status": job["status"]}
 
 
 @app.get("/api/tasks/{task_id}/segments")
@@ -3079,7 +3247,7 @@ def list_segments(task_id: str) -> dict:
             side = _seg_sidecar(task_id, it["name"])
             if side:
                 # 旧记录曾将 Ref2VA 写成 i2v；以真实后端和工作流优先，保留原文件。
-                it["mode"] = "api" if side.get("video_backend") == "api" else "ref2va" if side.get("video_workflow") == "ref2va" else str(side.get("mode") or "")
+                it["mode"] = side["video_backend"] if side.get("video_backend") in ("api", "muse") else "ref2va" if side.get("video_workflow") == "ref2va" else str(side.get("mode") or "")
     return {"items": items, "count": len(items)}
 
 
@@ -5322,9 +5490,91 @@ def get_config() -> dict:
         raise HTTPException(500, "服务配置读取失败，请保留 service_config.json 并检查文件") from exc
 
 
+@app.get("/api/muse/status")
+def muse_status() -> dict:
+    try:
+        return MUSE_BRIDGE.status()
+    except RuntimeError as exc:
+        return {"connected": False, "browser_open": False, "busy": False, "message": str(exc)}
+
+
+def _require_local_muse(request: Request) -> None:
+    from urllib.parse import urlparse
+    origin = request.headers.get("origin")
+    if origin and urlparse(origin).hostname not in ("localhost", "127.0.0.1", "::1"):
+        raise HTTPException(403, "请从本机镜序页面操作 Muse 连接")
+    if request.client and request.client.host not in ("127.0.0.1", "::1", "testclient"):
+        raise HTTPException(403, "Muse 浏览器连接仅供本机使用")
+
+
+def _muse_action(request: Request, command: str) -> dict:
+    _require_local_muse(request)
+    try:
+        return MUSE_BRIDGE.call(command)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/muse/open")
+def muse_open(request: Request) -> dict:
+    return _muse_action(request, "open")
+
+
+@app.post("/api/muse/window")
+def muse_window(request: Request) -> dict:
+    return _muse_action(request, "openWindow")
+
+
+@app.get("/api/muse/frame")
+def muse_frame(request: Request, response: Response) -> dict:
+    response.headers["Cache-Control"] = "no-store"
+    return _muse_action(request, "frame")
+
+
+class MusePanelInput(BaseModel):
+    model_config = {"extra": "forbid"}
+    kind: Literal["click", "wheel", "key", "text"]
+    frame_id: str = Field(min_length=1, max_length=64)
+    x: float | None = Field(default=None, ge=0, le=1920)
+    y: float | None = Field(default=None, ge=0, le=1200)
+    dx: float | None = Field(default=None, ge=-2000, le=2000)
+    dy: float | None = Field(default=None, ge=-2000, le=2000)
+    key: str | None = Field(default=None, min_length=1, max_length=64)
+    text: str | None = Field(default=None, min_length=1, max_length=10000)
+
+
+class MusePanelSize(BaseModel):
+    model_config = {"extra": "forbid"}
+    width: int = Field(ge=360, le=1920, strict=True)
+    height: int = Field(ge=300, le=1200, strict=True)
+
+
+def _muse_panel_action(request: Request, command: str, payload: dict) -> dict:
+    _require_local_muse(request)
+    try:
+        return MUSE_BRIDGE.call(command, payload, timeout=15)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/muse/input")
+def muse_input(request: Request, body: MusePanelInput) -> dict:
+    return _muse_panel_action(request, "input", body.model_dump(exclude_none=True))
+
+
+@app.post("/api/muse/resize")
+def muse_resize(request: Request, body: MusePanelSize) -> dict:
+    return _muse_panel_action(request, "resize", body.model_dump())
+
+
+@app.post("/api/muse/connect")
+def muse_connect(request: Request) -> dict:
+    return _muse_action(request, "connect")
+
+
 def _validate_service_config(cfg: dict) -> None:
     for key, allowed in (
-        ("video_backend", ("comfyui", "api")), ("video_mode", VIDEO_MODES),
+        ("video_backend", ("comfyui", "api", "muse")), ("video_mode", VIDEO_MODES),
         ("video_workflow", VIDEO_WORKFLOWS), ("audio_provider", AUDIO_PROVIDERS),
         ("video_ref_image_size", ("match", "max")),
     ):
@@ -5394,6 +5644,15 @@ register_workflow_routes(app, _task, _out_dir)
 from server.video_uploads import register_video_upload_routes
 
 register_video_upload_routes(app, lambda task_id: _task(task_id), lambda task_id: _out_dir(task_id))
+
+from server.canvas_media import register_canvas_media_routes
+from server.canvas_media_services import media_services
+
+register_canvas_media_routes(
+    app, _task, _out_dir,
+    *media_services(_task, _out_dir, LOCK, _persist, _snapshot_history),
+    list_tts_voices,
+)
 
 # 启动时把磁盘上的历史任务认回来，这样任务列表不再依赖浏览器
 _scan_tasks()

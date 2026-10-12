@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -16,8 +17,10 @@ from video_controls import h3_frames
 def resolve_video_sources(directory, sources, duration, workflow):
     if not sources:
         return []
-    if workflow != "ref2va":
-        raise HTTPException(422, "视频参考和续拍需要 ComfyUI 的 Ref2VA 工作流")
+    if workflow not in {"ref2va", "muse"}:
+        raise HTTPException(422, "视频参考和续拍需要 Muse 或 ComfyUI 的 Ref2VA 工作流")
+    if len({s.source_node for s in sources}) != len(sources):
+        raise HTTPException(422, "同一个来源视频不能重复引用，请只选择一个版本")
     if sum(s.usage == "continue" for s in sources) > 1:
         raise HTTPException(422, "一段新视频只能有一个续拍起点")
     root = Path(directory).resolve()
@@ -66,7 +69,7 @@ def resolve_video_sources(directory, sources, duration, workflow):
                 digest = hasher.hexdigest()
             if source.expected_sha256 and source.expected_sha256 != digest:
                 raise HTTPException(409, "来源文件在编排后发生变化，请重新编排")
-            prepared = _prepare(root, path, digest, source, duration)
+            prepared = _prepare(root, path, digest, source, duration, workflow)
             after = path.stat()
             if (before.st_mtime_ns, before.st_size) != (after.st_mtime_ns, after.st_size):
                 raise HTTPException(409, "来源文件在处理时发生变化，请重试")
@@ -85,7 +88,7 @@ def public_sources(sources):
     return [{k: v for k, v in source.items() if k not in {"clip_path", "tail_path"}} for source in sources]
 
 
-def _prepare(root, path, digest, source, duration):
+def _prepare(root, path, digest, source, duration, workflow="ref2va"):
     import imageio_ffmpeg
     from PIL import Image
     cache = root / "segments" / ".references" / digest
@@ -120,9 +123,33 @@ def _prepare(root, path, digest, source, duration):
         finally:
             reader.close()
     end = source.end if source.end is not None else info["source_duration"]
-    start = source.start if source.start is not None else max(0, end - source.tail_seconds)
+    start = source.start if source.start is not None else (0 if workflow == "muse" and source.usage == "reference" else max(0, end - source.tail_seconds))
     if not 0 <= start < end <= info["source_duration"] + 0.02:
         raise ValueError("参考范围超出来源视频")
+    if workflow == "muse":
+        # Muse gets the entire reference by default, without H3's frame-batch
+        # restriction. Explicit ranges/continuations get their own MP4 clip.
+        clip_path = cache / f"muse_{digest[:24]}.mp4"
+        if start == 0 and end >= info["source_duration"] - 0.02 and not clip_path.is_file():
+            with tempfile.TemporaryDirectory(dir=cache) as folder:
+                temporary = Path(folder) / "reference.mp4"
+                shutil.copyfile(path, temporary)
+                os.replace(temporary, clip_path)
+        if start > 0 or end < info["source_duration"] - 0.02:
+            key = hashlib.sha256(f"muse-v1:{start:.9f}:{end:.9f}".encode()).hexdigest()[:20]
+            clip_path = cache / f"ref_{digest[:24]}_{key}.mp4"
+            if not clip_path.is_file():
+                with tempfile.TemporaryDirectory(dir=cache) as folder:
+                    temporary = Path(folder) / "reference.mp4"
+                    command = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-v", "error", "-i", str(path), "-ss", str(start),
+                               "-t", str(end - start), "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", str(temporary)]
+                    process = subprocess.run(command, capture_output=True, timeout=120)
+                    if process.returncode or not temporary.is_file() or not temporary.stat().st_size:
+                        raise RuntimeError("参考视频裁切失败")
+                    os.replace(temporary, clip_path)
+        return {**info, "start": start, "end": end, "tail_seconds": source.tail_seconds,
+                "range_trimmed": False, "clip_path": str(clip_path), "tail_path": str(tail_path),
+                "guide": "last_frame_requested" if source.usage == "continue" else ""}
     # Ref2VA crops from the beginning when references exceed the target. Keep the
     # selected range's ending, with an exact 17k+5 batch no longer than the target.
     available = math.floor((end - start) * 24 + 1e-6)

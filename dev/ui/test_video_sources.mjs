@@ -32,11 +32,21 @@ test('explicit version pins both actual media and original description', () => {
   assert.equal(sourceVersion(inputs[0].node, inputs[0].edge).id, 'old')
   const snapshot = sourceSnapshot(inputs)
   assert.equal(snapshot[0].file, 'old.mp4')
-  assert.match(sourceContext(inputs), /original action/)
+  assert.equal(sourceContext(inputs), '')
   graph.nodes[1].data.activeVersionId = 'new'
   inputs[0].edge.sourceVersionId = 'new'
   assert.equal(snapshot[0].file, 'old.mp4')
   assert.equal(sourceSnapshot(inputs)[0].file, 'new.mp4')
+})
+test('visual references and continuation do not inherit source prompts', () => {
+  for (const usage of ['reference', 'continue']) {
+    const graph = fixture(usage)
+    const inputs = videoInputs(graph, graph.nodes[0].id)
+    assert.equal(sourceContext(inputs), '')
+    assert.equal(sourceSnapshot(inputs)[0].file, 'old.mp4')
+  }
+  const graph = fixture('text')
+  assert.match(sourceContext(videoInputs(graph, graph.nodes[0].id)), /original action/)
 })
 test('old unmarked links stay text and never submit media', () => {
   const graph = fixture(undefined)

@@ -17,6 +17,7 @@ const emit = defineEmits([
   'select',
   'focus',
   'connect',
+  'link-start',
   'finish-connect',
   'generate',
   'version',
@@ -28,6 +29,7 @@ const card = ref(null),
   mediaVisible = ref(false),
   mediaSize = ref(null);
 const isVideo = computed(() => ['shot', 'footage'].includes(props.node.type));
+const isAudio = computed(() => props.node.type === 'material' && props.node.data.materialKind === 'audio');
 const busy = computed(() => ['running', 'composing', 'queued'].includes(props.node.data.status));
 const failed = computed(() => ['failed', 'interrupted'].includes(props.node.data.status));
 const sizeLabel = computed(() => {
@@ -77,7 +79,7 @@ onBeforeUnmount(() => observer?.disconnect());
       @click.stop="emit('finish-connect', node.id)"
     ></button>
     <header class="node-header" @pointerdown.stop="emit('drag', $event, node)">
-      <WorkflowIcon :name="isVideo ? 'video' : node.type === 'note' ? 'note' : 'image'" />
+      <WorkflowIcon :name="isVideo ? 'video' : isAudio ? 'audio' : node.type === 'note' ? 'note' : 'image'" />
       <strong :title="node.data.title">{{ node.data.title }}</strong>
       <span v-if="node.type === 'shot'" class="node-state" :title="STATUS_LABELS[node.data.status]">
         <i :class="node.data.status"></i>
@@ -99,7 +101,7 @@ onBeforeUnmount(() => observer?.disconnect());
         @loadedmetadata="mediaSize = [$event.target.videoWidth, $event.target.videoHeight]"
       ></video>
       <img
-        v-else-if="node.type === 'material' && material?.url"
+        v-else-if="node.type === 'material' && !isAudio && material?.url"
         :src="material.url"
         :alt="material.name"
         draggable="false"
@@ -107,10 +109,26 @@ onBeforeUnmount(() => observer?.disconnect());
         decoding="async"
         @load="mediaSize = [$event.target.naturalWidth, $event.target.naturalHeight]"
       />
+      <div v-else-if="isAudio" class="audio-preview">
+        <WorkflowIcon name="audio" />
+        <audio
+          v-if="material?.url && mediaVisible"
+          :src="material.url"
+          controls
+          preload="metadata"
+          @pointerdown.stop
+          aria-label="试听音频素材"
+        />
+        <span v-else>{{ node.data.creationKind ? '填写台词，生成语音' : '音频素材尚未就绪' }}</span>
+      </div>
       <div v-else-if="node.type === 'note'" class="note-content">
         {{ node.data.text || '写下剧情、对白或灵感…' }}
       </div>
-      <div v-else class="node-placeholder"><WorkflowIcon :name="isVideo ? 'play' : 'image'" /></div>
+      <div v-else class="node-placeholder">
+        <WorkflowIcon :name="isVideo ? 'play' : 'image'" /><span v-if="node.data.creationKind"
+          >描述画面，生成图片</span
+        >
+      </div>
       <div v-if="isVideo && result" class="video-drag-area" aria-hidden="true"></div>
       <span v-if="busy || failed" class="generation-badge" :class="{ failed }" :title="node.data.error">
         <i v-if="busy"></i>{{ STATUS_LABELS[node.data.status]
@@ -134,6 +152,11 @@ onBeforeUnmount(() => observer?.disconnect());
           ><WorkflowIcon name="download"
         /></a>
       </div>
+      <div v-else-if="node.type === 'material' && material?.url" class="node-media-actions" @pointerdown.stop>
+        <a :href="material.url" :download="material.file" title="下载素材" aria-label="下载素材"
+          ><WorkflowIcon name="download"
+        /></a>
+      </div>
       <button
         v-if="connecting && ['shot', 'video'].includes(node.type)"
         class="node-connect-area"
@@ -145,18 +168,38 @@ onBeforeUnmount(() => observer?.disconnect());
       </button>
     </div>
     <button
-      v-if="node.type !== 'video'"
+      v-if="node.type !== 'video' && !isAudio"
       class="port output-port"
       :class="{ active: connecting }"
-      title="输出连接点：点击后再点目标视频框"
+      title="输出连接点：按住拖到目标视频，或点击后再点目标视频框"
       aria-label="从此节点开始连接"
-      @pointerdown.stop
-      @click.stop="emit('connect', node.id)"
+      @pointerdown.stop="emit('link-start', $event, node.id)"
+      @click.stop="!$event.detail && emit('connect', node.id)"
     ></button>
   </article>
 </template>
 
 <style scoped>
+.audio-preview {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  align-items: center;
+  justify-content: center;
+  color: var(--day-muted, #a4a5ae);
+}
+.audio-preview > svg {
+  width: 45px;
+  height: 45px;
+}
+.audio-preview audio {
+  width: 90%;
+}
+.audio-preview span,
+.node-placeholder span {
+  font-size: 12px;
+}
 .flow-node {
   position: absolute;
   width: 320px;

@@ -2,6 +2,75 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { emptyWorkflow, makeNode, makeShot } from '../../web/src/workflowGraph.js'
 import { appendStoryboard, mergeWorkflow, orderedShots, scriptParagraphs, shotReadiness } from '../../web/src/workflowStudio.js'
+import { imageCount, imageMode, imageRatio } from '../../web/src/imageModes.js'
+
+test('legacy style selections are discarded on import while personal descriptions and image types remain', () => {
+  const source = emptyWorkflow(), target = emptyWorkflow()
+  source.nodes.push(makeNode('material', 0, 0, { creationKind: 'image', imageMode: 'scene', materialKind: 'scene', prompt: 'My own description', imageStyle: { id: 'watercolor', label: 'Old style', prompt: 'Old extra style' } }))
+  mergeWorkflow(target, source)
+  assert.equal(target.nodes[0].data.imageStyle, undefined)
+  assert.equal(target.nodes[0].data.prompt, 'My own description')
+  assert.equal(target.nodes[0].data.imageMode, 'scene')
+})
+
+test('image presets survive backup import while foreign outputs and jobs are cleared', () => {
+  for (const mode of ['native', 'character', 'scene', 'prop']) {
+    const graph = emptyWorkflow(), source = emptyWorkflow()
+    source.nodes.push(makeNode('material', 0, 0, {
+      creationKind: 'image', imageMode: mode, materialKind: mode === 'native' ? 'image' : mode,
+      prompt: 'Personal style preferences', ratio: '9:16', imageCount: 4, materialName: 'Foreign asset',
+      materialFile: 'foreign_sheet.png', status: 'succeeded', jobId: 'foreign',
+      mediaVariants: [{ asset_name: 'Foreign', file: 'foreign.png' }],
+    }))
+    mergeWorkflow(graph, source)
+    const data = graph.nodes[0].data
+    assert.equal(data.imageMode, mode)
+    assert.equal(data.prompt, 'Personal style preferences')
+    assert.equal(data.materialKind, 'image')
+    assert.equal(data.materialFile, '')
+    assert.equal(data.jobId, undefined)
+    assert.equal(data.mediaVariants, undefined)
+    assert.equal(imageCount(data), 4)
+    assert.equal(imageRatio(data), ['character', 'prop'].includes(mode) ? '16:9' : '9:16')
+    assert.equal(data.ratio, '9:16', 'sheet modes retain the user ratio for later native/scene use')
+  }
+  assert.equal(imageMode({}).value, 'native')
+  const source = emptyWorkflow()
+  source.nodes.push(makeNode('material', 0, 0, { creationKind: 'image', imageMode: 'invalid', materialKind: 'image', prompt: 'x' }))
+  assert.throws(() => mergeWorkflow(emptyWorkflow(), source))
+  for (const count of [0, 3, '2', true]) {
+    source.nodes[0].data.imageMode = 'native'
+    source.nodes[0].data.imageCount = count
+    assert.throws(() => mergeWorkflow(emptyWorkflow(), source))
+  }
+  assert.equal(imageCount({}), 1)
+  assert.equal(imageCount({ imageMode: 'character' }), 1)
+})
+
+test('image and speech imports keep input settings without resuming foreign jobs or media', () => {
+  const graph = emptyWorkflow(), document = emptyWorkflow()
+  document.nodes.push(makeNode('material', 100, 100, {
+    materialKind: 'audio', creationKind: 'audio', prompt: 'A spoken line', voiceId: 'fixture',
+    materialName: 'Other project narration', materialFile: 'snd_foreign.mp3',
+    materialVersion: 'abcdef', materialIndex: 2, status: 'running', jobId: 'foreign-job',
+    mediaSubmission: { request_id: 'a'.repeat(32) },
+  }))
+  document.nodes.push(makeNode('material', 500, 100, {
+    materialKind: 'image', creationKind: 'image', prompt: 'Watercolor road', ratio: '9:16',
+    materialName: 'Other project image', materialFile: 'img_foreign.png', status: 'succeeded',
+  }))
+  assert.equal(mergeWorkflow(graph, document), 2)
+  for (const node of graph.nodes) {
+    assert.equal(node.data.materialName, '')
+    assert.equal(node.data.materialFile, '')
+    assert.equal(node.data.status, 'draft')
+    for (const field of ['jobId', 'mediaSubmission', 'materialVersion', 'materialIndex'])
+      assert.equal(node.data[field], undefined)
+  }
+  assert.equal(graph.nodes[0].data.voiceId, 'fixture')
+  assert.equal(graph.nodes[1].data.ratio, '9:16')
+  assert.throws(() => mergeWorkflow(emptyWorkflow(), { ...document, nodes: [{ ...document.nodes[0], data: { ...document.nodes[0].data, prompt: [] } }] }))
+})
 
 test('story order follows connections even after nodes have been repositioned', () => {
   const graph = { nodes: [{ id: 'end', type: 'shot' }, { id: 'start', type: 'shot' }, { id: 'middle', type: 'shot' }], edges: [{ source: 'start', target: 'middle' }, { source: 'middle', target: 'end' }] }

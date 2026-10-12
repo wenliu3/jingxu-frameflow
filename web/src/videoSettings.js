@@ -9,13 +9,14 @@ export const RESOLUTION_OPTIONS = [
 export const RATIO_OPTIONS = ['auto', '16:9', '4:3', '1:1', '3:4', '9:16', '21:9'];
 export function creationSettings(data, cfg) {
   const api = cfg?.video_backend === 'api';
+  const remote = api || cfg?.video_backend === 'muse';
   return {
     ratio: api ? 'auto' : data.ratio || 'auto',
     resolution: api ? 'custom' : data.resolution || 'custom',
-    candidate_count: data.candidateCount ?? 1,
+    candidate_count: cfg?.video_backend === 'muse' ? 1 : (data.candidateCount ?? 1),
     generate_audio: data.generateAudio !== false,
-    exact_duration: !api && data.exactDuration !== false,
-    ...(api || data.seed == null ? {} : { seed: Number(data.seed) }),
+    exact_duration: !remote && data.exactDuration !== false,
+    ...(remote || data.seed == null ? {} : { seed: Number(data.seed) }),
   };
 }
 export function creationSettingsError(data) {
@@ -36,16 +37,21 @@ export function defaultResolution(cfg) {
   return Number.isFinite(n) && n >= 0.1 && n <= 0.98 ? n : 0.5;
 }
 export function submissionResolution(override, cfg) {
-  if (cfg?.video_backend === 'api' || override === '' || override == null) return undefined;
+  if (['api', 'muse'].includes(cfg?.video_backend) || override === '' || override == null) return undefined;
   return Number(override);
 }
 export function videoSelectionError(refs, cfg, hasVideo = false) {
-  if (!refs.length && !hasVideo) return '请先选择至少一张已就绪的图片素材';
+  if (!refs.length && !hasVideo && cfg?.video_backend !== 'muse') return '请先选择至少一张已就绪的图片素材';
   if (refs.some((r) => r.kind === 'audio' || r.kind === 'voice'))
     return '当前视频服务不接收参考音频，请只选择图片素材';
-  const multi = cfg?.video_backend !== 'api' && cfg?.video_workflow === 'ref2va';
+  const multi =
+    cfg?.video_backend === 'muse' || (cfg?.video_backend !== 'api' && cfg?.video_workflow === 'ref2va');
   if (refs.length > (multi ? 9 : 1))
-    return multi ? 'Ref2VA 最多接受 9 张图片' : '当前视频服务只接受一张首帧图，请保留一项输入或切换 Ref2VA';
+    return multi
+      ? cfg?.video_backend === 'muse'
+        ? 'Muse 最多提交 9 张图片'
+        : 'Ref2VA 最多接受 9 张图片'
+      : '当前视频服务只接受一张首帧图，请保留一项输入或切换 Ref2VA';
   if (refs.filter((r) => r.kind === 'scene').length > 1) return '一镜只能使用一个场景，请移除多余场景';
   return '';
 }

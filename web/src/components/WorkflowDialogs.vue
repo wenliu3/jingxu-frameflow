@@ -71,8 +71,11 @@ onBeforeUnmount(() => previousFocus?.focus());
         </header>
         <template v-if="mode === 'review'">
           <p class="dialog-intro">
-            {{ cfg.video_backend === 'api' ? '视频 API' : 'ComfyUI' }} 将按镜头顺序逐个生成。{{
-              cfg.video_backend === 'api' ? '实际时长由 API 模型决定。' : '每一镜使用自己的时长和像素预算。'
+            {{ cfg.video_backend === 'muse' ? 'Muse' : cfg.video_backend === 'api' ? '视频 API' : 'ComfyUI' }}
+            将按镜头顺序逐个生成。{{
+              ['api', 'muse'].includes(cfg.video_backend)
+                ? '实际参数由生成服务决定。'
+                : '每一镜使用自己的时长和像素预算。'
             }}已完成的镜头不会被覆盖。
           </p>
           <div class="review-list">

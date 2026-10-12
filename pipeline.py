@@ -18,6 +18,8 @@ import shutil
 import sys
 from typing import Callable
 
+from atomic_io import atomic_write_json, atomic_write_text
+
 # stdout 被重定向到文件时默认是块缓冲，进度会攒在缓冲区里不刷出来，
 # 从外面看就像"卡死了"。这里改成行缓冲，每行立即落盘。
 try:
@@ -675,11 +677,10 @@ def regenerate_shot(
 
 def _save_blocks(out_dir: str, blocks: list) -> None:
     """块数据单独落盘（blocks.json），与旧流程的 shots.json 互不干扰。"""
-    with open(os.path.join(out_dir, "blocks.json"), "w", encoding="utf-8") as fh:
-        json.dump(
-            [b.to_dict() if hasattr(b, "to_dict") else b for b in blocks],
-            fh, ensure_ascii=False, indent=2,
-        )
+    atomic_write_json(
+        os.path.join(out_dir, "blocks.json"),
+        [b.to_dict() if hasattr(b, "to_dict") else b for b in blocks],
+    )
 
 
 def render_block_image(
@@ -723,12 +724,15 @@ def _save_outputs(
     传空时保持老行为（pipeline 内部两条调用链用它）。
     """
     payload = project_json if project_json is not None else dump(project)
-    with open(os.path.join(out_dir, "project.json"), "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-    with open(os.path.join(out_dir, "shots.json"), "w", encoding="utf-8") as fh:
-        json.dump([s.to_dict() for s in shots], fh, ensure_ascii=False, indent=2)
-    with open(os.path.join(out_dir, "preview.html"), "w", encoding="utf-8") as fh:
-        fh.write(_render_preview(project, shots))
+    # Prepare every payload before publishing any file: malformed data must not
+    # replace a valid project and then fail while serializing the shot list.
+    outputs = {
+        "project.json": json.dumps(payload, ensure_ascii=False, indent=2),
+        "shots.json": json.dumps([s.to_dict() for s in shots], ensure_ascii=False, indent=2),
+        "preview.html": _render_preview(project, shots),
+    }
+    for name, content in outputs.items():
+        atomic_write_text(os.path.join(out_dir, name), content)
 
 
 def _render_preview(project, shots: list[Shot]) -> str:
