@@ -2,6 +2,7 @@ import { canConnect, clone, makeShot, uid } from './workflowGraph.js';
 import { creationSettingsError, videoSelectionError } from './videoSettings.js';
 import { unifyVideoNodes } from './workflowVideo.js';
 import { videoInputs, videoSourcesError } from './videoSources.js';
+import { speechSettingsError } from './speechSettings.js';
 
 export const STATUS_LABELS = {
   empty: '等待输出',
@@ -171,7 +172,8 @@ export function mergeWorkflow(graph, document) {
           !['native', 'character', 'scene', 'prop'].includes(node.data.imageMode)) ||
         (node.data.imageCount != null && ![1, 2, 4].includes(node.data.imageCount)) ||
         typeof node.data.prompt !== 'string' ||
-        node.data.prompt.length > 3000 ||
+        node.data.prompt.length > (node.data.creationKind === 'audio' ? 9999 : 3000) ||
+        speechSettingsError(node.data.speechSettings) ||
         (node.data.voiceId != null && typeof node.data.voiceId !== 'string')
       )
         throw new Error('备份中的图片或语音节点无效');

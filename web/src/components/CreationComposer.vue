@@ -10,6 +10,7 @@ const props = defineProps({
   variants: Array,
   busy: Boolean,
   cfg: Object,
+  taskId: String,
 });
 const emit = defineEmits([
   'edit',
@@ -38,6 +39,7 @@ onBeforeUnmount(() => sizeObserver?.disconnect());
   <section
     ref="composer"
     class="creation-composer"
+    :class="{ speech: node.data.creationKind === 'audio' }"
     :aria-label="kind + '创作输入框'"
     @pointerdown.stop
     @wheel.stop
@@ -81,6 +83,7 @@ onBeforeUnmount(() => sizeObserver?.disconnect());
         :variants="variants"
         :cfg="cfg"
         :busy="busy"
+        :task-id="taskId"
         @edit="emit('edit', $event)"
         @checkpoint="emit('checkpoint')"
         @generate="emit('generate', $event)"
@@ -128,6 +131,12 @@ onBeforeUnmount(() => sizeObserver?.disconnect());
   gap: 8px;
   margin-bottom: 9px;
   flex-shrink: 0;
+}
+.creation-composer.speech {
+  max-height: min(440px, var(--creation-room, calc(100dvh - 240px)));
+}
+.creation-composer:has(.speech-settings-panel) {
+  max-height: min(680px, var(--creation-room, calc(100dvh - 240px)));
 }
 .creation-heading > svg {
   color: var(--day-accent, #c0aaf1);
@@ -218,6 +227,9 @@ onBeforeUnmount(() => sizeObserver?.disconnect());
   line-height: 1.7;
 }
 @media (max-width: 760px) {
+  .creation-composer:has(.speech-settings-panel) {
+    max-height: min(540px, var(--creation-room, calc(100dvh - 300px)));
+  }
   .creation-composer {
     border-radius: 13px;
     padding: 10px 12px;

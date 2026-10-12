@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from '../api';
 import { mapConcurrent } from '../asyncTasks.js';
 import { imageCount, imageMode, imageRatio } from '../imageModes.js';
+import { speechSettings } from '../speechSettings.js';
 import {
   videoInputs,
   videoSourcesError,
@@ -226,10 +227,15 @@ const composerPosition = computed(() => {
   const node = selected.value,
     view = graph.value.viewport;
   if (!isCreationNode(node)) return {};
+  const half = composerWidth.value / 2;
+  const audio = node.data.creationKind === 'audio';
+  const anchorLeft = view.x + (node.x + NODE_WIDTH / 2) * view.zoom;
+  const anchorTop = view.y + (node.y + NODE_HEIGHT) * view.zoom + COMPOSER_GAP;
   return {
-    left: `${view.x + (node.x + NODE_WIDTH / 2) * view.zoom}px`,
-    top: `${view.y + (node.y + NODE_HEIGHT) * view.zoom + COMPOSER_GAP}px`,
+    left: `${audio ? anchorLeft : Math.max(half + 12, Math.min(dimensions.value.width - half - 12, anchorLeft))}px`,
+    top: `${audio ? anchorTop : Math.max(12, Math.min(dimensions.value.height - 90 - composerHeight.value, anchorTop))}px`,
     width: `${composerWidth.value}px`,
+    '--creation-room': audio ? `${Math.max(120, dimensions.value.height - 90 - anchorTop)}px` : undefined,
   };
 });
 const running = computed(() => graph.value.nodes.some((n) => ACTIVE_STATUSES.includes(n.data.status)));
@@ -746,21 +752,25 @@ async function generateMedia(id) {
     prompt: node.data.prompt?.trim() || '',
     ratio: node.data.creationKind === 'image' ? imageRatio(node.data) : node.data.ratio || '16:9',
     voice_id: node.data.voiceId || '',
+    ...(node.data.creationKind === 'audio' ? { speech_settings: speechSettings(node.data, props.cfg) } : {}),
   };
   if (!payload.prompt || !payload.title) return say('请填写名称和生成内容', 'error');
   const previous = node.data.mediaSubmission;
   const sameInput =
     previous &&
-    Object.entries(payload).every(
-      ([key, value]) =>
-        (key === 'image_mode'
+    Object.entries(payload).every(([key, value]) => {
+      const oldValue =
+        key === 'image_mode'
           ? previous[key] || 'native'
           : key === 'style_prompt'
             ? previous[key] || ''
             : key === 'count'
               ? (previous[key] ?? 1)
-              : previous[key]) === value
-    );
+              : key === 'speech_settings'
+                ? speechSettings({ speechSettings: previous[key] }, { audio_provider: 'minimax' })
+                : previous[key];
+      return JSON.stringify(oldValue) === JSON.stringify(value);
+    });
   const submission = { ...payload, request_id: sameInput ? previous.request_id : uid().replaceAll('-', '') };
   checkpoint();
   Object.assign(node.data, {
@@ -1015,21 +1025,17 @@ function beginBatchLink() {
   const b = boxFor(sources, 0);
   pointer.value = { x: b.x + b.width + 70, y: b.y + b.height / 2 };
 }
-// Frame the card and its editor together when selecting, never while panning or zooming.
+// Selecting may pan the camera; growing an editor must never change the user's zoom.
 function frameCreation(node, centered = false) {
   const rect = board.value?.getBoundingClientRect();
   if (!rect || disposed) return;
   const view = graph.value.viewport;
   const availableHeight = rect.height - 100;
-  const maxZoom = Math.max(
-    0.15,
-    Math.min(
-      (availableHeight - composerHeight.value - COMPOSER_GAP - 32) / NODE_HEIGHT,
-      (rect.width - 24) / NODE_WIDTH
-    )
-  );
-  const zoom = Math.min(centered ? Math.max(view.zoom, 0.75) : view.zoom, maxZoom);
-  const height = NODE_HEIGHT * zoom + COMPOSER_GAP + composerHeight.value;
+  const zoom = centered ? Math.max(view.zoom, 0.75) : view.zoom;
+  // Reserve space once on selection; expanding audio controls only grows below this anchor.
+  const editorHeight =
+    node.data.creationKind === 'audio' ? (rect.width <= 760 ? 540 : 680) : composerHeight.value;
+  const height = Math.min(availableHeight - 32, NODE_HEIGHT * zoom + COMPOSER_GAP + editorHeight);
   const width = Math.max(NODE_WIDTH * zoom, composerWidth.value);
   let x = view.x,
     y = view.y;
@@ -1045,7 +1051,7 @@ function frameCreation(node, centered = false) {
   graph.value.viewport = { x, y, zoom };
 }
 watch(
-  [selectedId, dimensions, composerHeight],
+  [selectedId, dimensions],
   async () => {
     await nextTick();
     if (!gesture && isCreationNode(selected.value)) frameCreation(selected.value);
@@ -2723,6 +2729,7 @@ onBeforeUnmount(() => {
             :variants="mediaVariants(selected)"
             :busy="ACTIVE_STATUSES.includes(selected.data.status)"
             :cfg="cfg"
+            :task-id="taskId"
             @resize="composerHeight = $event"
             @edit="editNode"
             @checkpoint="checkpoint"

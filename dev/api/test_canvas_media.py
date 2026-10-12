@@ -152,7 +152,7 @@ class CanvasMediaTests(unittest.TestCase):
         entry = prepare("abcdef123456", body)
         with patch("server.canvas_media_services.tts.synth") as synth:
             render("abcdef123456", body, str(self.root / "test.mp3"))
-            synth.assert_called_once_with("Literal text", "voice-test", str(self.root / "test.mp3"))
+            synth.assert_called_once_with("Literal text", "voice-test", str(self.root / "test.mp3"), settings=body.speech_settings)
         output = self.root / "result.mp3"
         output.write_bytes(b"new audio")
         result = publish("abcdef123456", body, str(output))

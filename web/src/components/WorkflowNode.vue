@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import WorkflowIcon from './WorkflowIcon.vue';
+import AudioWaveformPlayer from './AudioWaveformPlayer.vue';
 import { currentVideo, videoVersions } from '../workflowVideo.js';
 import { STATUS_LABELS } from '../workflowStudio.js';
 const props = defineProps({
@@ -110,16 +111,18 @@ onBeforeUnmount(() => observer?.disconnect());
         @load="mediaSize = [$event.target.naturalWidth, $event.target.naturalHeight]"
       />
       <div v-else-if="isAudio" class="audio-preview">
-        <WorkflowIcon name="audio" />
-        <audio
+        <AudioWaveformPlayer
           v-if="material?.url && mediaVisible"
           :src="material.url"
-          controls
-          preload="metadata"
-          @pointerdown.stop
-          aria-label="试听音频素材"
+          :file="material.file"
+          name="音频素材"
+          compact
         />
-        <span v-else>{{ node.data.creationKind ? '填写台词，生成语音' : '音频素材尚未就绪' }}</span>
+        <template v-else
+          ><WorkflowIcon name="audio" /><span>{{
+            node.data.creationKind ? '填写台词，生成语音' : '音频素材尚未就绪'
+          }}</span></template
+        >
       </div>
       <div v-else-if="node.type === 'note'" class="note-content">
         {{ node.data.text || '写下剧情、对白或灵感…' }}
@@ -152,7 +155,11 @@ onBeforeUnmount(() => observer?.disconnect());
           ><WorkflowIcon name="download"
         /></a>
       </div>
-      <div v-else-if="node.type === 'material' && material?.url" class="node-media-actions" @pointerdown.stop>
+      <div
+        v-else-if="node.type === 'material' && !isAudio && material?.url"
+        class="node-media-actions"
+        @pointerdown.stop
+      >
         <a :href="material.url" :download="material.file" title="下载素材" aria-label="下载素材"
           ><WorkflowIcon name="download"
         /></a>

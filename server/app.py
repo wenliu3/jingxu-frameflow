@@ -5646,12 +5646,15 @@ from server.video_uploads import register_video_upload_routes
 register_video_upload_routes(app, lambda task_id: _task(task_id), lambda task_id: _out_dir(task_id))
 
 from server.canvas_media import register_canvas_media_routes
+from server.speech_studio import VoiceCatalog, register_speech_routes
 from server.canvas_media_services import media_services
 
+speech_catalog = VoiceCatalog()
+register_speech_routes(app, _task, _out_dir, speech_catalog)
 register_canvas_media_routes(
     app, _task, _out_dir,
     *media_services(_task, _out_dir, LOCK, _persist, _snapshot_history),
-    list_tts_voices,
+    lambda: speech_catalog.get()["items"],
 )
 
 # 启动时把磁盘上的历史任务认回来，这样任务列表不再依赖浏览器

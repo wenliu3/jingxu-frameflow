@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { emptyWorkflow, makeNode, makeShot } from '../../web/src/workflowGraph.js';
+import { serveAudioFixture } from './audio_fixture.mjs';
 const require = createRequire(new URL('../../web/package.json', import.meta.url));
 const { chromium } = require('playwright');
 const browser = await chromium.launch({ headless: true });
@@ -17,7 +18,7 @@ const project = { title: '多类型画布测试', style: '作品原有风格', a
 const jobs = new Map(), submissions = [], uploads = [], errors = [], unexpected = [];
 let finishJobs = false;
 page.on('pageerror', error => errors.push(error.message));
-await page.route('**/files/**', route => route.fulfill({
+await page.route('**/files/**', route => new URL(route.request().url()).pathname.endsWith('.mp3') ? serveAudioFixture(route) : route.fulfill({
   contentType: 'image/png',
   body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5EsAAAAASUVORK5CYII=', 'base64'),
 }));
@@ -26,7 +27,7 @@ await page.route('**/api/**', async route => {
   const json = data => route.fulfill({ contentType: 'application/json', body: JSON.stringify(data) });
   if (path === '/api/config') return json({ video_backend: 'muse', image_api_key: 'fixture', text_api_key: 'fixture', audio_provider: 'edge' });
   if (path === '/api/video-capabilities') return json({ controls_version: 1, video_sources_version: 1 });
-  if (path === '/api/voices') return json([{ id: 'voice-a', cn: '温柔女声', locale: '普通话', gender: 'female' }, { id: 'voice-b', cn: '沉稳男声', locale: '普通话', gender: 'male' }]);
+  if (path === '/api/audio/voices') return json({ provider: 'edge', source: 'preset', items: [{ id: 'voice-a', cn: '温柔女声', locale: '普通话', gender: 'female' }, { id: 'voice-b', cn: '沉稳男声', locale: '普通话', gender: 'male' }] });
   if (path === '/api/tasks') return json([]);
   if (path === base) return json({ task_id: taskId, status: 'succeeded', project, shots: [], blocks: [] });
   if (path.endsWith('/segments')) return json({ items: [] });
@@ -99,8 +100,7 @@ async function inlineEditor(id, selector = '.creation-composer') {
     const editor = document.querySelector(selector)?.getBoundingClientRect();
     const node = document.querySelector('[data-node-id="' + id + '"]')?.getBoundingClientRect();
     const board = document.querySelector('.flow-board')?.getBoundingClientRect();
-    return editor && node && board && Math.abs(editor.top - node.bottom - 14) < 1 &&
-      Math.abs(editor.left + editor.width / 2 - node.left - node.width / 2) < 1 &&
+    return editor && node && board &&
       editor.left >= board.left && editor.right <= board.right && editor.bottom <= board.bottom - 75;
   }, { id, selector });
   assert.equal(await page.locator('.flow-inspector').count(), 0);
@@ -120,6 +120,13 @@ async function chooseCount(value) {
   await settingsPanel.getByRole('radio', { name: value + ' 张', exact: true }).click();
   await page.getByRole('button', { name: '关闭图片生成设置', exact: true }).click();
   await settingsPanel.waitFor({ state: 'hidden' });
+}
+const modes = page.getByRole('button', { name: '图片类型', exact: true });
+const typeMenu = page.getByRole('listbox', { name: '图片类型', exact: true });
+async function chooseType(value) {
+  await modes.click();
+  await typeMenu.locator(`[data-value="${value}"]`).click();
+  await typeMenu.waitFor({ state: 'hidden' });
 }
 try {
   await page.goto((process.env.E2E_URL || 'http://127.0.0.1:5173') + '/?browser-test=media#project=' + taskId + '&view=storyboard');
@@ -146,11 +153,40 @@ try {
   await inlineEditor(imageId);
   await page.getByRole('textbox', { name: '画面描述', exact: true }).fill('水彩风格的山间小路，晨光透过树林。');
   await chooseRatio('9:16');
-  const modes = page.getByLabel('图片类型', { exact: true });
-  assert.equal(await modes.inputValue(), 'native');
-  assert.deepEqual(await modes.locator('option').allTextContents(), ['原生', '人物三视图', '场景图', '道具图']);
+  assert.equal(await modes.getAttribute('data-value'), 'native');
+  await modes.press('ArrowDown');
+  await typeMenu.waitFor();
+  assert.deepEqual(await typeMenu.getByRole('option').evaluateAll(options => options.map(option => option.getAttribute('aria-label'))), ['原生', '人物三视图', '场景图', '道具图']);
+  assert.equal(await typeMenu.locator('[aria-selected="true"]').getAttribute('data-value'), 'native');
+  await page.keyboard.press('ArrowDown');
+  assert.equal(await typeMenu.locator('[data-value="character"]').evaluate(el => el === document.activeElement), true);
+  assert.equal(await modes.getAttribute('data-value'), 'native', 'browsing types keeps the current choice until confirmed');
+  await page.keyboard.press('Enter');
+  await typeMenu.waitFor({ state: 'hidden' });
+  assert.equal(await modes.getAttribute('data-value'), 'character');
+  assert.equal(await modes.evaluate(el => el === document.activeElement), true, 'choosing a type returns focus');
+  await modes.click();
+  await typeMenu.waitFor();
+  await page.keyboard.press('End');
+  assert.equal(await typeMenu.locator('[data-value="prop"]').evaluate(el => el === document.activeElement), true);
+  await page.keyboard.press('Home');
+  assert.equal(await typeMenu.locator('[data-value="native"]').evaluate(el => el === document.activeElement), true);
+  await page.keyboard.press('Escape');
+  await typeMenu.waitFor({ state: 'hidden' });
+  assert.equal(await modes.evaluate(el => el === document.activeElement), true);
+  assert.equal(await page.locator('.creation-composer').count(), 1, 'Escape only closes the type menu');
+  await modes.click();
+  await typeMenu.waitFor();
+  await page.keyboard.press('Tab');
+  await typeMenu.waitFor({ state: 'hidden' });
+  assert.equal(await page.locator('.media-generate').evaluate(el => el === document.activeElement), true, 'Tab continues to the next composer control');
+  await modes.click();
+  await typeMenu.waitFor();
+  await page.getByRole('textbox', { name: '画面描述', exact: true }).click({ position: { x: 4, y: 4 } });
+  await typeMenu.waitFor({ state: 'hidden' });
+  await chooseType('native');
   for (const mode of ['character', 'prop', 'scene', 'native']) {
-    await modes.selectOption(mode);
+    await chooseType(mode);
     assert.equal(await page.getByRole('textbox', { name: '画面描述', exact: true }).inputValue(), '水彩风格的山间小路，晨光透过树林。');
     const sheet = ['character', 'prop'].includes(mode);
     assert.ok((await settingsButton.textContent()).includes(sheet ? '16:9' : '9:16'));
@@ -201,6 +237,7 @@ try {
   assert.ok((await settingsButton.textContent()).includes('2 张'), 'count survives refresh before submission');
   await page.getByRole('button', { name: '生成图片', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('.media-composer [role="status"]'));
+  assert.equal(await modes.isDisabled(), true, 'types cannot change during generation');
   await saved();
   assert.equal(submissions[0].kind, 'image');
   assert.equal(submissions[0].image_mode, 'native');
@@ -247,7 +284,7 @@ try {
   for (const mode of ['character', 'scene', 'prop']) {
     await chooseNode(imageId);
     const previousFile = graph.nodes.find(n => n.id === imageId).data.materialFile;
-    await page.getByLabel('图片类型', { exact: true }).selectOption(mode);
+    await chooseType(mode);
     await chooseCount(1);
     await saved();
     assert.equal(graph.nodes.find(n => n.id === imageId).data.materialFile, previousFile, 'switching type preserves the visible previous output');
@@ -272,7 +309,7 @@ try {
       await page.reload();
       await page.locator('.flow-node').first().waitFor();
       await chooseNode(imageId);
-      assert.equal(await page.getByLabel('图片类型', { exact: true }).inputValue(), 'character');
+      assert.equal(await modes.getAttribute('data-value'), 'character');
       assert.ok((await page.locator(nodeSelector(imageId) + ' img').getAttribute('src')).includes('_sheet.png'), 'sheet preview survives refresh');
       await chooseNode(target.id);
       assert.ok((await page.locator('.video-composer img').evaluateAll(images => images.map(img => img.getAttribute('src')))).some(src => src.includes('_portrait.png')), 'Muse video reference uses the single-person image');
@@ -287,9 +324,10 @@ try {
   const audioId = await page.locator('.flow-node.material').last().getAttribute('data-node-id');
   await inlineEditor(audioId);
   await page.getByRole('textbox', { name: '台词 / 旁白', exact: true }).fill('清晨，新的故事开始了。');
-  await page.getByLabel('音色', { exact: true }).selectOption('voice-b');
+  await page.getByRole('button', { name: '音色', exact: true }).click();
+  await page.getByRole('button', { name: '选择沉稳男声', exact: true }).click();
   await page.getByRole('button', { name: '生成语音', exact: true }).click();
-  await page.getByRole('link', { name: '下载语音', exact: true }).waitFor();
+  await page.locator(nodeSelector(audioId)).getByRole('link', { name: '下载音频', exact: true }).waitFor();
   await saved();
   assert.equal(submissions.at(-1).kind, 'audio');
   assert.equal(submissions.at(-1).style_prompt, '');
@@ -298,12 +336,13 @@ try {
   const audio = graph.nodes.find(n => n.data.creationKind === 'audio');
   assert.equal(audio.data.status, 'succeeded');
   assert.equal(await page.locator(nodeSelector(audio.id) + ' .output-port').count(), 0);
-  assert.equal(await page.locator('.media-result audio[controls]').count(), 1);
+  await page.locator(nodeSelector(audio.id) + ' .waveform-svg').waitFor();
+  assert.equal(await page.locator('.creation-composer .waveform-svg').count(), 0);
   await page.reload();
   await page.locator('.flow-node').first().waitFor();
   await chooseNode(audio.id);
   await inlineEditor(audio.id);
-  await page.getByRole('link', { name: '下载语音', exact: true }).waitFor();
+  await page.locator(nodeSelector(audio.id)).getByRole('link', { name: '下载音频', exact: true }).waitFor();
   assert.equal(submissions.length, 5, 'audio survives reload without another generation');
 
   await page.getByRole('button', { name: '添加节点', exact: true }).click();
@@ -336,7 +375,11 @@ try {
   const mobileDialog = await settingsPanel.boundingBox();
   assert.ok(mobileDialog.x >= 0 && mobileDialog.x + mobileDialog.width <= 420 && mobileDialog.y >= 0 && mobileDialog.y + mobileDialog.height <= 900, 'mobile ratio panel fits viewport');
   await page.getByRole('button', { name: '关闭图片生成设置', exact: true }).click();
-  await page.getByLabel('图片类型', { exact: true }).selectOption('native');
+  await modes.click();
+  await typeMenu.waitFor();
+  const mobileTypes = await typeMenu.locator('..').boundingBox();
+  assert.ok(mobileTypes.x >= 12 && mobileTypes.x + mobileTypes.width <= 408 && mobileTypes.y >= 12 && mobileTypes.y + mobileTypes.height <= 888, 'mobile type menu fits viewport without being clipped by the editor');
+  await typeMenu.locator('[data-value="native"]').click();
   await chooseRatio('1:1');
   await chooseCount(4);
   await saved();

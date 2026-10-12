@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from atomic_io import atomic_write_json
+from speech_controls import SpeechSettings
 
 
 class MediaBody(BaseModel):
@@ -21,10 +22,11 @@ class MediaBody(BaseModel):
     image_mode: Literal["native", "character", "scene", "prop"] = "native"
     style_prompt: str = Field("", max_length=1000)
     title: str = Field(min_length=1, max_length=80)
-    prompt: str = Field(min_length=1, max_length=3000)
+    prompt: str = Field(min_length=1, max_length=9999)
     ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4"] = "16:9"
     voice_id: str = Field("", max_length=100)
     count: Literal[1, 2, 4] = 1
+    speech_settings: SpeechSettings = Field(default_factory=SpeechSettings)
 
     @field_validator("count", mode="before")
     @classmethod
@@ -92,6 +94,14 @@ def register_canvas_media_routes(
         lookup(task_id)
         if not body.prompt.strip() or not body.title.strip():
             raise HTTPException(422, "请填写名称和生成内容")
+        if body.kind == "image" and len(body.prompt) > 3000:
+            raise HTTPException(422, "图片描述最多 3000 字")
+        if body.kind == "audio":
+            import tts
+            try:
+                body.speech_settings.for_provider(tts.current_provider())
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
         if body.kind == "audio" and body.image_mode != "native":
             raise HTTPException(422, "语音节点不支持图片类型")
         if body.kind == "audio" and body.style_prompt.strip():

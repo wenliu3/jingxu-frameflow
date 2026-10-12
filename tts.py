@@ -1,7 +1,8 @@
-"""音频生成通道（角色音色样本）。
+"""音频生成通道（角色音色样本、画布配音和音色试听）。
 
-**用途只是造音色样本**：产出 2-15 秒干净人声，喂给 Ref2VA 的参考音频槽位，
-让 H3 在整片里用同一个音色说话。
+角色流程产出 2-15 秒干净人声，喂给 Ref2VA 的参考音频槽位，让 H3 在整片里
+用同一个音色说话。画布配音和试听还支持 SpeechSettings 中的声音调节；画布音色库
+由 server.speech_studio 同步 MiniMax 账户的完整列表，下面的内置池用于自动分配和兜底。
 环境音 / 配乐不归这里 —— 那是 H3 的 `overall_soundscape` / `non_diegetic_music`
 原生生成的，本来就和画面同源出。
 
@@ -40,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections import Counter
+from speech_controls import SpeechSettings
 
 # ---------------------------------------------------------------- 后端选择
 DEFAULT_PROVIDER = "edge"
@@ -409,17 +411,21 @@ def sample_filename(name: str) -> str:
 
 
 # ---------------------------------------------------------------- 合成
-def _synth_edge(text: str, voice_id: str, out_path: str) -> str:
+def _synth_edge(text: str, voice_id: str, out_path: str, settings=None) -> str:
     import edge_tts  # 延迟导入：没装 edge-tts 时只有走到这一步才报错
 
+    controls = settings or SpeechSettings()
     async def _run() -> None:
-        await edge_tts.Communicate(text, voice_id).save(out_path)
+        await edge_tts.Communicate(text, voice_id,
+            rate=f"{round((controls.speed - 1) * 100):+d}%",
+            volume=f"{round((controls.volume - 1) * 100):+d}%",
+            pitch=f"{controls.pitch * 10:+d}Hz").save(out_path)
 
     asyncio.run(_run())
     return out_path
 
 
-def _synth_minimax(text: str, voice_id: str, out_path: str) -> str:
+def _synth_minimax(text: str, voice_id: str, out_path: str, settings=None) -> str:
     """MiniMax 同步语音合成（`POST /v1/t2a_v2`）。
 
     协议要点（2026-09-14 查证官方文档）：
@@ -436,16 +442,17 @@ def _synth_minimax(text: str, voice_id: str, out_path: str) -> str:
         raise RuntimeError(
             "缺 MiniMax 的 API Key：请在「服务配置 → 音频模型」里填 audio_api_key"
         )
-    model = (os.getenv("AUDIO_MODEL") or DEFAULT_MINIMAX_MODEL).strip()
+    controls = settings or SpeechSettings()
+    model = controls.model or (os.getenv("AUDIO_MODEL") or DEFAULT_MINIMAX_MODEL).strip()
     payload = {
         "model": model,
         "text": text,
         "stream": False,
         "voice_setting": {
             "voice_id": voice_id or default_voice(),
-            "speed": 1,
-            "vol": 1,
-            "pitch": 0,
+            "speed": controls.speed,
+            "vol": controls.volume,
+            "pitch": controls.pitch,
         },
         "audio_setting": {
             "sample_rate": MINIMAX_SAMPLE_RATE,
@@ -455,6 +462,15 @@ def _synth_minimax(text: str, voice_id: str, out_path: str) -> str:
         },
         "output_format": "hex",
     }
+    if controls.emotion:
+        payload["voice_setting"]["emotion"] = controls.emotion
+    if controls.language != "auto":
+        payload["language_boost"] = controls.language
+    if any((controls.effect_pitch, controls.intensity, controls.timbre, controls.sound_effect)):
+        payload["voice_modify"] = {"pitch": controls.effect_pitch,
+            "intensity": controls.intensity, "timbre": controls.timbre}
+        if controls.sound_effect:
+            payload["voice_modify"]["sound_effects"] = controls.sound_effect
     resp = requests.request(
         "post",
         f"{base}/t2a_v2",
@@ -485,18 +501,20 @@ def _synth_minimax(text: str, voice_id: str, out_path: str) -> str:
     return out_path
 
 
-def synth(text: str, voice_id: str, out_path: str) -> str:
+def synth(text: str, voice_id: str, out_path: str, *, settings=None) -> str:
     """按当前后端合成一段音频落盘，返回路径（同步，内部自建事件循环）。
 
     调用方在后台线程里跑（server 的 stage 线程），所以不会有"事件循环已运行"的冲突；
     真遇到了也要让它抛出来，不要静默吞掉。
     """
+    controls = (settings if isinstance(settings, SpeechSettings) else SpeechSettings.model_validate(settings or {}))
+    controls.for_provider(current_provider())
     parent = os.path.dirname(out_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
     if current_provider() == "minimax":
-        return _synth_minimax(text, voice_id, out_path)
-    return _synth_edge(text, voice_id, out_path)
+        return _synth_minimax(text, voice_id, out_path, controls)
+    return _synth_edge(text, voice_id, out_path, controls)
 
 
 def synth_sample(voice_id: str, out_path: str, text: str = "") -> str:
@@ -505,7 +523,7 @@ def synth_sample(voice_id: str, out_path: str, text: str = "") -> str:
 
 
 def list_voices(pool=None) -> list[dict[str, str]]:
-    """当前后端的音色清单（给前端下拉用）。单一来源在这里，前端不要自己硬编码一份。"""
+    """当前后端的内置音色清单，供自动分配和账户音色库兜底使用。"""
     return [
         {
             "id": v["id"], "cn": v["cn"], "gender": v["gender"],

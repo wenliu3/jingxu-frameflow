@@ -2,8 +2,13 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { api } from '../api.js';
 import { IMAGE_MODES, imageCount, imageMode } from '../imageModes.js';
+import ComposerSelect from './ComposerSelect.vue';
 import ImageGenerationSettings from './ImageGenerationSettings.vue';
 import WorkflowIcon from './WorkflowIcon.vue';
+import VoiceLibrary from './VoiceLibrary.vue';
+import SpeechSettingsPanel from './SpeechSettingsPanel.vue';
+import SpeechTextEditor from './SpeechTextEditor.vue';
+import { speechSettings, SPEECH_MODELS } from '../speechSettings.js';
 
 const props = defineProps({
   node: Object,
@@ -11,6 +16,7 @@ const props = defineProps({
   variants: { type: Array, default: () => [] },
   cfg: Object,
   busy: Boolean,
+  taskId: String,
 });
 const emit = defineEmits(['edit', 'checkpoint', 'generate', 'configure', 'variant']);
 const audio = computed(() => props.node.data.creationKind === 'audio');
@@ -18,6 +24,22 @@ const mode = computed(() => imageMode(props.node.data));
 const voices = ref([]),
   voiceError = ref(''),
   voicesLoading = ref(false);
+const voiceNotice = ref(''),
+  settingsOpen = ref(false);
+const minimax = computed(() => props.cfg.audio_provider === 'minimax');
+const controls = computed(() => speechSettings(props.node.data, props.cfg));
+const speechModel = computed(() => controls.value.model || props.cfg.audio_model || 'speech-2.8-hd');
+const modelOptions = computed(() => [
+  { value: '', label: props.cfg.audio_model || 'speech-2.8-hd', description: '使用服务默认模型' },
+  ...SPEECH_MODELS.map((value) => ({
+    value,
+    label: value,
+    description: value.endsWith('-hd') ? '更细腻的声音表现' : '更快的语音生成',
+  })),
+]);
+function changeSpeech(patch) {
+  if (!props.busy) emit('edit', { speechSettings: { ...controls.value, ...patch } });
+}
 const configured = computed(() =>
   audio.value
     ? props.cfg.audio_provider !== 'minimax' || !!props.cfg.audio_api_key
@@ -37,26 +59,35 @@ let voiceRequest = 0;
 onBeforeUnmount(() => {
   voiceRequest++;
 });
+async function loadVoices(refresh = false) {
+  const serial = ++voiceRequest;
+  voices.value = [];
+  voiceError.value = '';
+  voicesLoading.value = false;
+  if (!audio.value) return;
+  voicesLoading.value = true;
+  try {
+    const result = await api.mediaVoices(refresh);
+    if (serial !== voiceRequest) return;
+    voices.value = result.items;
+    voiceNotice.value = result.notice || '';
+    if (!props.node.data.voiceId && !props.busy && result.items[0])
+      emit('edit', { voiceId: result.items[0].id });
+  } catch (err) {
+    if (serial === voiceRequest) voiceError.value = err.message;
+  } finally {
+    if (serial === voiceRequest) voicesLoading.value = false;
+  }
+}
 watch(
-  () => [props.node.id, audio.value, props.cfg.audio_provider],
-  async () => {
-    const serial = ++voiceRequest;
-    voices.value = [];
-    voiceError.value = '';
-    voicesLoading.value = false;
-    if (!audio.value) return;
-    voicesLoading.value = true;
-    try {
-      const result = await api.mediaVoices();
-      if (serial !== voiceRequest) return;
-      voices.value = result;
-      if (!props.node.data.voiceId && !props.busy && result[0]) emit('edit', { voiceId: result[0].id });
-    } catch (err) {
-      if (serial === voiceRequest) voiceError.value = err.message;
-    } finally {
-      if (serial === voiceRequest) voicesLoading.value = false;
-    }
-  },
+  () => [
+    props.node.id,
+    audio.value,
+    props.cfg.audio_provider,
+    props.cfg.audio_base_url,
+    props.cfg.audio_api_key,
+  ],
+  () => loadVoices(),
   { immediate: true }
 );
 </script>
@@ -68,11 +99,8 @@ watch(
     @keydown.ctrl.enter.prevent="generate"
     @keydown.meta.enter.prevent="generate"
   >
-    <div v-if="material?.url" class="media-result">
-      <audio v-if="audio" :src="material.url" controls preload="metadata" aria-label="试听生成的语音" />
-      <a :href="material.url" :download="material.file"
-        ><WorkflowIcon name="download" />下载{{ audio ? '语音' : '图片' }}</a
-      >
+    <div v-if="!audio && material?.url" class="media-result">
+      <a :href="material.url" :download="material.file"><WorkflowIcon name="download" />下载图片</a>
     </div>
     <div v-if="!audio && variants.length > 1" class="image-variants" role="group" aria-label="生成的候选图片">
       <button
@@ -88,11 +116,21 @@ watch(
       <span>选择要使用的图片</span>
     </div>
     <fieldset :disabled="busy">
-      <label class="prompt-field">
+      <SpeechTextEditor
+        v-if="audio"
+        :key="node.id"
+        :model-value="node.data.prompt || ''"
+        :disabled="busy"
+        :markers="minimax"
+        :interjections="speechModel.startsWith('speech-2.8-')"
+        @checkpoint="emit('checkpoint')"
+        @update:model-value="emit('edit', { prompt: $event })"
+      />
+      <label v-else class="prompt-field">
         <textarea
           :aria-label="audio ? '台词 / 旁白' : '画面描述'"
           :value="node.data.prompt"
-          maxlength="3000"
+          :maxlength="audio ? 9999 : 3000"
           rows="5"
           :placeholder="audio ? '输入想要朗读的内容，生成配音或旁白…' : mode.placeholder"
           @focus="emit('checkpoint')"
@@ -100,7 +138,19 @@ watch(
         />
       </label>
       <div class="media-controls">
-        <span v-if="audio" class="media-kind"><WorkflowIcon name="audio" />语音生成</span>
+        <ComposerSelect
+          v-if="audio && minimax"
+          label="语音模型"
+          icon="box"
+          :model-value="controls.model"
+          :options="modelOptions"
+          :disabled="busy"
+          @checkpoint="emit('checkpoint')"
+          @update:model-value="changeSpeech({ model: $event })"
+        />
+        <button v-else-if="audio" class="model-choice" aria-label="设置语音服务" @click="emit('configure')">
+          <WorkflowIcon name="box" /><span>Edge TTS</span><span class="model-chevron">⌄</span>
+        </button>
         <button
           v-else
           class="model-choice"
@@ -111,43 +161,52 @@ watch(
           <WorkflowIcon name="spark" /><span>{{ cfg.image_model || '图片模型' }}</span
           ><span class="model-chevron">⌄</span>
         </button>
-        <label v-if="audio" class="setting-field"
-          >音色
-          <select
-            aria-label="音色"
-            :value="node.data.voiceId || ''"
-            :disabled="voicesLoading || !!voiceError"
-            @focus="emit('checkpoint')"
-            @change="emit('edit', { voiceId: $event.target.value })"
-          >
-            <option value="" disabled>{{ voicesLoading ? '正在读取音色…' : '请选择音色' }}</option>
-            <option v-for="voice in voices" :key="voice.id" :value="voice.id">
-              {{ voice.cn }} · {{ voice.locale
-              }}{{ voice.gender ? ` · ${voice.gender === 'female' ? '女声' : '男声'}` : '' }}
-            </option>
-          </select>
-        </label>
+        <VoiceLibrary
+          v-if="audio"
+          :key="node.id + '-voice'"
+          :selected="node.data.voiceId || ''"
+          :voices="voices"
+          :provider="cfg.audio_provider"
+          :loading="voicesLoading"
+          :busy="busy"
+          :notice="voiceNotice"
+          :error="voiceError"
+          :task-id="taskId"
+          :settings="controls"
+          @refresh="loadVoices(true)"
+          @select="
+            emit('checkpoint');
+            emit('edit', { voiceId: $event });
+          "
+        />
+        <button
+          v-if="audio"
+          class="speech-settings-trigger"
+          aria-label="语音调节"
+          :aria-expanded="settingsOpen"
+          @click="settingsOpen = !settingsOpen"
+        >
+          <WorkflowIcon name="settings" /><span>调节</span>
+        </button>
         <ImageGenerationSettings
-          v-else
+          v-if="!audio"
           :node="node"
           :busy="busy"
           @checkpoint="emit('checkpoint')"
           @edit="emit('edit', $event)"
         />
-        <label v-if="!audio" class="mode-choice"
-          ><WorkflowIcon name="image" />
-          <select
-            aria-label="图片类型"
-            :value="mode.value"
-            @focus="emit('checkpoint')"
-            @change="emit('edit', { imageMode: $event.target.value })"
-          >
-            <option v-for="item in IMAGE_MODES" :key="item.value" :value="item.value">
-              {{ item.label }}
-            </option>
-          </select>
-        </label>
-        <span class="media-length">{{ node.data.prompt?.length || 0 }}</span>
+        <ComposerSelect
+          v-if="!audio"
+          :key="node.id + '-mode'"
+          class="mode-choice"
+          label="图片类型"
+          :model-value="mode.value"
+          :options="IMAGE_MODES"
+          :disabled="busy"
+          @checkpoint="emit('checkpoint')"
+          @update:model-value="emit('edit', { imageMode: $event })"
+        />
+        <span class="media-length">{{ node.data.prompt?.length || 0 }}{{ audio ? ' / 9999' : '' }}</span>
         <button
           class="media-generate"
           :disabled="!canGenerate"
@@ -158,7 +217,26 @@ watch(
           <WorkflowIcon :name="busy ? 'spark' : 'arrow'" />
         </button>
       </div>
+      <SpeechSettingsPanel
+        v-if="audio && settingsOpen"
+        :settings="controls"
+        :minimax="minimax"
+        :busy="busy"
+        @checkpoint="emit('checkpoint')"
+        @change="changeSpeech"
+      />
     </fieldset>
+    <p
+      v-if="
+        audio &&
+        !voicesLoading &&
+        node.data.voiceId &&
+        !voices.some((voice) => voice.id === node.data.voiceId)
+      "
+      class="media-hint"
+    >
+      原音色在当前服务中不可用，请重新选择音色。
+    </p>
     <p v-if="!audio && mode.value !== 'native'" class="media-hint image-mode-hint">{{ mode.hint }}</p>
     <p v-if="voiceError || node.data.error" class="media-error" role="alert">
       {{ node.data.error || voiceError }}
@@ -181,6 +259,22 @@ watch(
 </template>
 
 <style scoped>
+.media-composer .speech-settings-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 9px;
+  min-height: 32px;
+  border: 1px solid var(--day-line-soft, #ffffff12);
+  border-radius: 9px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.media-composer .speech-settings-trigger[aria-expanded='true'] {
+  color: var(--day-accent, #c0aaf1);
+  background: var(--day-accent-soft, #b9a0f514);
+  border-color: var(--day-accent-line, #b9a0f54a);
+}
 .image-variants {
   display: flex;
   align-items: center;
@@ -241,8 +335,7 @@ label {
   color: var(--day-muted, #aeb4c0);
   margin: 0;
 }
-textarea,
-select {
+textarea {
   padding: 7px 9px;
   background: transparent;
   border: 0;
@@ -279,40 +372,6 @@ textarea::placeholder {
   color: var(--day-accent, #c0aaf1);
   font-size: 11px;
 }
-.setting-field {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-  font-size: 10px;
-  white-space: nowrap;
-}
-.setting-field select {
-  max-width: 245px;
-  min-width: 0;
-  padding: 5px;
-  background: transparent;
-}
-.mode-choice {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 0;
-  border: 0;
-  background: transparent;
-  color: var(--day-muted, #b8b7c4);
-  font-size: 11px;
-  white-space: nowrap;
-}
-.mode-choice select {
-  padding: 0;
-  font-size: 11px;
-  cursor: pointer;
-  max-width: 125px;
-}
-.mode-choice option {
-  background: var(--day-panel, #26262b);
-}
 .model-choice {
   display: inline-flex;
   align-items: center;
@@ -338,17 +397,9 @@ textarea::placeholder {
 .model-chevron {
   color: var(--day-faint, #777682);
 }
-.model-choice + .setting-field {
-  border-left: 1px solid var(--day-line, #484852);
-  padding-left: 10px;
-}
-.mode-choice :focus-visible,
 .model-choice:focus-visible {
   outline: 2px solid var(--day-accent, #c0aaf1);
   outline-offset: 3px;
-}
-.setting-field option {
-  background: var(--day-panel, #26262b);
 }
 .media-length {
   margin-left: auto;
@@ -383,10 +434,6 @@ textarea::placeholder {
   align-items: center;
   gap: 12px;
   margin: 4px 0 7px;
-}
-.media-result audio {
-  width: min(360px, 70%);
-  height: 36px;
 }
 .media-result a {
   display: inline-flex;
@@ -426,9 +473,6 @@ textarea::placeholder {
   }
   .media-controls {
     gap: 6px;
-  }
-  .setting-field select {
-    max-width: 150px;
   }
   .media-kind {
     font-size: 10px;

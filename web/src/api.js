@@ -54,8 +54,11 @@ function uploadFile(path, file, filename = '') {
 }
 
 export const api = {
-  mediaVoices() {
-    return readOnce('/api/voices');
+  mediaVoices(refresh = false) {
+    return readOnce('/api/audio/voices' + (refresh ? '?refresh=true' : ''));
+  },
+  previewSpeech(taskId, payload) {
+    return request(`/api/tasks/${taskId}/speech-preview`, { method: 'POST', body: JSON.stringify(payload) });
   },
   generateCanvasMedia(taskId, payload) {
     return request(`/api/tasks/${taskId}/media-jobs`, {

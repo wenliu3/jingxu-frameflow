@@ -16,6 +16,7 @@
     "test:browser:lifecycle": "node ../dev/ui/test_canvas_lifecycle_browser.mjs",
     "test:browser:connections": "node ../dev/ui/test_canvas_connections_browser.mjs",
     "test:browser:media": "node ../dev/ui/test_canvas_media_browser.mjs",
+    "test:browser:speech": "node --test ../dev/ui/test_speech_text.mjs && node ../dev/ui/test_speech_browser.mjs",
     "test:browser:muse": "node ../dev/ui/test_muse_browser.mjs && node ../dev/ui/test_muse_video_references.mjs && node ../dev/ui/test_muse_panel.mjs && node ../dev/ui/test_muse_ui_browser.mjs",
     "test:browser:export": "node ../dev/ui/test_canvas_export_browser.mjs"
   },

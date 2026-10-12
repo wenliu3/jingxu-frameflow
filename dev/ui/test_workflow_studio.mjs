@@ -76,6 +76,17 @@ test('story order follows connections even after nodes have been repositioned', 
   const graph = { nodes: [{ id: 'end', type: 'shot' }, { id: 'start', type: 'shot' }, { id: 'middle', type: 'shot' }], edges: [{ source: 'start', target: 'middle' }, { source: 'middle', target: 'end' }] }
   assert.deepEqual(orderedShots(graph).map(n => n.id), ['start', 'middle', 'end'])
 })
+test('speech imports preserve real controls and reject invalid settings', () => {
+  const source = emptyWorkflow(), target = emptyWorkflow()
+  source.nodes.push(makeNode('material', 0, 0, { creationKind: 'audio', materialKind: 'audio', prompt: 'x'.repeat(5000), voiceId: 'fixture', speechSettings: { speed: 1.2, sound_effect: 'robotic', model: 'speech-2.8-turbo' } }))
+  mergeWorkflow(target, source)
+  assert.deepEqual(target.nodes[0].data.speechSettings, source.nodes[0].data.speechSettings)
+  assert.equal(target.nodes[0].data.prompt.length, 5000)
+  for (const settings of [{ speed: 3 }, { pitch: 1.5 }, { language: 'unknown' }, { sound_effect: 'unknown' }, []]) {
+    source.nodes[0].data.speechSettings = settings
+    assert.throws(() => mergeWorkflow(emptyWorkflow(), source))
+  }
+})
 test('paragraphs preserve multiline dialogue and only split at blank lines', () => {
   assert.deepEqual(scriptParagraphs('  雨夜\n人物对白\n\n\n晨光  '), ['雨夜\n人物对白', '晨光'])
 })

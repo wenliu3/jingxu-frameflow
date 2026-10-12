@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { emptyWorkflow, makeNode, makeShot } from '../../web/src/workflowGraph.js';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
+const captureDir = process.env.CAPTURE_DIR ? path.resolve(process.env.CAPTURE_DIR) : path.join(root, 'docs/images');
 const require = createRequire(new URL('../../web/package.json', import.meta.url));
 const { chromium } = require('playwright');
 const browser = await chromium.launch({
@@ -83,10 +84,10 @@ await context.route('**/api/**', route => {
   const json = data => route.fulfill({ contentType: 'application/json', body: JSON.stringify(data) });
   if (pathname === '/api/config') return json(cfg);
   if (pathname === '/api/video-capabilities') return json({ controls_version: 1, video_sources_version: 1 });
-  if (pathname === '/api/voices') return json([
+  if (pathname === '/api/audio/voices') return json({ provider: cfg.audio_provider, source: 'synced', items: [
     { id: 'voice-a', cn: '温柔女声', locale: '普通话', gender: 'female' },
     { id: 'voice-b', cn: '沉稳男声', locale: '普通话', gender: 'male' },
-  ]);
+  ] });
   if (pathname === '/api/muse/status') return json({ connected: false, browser_open: false, message: '尚未连接 Muse' });
   if (pathname === '/api/tasks') return json([]);
   if (pathname === base) return json({ task_id: taskId, status: 'succeeded', project, shots: [], blocks: [] });
@@ -109,7 +110,7 @@ async function capture(name) {
   await page.mouse.move(1420, 80);
   await page.waitForTimeout(200);
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
-  await page.screenshot({ path: path.join(root, 'docs/images', name + '.png'), animations: 'disabled' });
+  await page.screenshot({ path: path.join(captureDir, name + '.png'), animations: 'disabled' });
   captured.push(name);
 }
 async function select(node) {
@@ -121,7 +122,11 @@ async function select(node) {
   await saved();
 }
 
-fs.mkdirSync(path.join(root, 'docs/images'), { recursive: true });
+async function chooseType(value) {
+  await page.getByRole('button', { name: '图片类型', exact: true }).click();
+  await page.getByRole('listbox', { name: '图片类型', exact: true }).locator(`[data-value="${value}"]`).click();
+}
+fs.mkdirSync(captureDir, { recursive: true });
 try {
   await page.goto(`${url}/?browser-test=screenshots#project=${taskId}&view=storyboard`);
   await page.locator('.flow-node').first().waitFor();
@@ -159,15 +164,25 @@ try {
   await page.getByRole('dialog', { name: '图片生成设置', exact: true }).waitFor();
   await capture('canvas-image-settings');
   await page.getByRole('button', { name: '关闭图片生成设置', exact: true }).click();
-  await page.getByLabel('图片类型', { exact: true }).selectOption('character');
+  await chooseType('character');
   await saved();
   await capture('canvas-character-mode');
-  await page.getByLabel('图片类型', { exact: true }).selectOption('native');
+  await page.getByRole('button', { name: '图片类型', exact: true }).click();
+  await page.getByRole('listbox', { name: '图片类型', exact: true }).waitFor();
+  await capture('canvas-image-type-menu');
+  await page.locator('.creation-composer').screenshot({ path: path.join(captureDir, 'image-type-menu-detail.png'), animations: 'disabled' });
+  await page.keyboard.press('Escape');
+  await chooseType('native');
   await select(note);
   await capture('canvas-text-composer');
   await select(audio);
-  await page.getByLabel('音色', { exact: true }).selectOption('voice-a');
+  await page.getByRole('button', { name: '音色', exact: true }).click();
+  await page.getByRole('button', { name: '选择温柔女声', exact: true }).click();
   await capture('canvas-speech-composer');
+  await page.getByRole('button', { name: '音色', exact: true }).click();
+  await page.getByRole('dialog', { name: '音色库', exact: true }).waitFor();
+  await capture('canvas-voice-menu');
+  await page.keyboard.press('Escape');
 
   await page.goto(`${url}/?browser-test=screenshots-studio#project=${taskId}&view=studio`);
   await page.locator('.mcard').first().waitFor();
@@ -179,9 +194,17 @@ try {
   await page.locator('.flow-node').first().waitFor();
   await select(image);
   await capture('day-image-composer');
+  await page.getByRole('button', { name: '图片类型', exact: true }).click();
+  await page.getByRole('listbox', { name: '图片类型', exact: true }).waitFor();
+  await capture('day-image-type-menu');
+  await page.keyboard.press('Escape');
   await page.setViewportSize({ width: 420, height: 900 });
   await select(image);
   await capture('mobile-image-composer');
+  await page.getByRole('button', { name: '图片类型', exact: true }).click();
+  await page.getByRole('listbox', { name: '图片类型', exact: true }).waitFor();
+  await capture('mobile-image-type-menu');
+  await page.keyboard.press('Escape');
   await page.getByRole('button', { name: '图片生成设置', exact: true }).click();
   await page.getByRole('dialog', { name: '图片生成设置', exact: true }).waitFor();
   await capture('mobile-image-settings');
@@ -190,7 +213,7 @@ try {
   await capture('mobile-speech-composer');
   assert.deepEqual(errors, []);
   assert.deepEqual(unexpected, []);
-  console.log(`Captured ${captured.length} current UI screenshots in docs/images; no live model calls.`);
+  console.log(`Captured ${captured.length} current UI screenshots in ${captureDir}; no live model calls.`);
 } finally {
   await context.close();
   await browser.close();

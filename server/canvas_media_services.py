@@ -68,7 +68,7 @@ def media_services(lookup, out_dir, lock, persist, snapshot):
     def render(task_id, body, output):
         prompt = body.prompt.strip()
         if body.kind == "audio":
-            tts.synth(prompt, body.voice_id, output)
+            tts.synth(prompt, body.voice_id, output, settings=body.speech_settings)
             return
         provider = create_provider()
         negative = DEFAULT_NEGATIVE
